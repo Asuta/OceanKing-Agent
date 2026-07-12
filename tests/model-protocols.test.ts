@@ -10,6 +10,10 @@ function sse(events: Array<Record<string, unknown> | "[DONE]">): Response {
   return new Response(events.map((event) => `data: ${typeof event === "string" ? event : JSON.stringify(event)}\n\n`).join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
+function requestBody(init?: RequestInit): Record<string, unknown> {
+  return JSON.parse(String(init?.body)) as Record<string, unknown>;
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   delete process.env.OPENAI_API_KEY;
@@ -26,11 +30,29 @@ describe("OpenAI 兼容协议", () => {
   it("接受完整 chat/completions 地址并归一化为兼容 API 根地址", () => {
     expect(normalizeOpenAiBaseUrl("https://api.deepseek.com/v1/chat/completions")).toBe("https://api.deepseek.com/v1");
   });
+  it("官方 OpenAI 使用原生 reasoning 参数且禁用时不覆盖模型默认值", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://api.openai.com/v1";
+    const requests: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input); requests.push(requestBody(init));
+      return url.endsWith("/responses")
+        ? sse([{ type: "response.output_text.delta", delta: "Responses" }, { type: "response.completed", response: { id: "resp_openai" } }, "[DONE]"])
+        : sse([{ choices: [{ delta: { content: "Chat" } }] }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "官方协议测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const run = (apiFormat: "responses" | "chat_completions", thinkingMode: "enabled" | "disabled", turnId: string) => runAgentModel({ repository, agent: { ...base, settings: { ...base.settings, apiFormat, thinkingMode, reasoningEffort: "high" as const } }, agentParticipantId: "participant_navigator_harbor", packet, turnId, signal: new AbortController().signal });
+    await run("responses", "enabled", "turn_openai_responses_on"); await run("chat_completions", "enabled", "turn_openai_chat_on");
+    await run("responses", "disabled", "turn_openai_responses_off"); await run("chat_completions", "disabled", "turn_openai_chat_off");
+    expect(requests).toHaveLength(4);
+    expect(requests[0]?.reasoning).toEqual({ effort: "high" }); expect(requests[1]?.reasoning_effort).toBe("high");
+    expect(requests[2]).not.toHaveProperty("reasoning"); expect(requests[3]).not.toHaveProperty("reasoning_effort");
+    expect(requests.every((request) => !("thinking" in request))).toBe(true);
+  }));
   it("解析 Responses SSE 的私有文本与 usage", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
-    let requestBody: { input: Array<{ content: string }> } | undefined;
+    let sentBody: { input: Array<{ content: string }>; thinking?: { type: string } } | undefined;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      requestBody = JSON.parse(String(init?.body)) as typeof requestBody;
+      sentBody = requestBody(init) as typeof sentBody;
       return sse([
       { type: "response.created", response: { id: "resp_1" } },
       { type: "response.output_text.delta", delta: "只进入 Console" },
@@ -41,10 +63,11 @@ describe("OpenAI 兼容协议", () => {
     sendUser(repository, "room_harbor", "Responses 历史"); const historicalPacket = packetFor(repository);
     repository.beginTurn({ turnId: "turn_responses_history", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: historicalPacket });
     repository.finishTurn({ turnId: "turn_responses_history", assistantContent: "需要跨轮保留", tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: historicalPacket.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
-    sendUser(repository, "room_harbor", "协议测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const } };
+    sendUser(repository, "room_harbor", "协议测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const, thinkingMode: "disabled" as const } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses", signal: new AbortController().signal });
     expect(result.assistantContent).toBe("只进入 Console"); expect(result.modelMeta.format).toBe("responses"); expect(result.effects).toEqual([]);
-    expect(requestBody?.input.some((item) => item.content === "需要跨轮保留")).toBe(true);
+    expect(sentBody?.input.some((item) => item.content === "需要跨轮保留")).toBe(true);
+    expect(sentBody?.thinking).toEqual({ type: "disabled" });
   }));
 
   it("auto 仅在首个 Responses 请求不兼容时回退 Chat Completions", async () => withRepository(async (repository) => {

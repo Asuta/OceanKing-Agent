@@ -163,12 +163,31 @@ function apiConfig() {
 }
 
 function applyChatThinkingSettings(body: Record<string, unknown>, agent: Agent, baseUrl: string): void {
+  if (isOfficialOpenAiBaseUrl(baseUrl)) {
+    if (agent.settings.thinkingMode === "enabled") body.reasoning_effort = agent.settings.reasoningEffort;
+    return;
+  }
   if (agent.settings.thinkingMode === "provider_default") {
     if (isDeepSeekBaseUrl(baseUrl)) body.reasoning_effort = agent.settings.reasoningEffort;
     return;
   }
   body.thinking = { type: agent.settings.thinkingMode };
   if (agent.settings.thinkingMode === "enabled") body.reasoning_effort = agent.settings.reasoningEffort;
+}
+
+function applyResponsesThinkingSettings(body: Record<string, unknown>, agent: Agent, baseUrl: string): void {
+  if (isOfficialOpenAiBaseUrl(baseUrl)) {
+    if (agent.settings.thinkingMode === "enabled") body.reasoning = { effort: agent.settings.reasoningEffort };
+    return;
+  }
+  if (agent.settings.thinkingMode === "provider_default") return;
+  body.thinking = { type: agent.settings.thinkingMode };
+  if (agent.settings.thinkingMode === "enabled") body.reasoning_effort = agent.settings.reasoningEffort;
+}
+
+function isOfficialOpenAiBaseUrl(baseUrl: string): boolean {
+  try { return new URL(baseUrl).hostname.toLowerCase() === "api.openai.com"; }
+  catch { return false; }
 }
 
 function isDeepSeekBaseUrl(baseUrl: string): boolean {
@@ -204,14 +223,16 @@ async function compactWithChatCompletions(args: RunArgs, messages: Array<Record<
 
 async function compactWithResponses(args: RunArgs, messages: Array<Record<string, unknown>>): Promise<string> {
   const { baseUrl, headers } = apiConfig();
+  const body: Record<string, unknown> = {
+    model: args.agent.settings.model,
+    instructions: contextCompactionInstructions,
+    input: [...messages, { role: "user", content: "现在压缩上面的完整会话，只输出可供 Agent 继续工作的压缩上下文。" }],
+    stream: true,
+  };
+  applyResponsesThinkingSettings(body, args.agent, baseUrl);
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST", headers, signal: args.signal,
-    body: JSON.stringify({
-      model: args.agent.settings.model,
-      instructions: contextCompactionInstructions,
-      input: [...messages, { role: "user", content: "现在压缩上面的完整会话，只输出可供 Agent 继续工作的压缩上下文。" }],
-      stream: true,
-    }),
+    body: JSON.stringify(body),
   });
   if (!response.ok && [400, 404, 405].includes(response.status)) {
     throw new ResponsesUnsupportedError(`Responses API 不可用 (${response.status}): ${(await response.text()).slice(0, 1_000)}`);
@@ -377,6 +398,7 @@ async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
     const body: Record<string, unknown> = { model: args.agent.settings.model, input, stream: true };
     if (requestTools.length) { body.tools = requestTools; body.tool_choice = "auto"; }
     if (!previousResponseId) body.instructions = systemPrompt(args.agent, args.packet); else body.previous_response_id = previousResponseId;
+    applyResponsesThinkingSettings(body, args.agent, baseUrl);
     const response = await fetch(`${baseUrl}/responses`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
     if (!response.ok && step === 0 && [400, 404, 405].includes(response.status)) {
       throw new ResponsesUnsupportedError(`Responses API 不可用 (${response.status}): ${(await response.text()).slice(0, 1_000)}`);
