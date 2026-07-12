@@ -65,6 +65,15 @@ export type RoomMessage = {
   createdAt: string;
 };
 
+export type RoomMessagePreview = {
+  turnId: Id;
+  roomId: Id;
+  agentId: Id;
+  messageKey: string;
+  content: string;
+  kind: "answer" | "progress" | "warning" | "error" | "clarification";
+};
+
 export type ToolExecution = {
   id: Id;
   turnId: Id;

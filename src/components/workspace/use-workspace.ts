@@ -1,7 +1,7 @@
 "use client";
 
 import { startTransition, useCallback, useEffect, useRef, useState } from "react";
-import type { WorkspaceSnapshot } from "@/lib/domain/types";
+import type { RoomMessagePreview, WorkspaceSnapshot } from "@/lib/domain/types";
 import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
 
 export function useWorkspace(initialSnapshot: WorkspaceSnapshot) {
@@ -9,6 +9,7 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
+  const [roomPreviews, setRoomPreviews] = useState<Record<string, RoomMessagePreview>>({});
   const versionRef = useRef(initialSnapshot.version);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -18,16 +19,24 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot) {
     const response = await fetch("/api/workspace", { cache: "no-store" });
     if (!response.ok) return;
     const next = await response.json() as WorkspaceSnapshot;
+    const turns = new Map(next.rooms.flatMap((room) => room.turns).map((turn) => [turn.id, turn.status]));
+    const committedKeys = new Set(next.rooms.flatMap((room) => room.messages.map((message) => message.messageKey).filter(Boolean)));
     startTransition(() => setSnapshot(next));
+    setRoomPreviews((current) => Object.fromEntries(Object.entries(current).filter(([, preview]) => turns.get(preview.turnId) === "running" && !committedKeys.has(preview.messageKey))));
+    setPreviews((current) => Object.fromEntries(Object.entries(current).filter(([turnId]) => turns.get(turnId) === "running")));
   }, []);
 
   useEffect(() => {
     const events = new EventSource(`/api/events?after=${initialSnapshot.revision}`);
     const onEvent = (raw: MessageEvent<string>) => {
       try {
-        const event = JSON.parse(raw.data) as { type: string; entityId?: string; payload?: { kind?: string; delta?: string; status?: string } };
+        const event = JSON.parse(raw.data) as { type: string; entityId?: string; payload?: { kind?: string; delta?: string; roomId?: string; agentId?: string; messageKey?: string; content?: string; messageKind?: RoomMessagePreview["kind"]; status?: string } };
         if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "assistant_delta" && event.payload.delta) {
           setPreviews((current) => ({ ...current, [event.entityId!]: `${current[event.entityId!] ?? ""}${event.payload!.delta}` }));
+        }
+        if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "room_message_preview" && event.payload.roomId && event.payload.agentId && event.payload.messageKey && event.payload.content) {
+          const preview: RoomMessagePreview = { turnId: event.entityId, roomId: event.payload.roomId, agentId: event.payload.agentId, messageKey: event.payload.messageKey, content: event.payload.content, kind: event.payload.messageKind ?? "answer" };
+          setRoomPreviews((current) => ({ ...current, [event.entityId!]: preview }));
         }
         if (refreshTimer.current) clearTimeout(refreshTimer.current);
         refreshTimer.current = setTimeout(() => { void refresh(); }, 80);
@@ -57,5 +66,5 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot) {
     } finally { setBusy(false); }
   }, []);
 
-  return { snapshot, busy, error, setError, previews, refresh, sendCommand };
+  return { snapshot, busy, error, setError, previews, roomPreviews, refresh, sendCommand };
 }

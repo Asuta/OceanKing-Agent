@@ -1,19 +1,38 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Archive, Bot, ChevronDown, FileText, LoaderCircle, Paperclip, PanelRightOpen, Send, Square, UserPlus, X } from "lucide-react";
-import type { Agent, Attachment, Room } from "@/lib/domain/types";
+import type { Agent, Attachment, Room, RoomMessagePreview } from "@/lib/domain/types";
 import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
 import { Markdown } from "@/components/workspace/markdown";
 
 type SendCommand = (draft: WorkspaceCommandDraft) => Promise<boolean>;
+const scrollFollowThreshold = 48;
 
-export function RoomPanel({ room, agents, busy, sendCommand, onToggleConsole, consoleOpen }: { room: Room; agents: Agent[]; busy: boolean; sendCommand: SendCommand; onToggleConsole: () => void; consoleOpen: boolean }) {
+function isAtMessageBottom(element: HTMLDivElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= scrollFollowThreshold;
+}
+
+export function RoomPanel({ room, agents, previews, busy, sendCommand, onToggleConsole, consoleOpen }: { room: Room; agents: Agent[]; previews: RoomMessagePreview[]; busy: boolean; sendCommand: SendCommand; onToggleConsole: () => void; consoleOpen: boolean }) {
   const [content, setContent] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const messageScrollRef = useRef<HTMLDivElement>(null);
+  const followLatestRef = useRef(false);
   const availableAgents = agents.filter((agent) => !room.participants.some((participant) => participant.agentId === agent.id));
+  const visiblePreviews = previews.filter((preview) => preview.roomId === room.id && !room.messages.some((message) => message.messageKey === preview.messageKey));
+  const previewLength = visiblePreviews.reduce((total, preview) => total + preview.content.length, 0);
+
+  useEffect(() => {
+    const element = messageScrollRef.current;
+    if (element) followLatestRef.current = isAtMessageBottom(element);
+  }, [room.id]);
+
+  useEffect(() => {
+    const element = messageScrollRef.current;
+    if (element && followLatestRef.current) element.scrollTop = element.scrollHeight;
+  }, [previewLength, room.messages.length, visiblePreviews.length]);
 
   const submit = async () => {
     if ((!content.trim() && !attachments.length) || busy) return;
@@ -39,7 +58,7 @@ export function RoomPanel({ room, agents, busy, sendCommand, onToggleConsole, co
       </div>
     </header>
 
-    <div className="message-scroll">
+    <div className="message-scroll" ref={messageScrollRef} onScroll={(event) => { followLatestRef.current = isAtMessageBottom(event.currentTarget); }}>
       <div className="message-day">公开房间转录</div>
       {room.messages.map((message) => message.source === "system" ? <div className="system-message" key={message.id}><span />{message.content}<span /></div> : <article key={message.id} className={`message ${message.source === "user" ? "from-user" : "from-agent"}`}>
         <div className="message-avatar">{message.source === "agent_emit" ? <Bot size={16} /> : message.sender.name.slice(0, 1)}</div>
@@ -47,6 +66,10 @@ export function RoomPanel({ room, agents, busy, sendCommand, onToggleConsole, co
           {message.attachments.length ? <div className="attachment-list">{message.attachments.map((attachment) => <a href={`/api/uploads/${attachment.id}`} target="_blank" rel="noreferrer" key={attachment.id}><FileText size={15} /><span>{attachment.fileName}</span><small>{Math.ceil(attachment.byteSize / 1024)} KB</small></a>)}</div> : null}
           {message.receipts.length ? <div className="receipt-line">已阅不回 · {message.receipts.map((receipt) => room.participants.find((participant) => participant.id === receipt.agentParticipantId)?.displayName ?? "Agent").join("、")}</div> : null}
         </div>
+      </article>)}
+      {visiblePreviews.map((preview) => <article key={preview.turnId} className="message from-agent streaming-message" aria-live="polite" aria-label="Agent 正在生成公开回复">
+        <div className="message-avatar"><Bot size={16} /></div>
+        <div className="message-body"><div className="message-meta"><strong>{agents.find((agent) => agent.id === preview.agentId)?.label ?? "Agent"}</strong><span>生成中</span><em>{preview.kind}</em></div><div className="message-content"><Markdown>{preview.content}</Markdown><span className="stream-cursor" aria-hidden="true" /></div></div>
       </article>)}
       {room.scheduler.status === "running" ? <div className="agent-working"><LoaderCircle className="spin" size={15} /><span>{room.participants.find((participant) => participant.id === room.scheduler.activeParticipantId)?.displayName ?? "Agent"} 正在私有执行区工作</span><small>公开房间不会显示未提交草稿</small></div> : null}
     </div>

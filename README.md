@@ -18,6 +18,7 @@ pnpm dev
 
 - 模型普通文本只进入私有 Console，不自动显示在房间。
 - Agent 必须调用 `send_message_to_room` 才能公开发言。
+- `send_message_to_room` 参数生成期间会通过 SSE 显示临时流式气泡；只有工具成功后才写入正式消息，失败或停止时不会留下半截内容。
 - 同一 Agent 的运行会话跨房间共享，同时只能有一个 active run。
 - SQLite 是权威状态，SSE 与浏览器状态只是实时投影。
 

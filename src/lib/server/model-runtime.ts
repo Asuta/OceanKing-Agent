@@ -47,6 +47,51 @@ function createTimelineFactory(turnId: string, timeline: TimelineEvent[]) {
   };
 }
 
+export function extractPartialJsonStringField(input: string, field: string): string | null {
+  const keyIndex = input.indexOf(`"${field}"`);
+  if (keyIndex < 0) return null;
+  let index = keyIndex + field.length + 2;
+  while (/\s/.test(input[index] ?? "")) index += 1;
+  if (input[index] !== ":") return null;
+  index += 1;
+  while (/\s/.test(input[index] ?? "")) index += 1;
+  if (input[index] !== '"') return null;
+  index += 1;
+
+  let value = "";
+  const escapes: Record<string, string> = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+  for (; index < input.length; index += 1) {
+    const character = input[index]!;
+    if (character === '"') return value;
+    if (character !== "\\") { value += character; continue; }
+    const escaped = input[index + 1];
+    if (!escaped) return value;
+    if (escaped === "u") {
+      const hex = input.slice(index + 2, index + 6);
+      if (!/^[0-9a-fA-F]{4}$/.test(hex)) return value;
+      value += String.fromCharCode(Number.parseInt(hex, 16)); index += 5; continue;
+    }
+    value += escapes[escaped] ?? escaped; index += 1;
+  }
+  return value;
+}
+
+function publishRoomMessagePreview(args: RunArgs, call: ToolCall): void {
+  if (call.name !== "send_message_to_room" || !call.id) return;
+  const roomId = extractPartialJsonStringField(call.arguments, "roomId");
+  const content = extractPartialJsonStringField(call.arguments, "content");
+  if (!roomId || !content) return;
+  const connected = args.repository.getSnapshot().rooms.some((room) => room.id === roomId && room.participants.some((participant) => participant.agentId === args.agent.id && participant.enabled));
+  if (!connected) return;
+  const rawKind = extractPartialJsonStringField(call.arguments, "kind");
+  const kind = (["answer", "progress", "warning", "error", "clarification"] as const).find((entry) => entry === rawKind) ?? "answer";
+  publishWorkspaceEvent("turn.preview", args.turnId, {
+    kind: "room_message_preview", roomId, agentId: args.agent.id,
+    messageKey: extractPartialJsonStringField(call.arguments, "messageKey") || call.id,
+    content, messageKind: kind,
+  });
+}
+
 async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExecution[], timeline: TimelineEvent[], effects: TurnEffect[]) {
   const addTimeline = createTimelineFactory(args.turnId, timeline);
   const outputs: Array<{ callId: string; name: string; text: string; error: boolean }> = [];
@@ -118,7 +163,8 @@ async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
       const chunks = Array.isArray(delta?.tool_calls) ? delta.tool_calls as Array<Record<string, unknown>> : [];
       for (const chunk of chunks) {
         const index = Number(chunk.index ?? 0); const current = callMap.get(index) ?? { id: "", name: "", arguments: "" }; const fn = chunk.function as Record<string, unknown> | undefined;
-        callMap.set(index, { id: current.id || String(chunk.id ?? ""), name: current.name + String(fn?.name ?? ""), arguments: current.arguments + String(fn?.arguments ?? "") });
+        const next = { id: current.id || String(chunk.id ?? ""), name: current.name + String(fn?.name ?? ""), arguments: current.arguments + String(fn?.arguments ?? "") };
+        callMap.set(index, next); publishRoomMessagePreview(args, next);
       }
     });
     const calls = [...callMap.values()];
@@ -151,15 +197,22 @@ async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
       if (type === "response.output_text.delta" && typeof event.delta === "string") { assistantContent += event.delta; addTimeline("assistant_delta", { delta: event.delta }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: event.delta }); }
       if (type === "response.output_item.added") {
         const item = event.item as Record<string, unknown> | undefined;
-        if (item?.type === "function_call") callMap.set(String(item.id ?? item.call_id ?? createId("call")), { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") });
+        if (item?.type === "function_call") {
+          const key = String(item.id ?? item.call_id ?? createId("call")); const call = { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") };
+          callMap.set(key, call); publishRoomMessagePreview(args, call);
+        }
       }
       if (type === "response.function_call_arguments.delta") {
         const key = String(event.item_id ?? event.call_id ?? ""); const current = callMap.get(key) ?? { id: String(event.call_id ?? key), name: String(event.name ?? ""), arguments: "" };
-        callMap.set(key, { ...current, arguments: current.arguments + String(event.delta ?? "") });
+        const call = { ...current, arguments: current.arguments + String(event.delta ?? "") };
+        callMap.set(key, call); publishRoomMessagePreview(args, call);
       }
       if (type === "response.output_item.done") {
         const item = event.item as Record<string, unknown> | undefined;
-        if (item?.type === "function_call") callMap.set(String(item.id ?? item.call_id ?? ""), { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") });
+        if (item?.type === "function_call") {
+          const call = { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") };
+          callMap.set(String(item.id ?? item.call_id ?? ""), call); publishRoomMessagePreview(args, call);
+        }
       }
     });
     const calls = [...callMap.values()]; if (!calls.length) break;
