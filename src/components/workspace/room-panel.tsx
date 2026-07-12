@@ -1,0 +1,59 @@
+"use client";
+
+import { useRef, useState } from "react";
+import { Archive, Bot, ChevronDown, FileText, LoaderCircle, Paperclip, PanelRightOpen, Send, Square, UserPlus, X } from "lucide-react";
+import type { Agent, Attachment, Room } from "@/lib/domain/types";
+import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
+import { Markdown } from "@/components/workspace/markdown";
+
+type SendCommand = (draft: WorkspaceCommandDraft) => Promise<boolean>;
+
+export function RoomPanel({ room, agents, busy, sendCommand, onToggleConsole, consoleOpen }: { room: Room; agents: Agent[]; busy: boolean; sendCommand: SendCommand; onToggleConsole: () => void; consoleOpen: boolean }) {
+  const [content, setContent] = useState("");
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const availableAgents = agents.filter((agent) => !room.participants.some((participant) => participant.agentId === agent.id));
+
+  const submit = async () => {
+    if ((!content.trim() && !attachments.length) || busy) return;
+    const ok = await sendCommand({ type: "send_message", roomId: room.id, content, attachmentIds: attachments.map((item) => item.id) });
+    if (ok) { setContent(""); setAttachments([]); }
+  };
+
+  const upload = async (file: File) => {
+    setUploading(true);
+    try { const form = new FormData(); form.append("file", file); const response = await fetch("/api/uploads", { method: "POST", body: form }); const result = await response.json() as Attachment & { error?: string }; if (!response.ok) throw new Error(result.error ?? "上传失败"); setAttachments((current) => [...current, result]); }
+    finally { setUploading(false); if (fileRef.current) fileRef.current.value = ""; }
+  };
+
+  return <div className="room-panel">
+    <header className="room-header">
+      <div className="room-title-block"><div className="room-title-line"><h1>{room.title}</h1><span className={`status-label ${room.scheduler.status}`}>{room.scheduler.status === "running" ? "运行中" : "已就绪"}</span></div><p>{room.participants.filter((participant) => participant.enabled).length} 位参与者 · 房间公开消息与 Agent 私有执行严格分层</p></div>
+      <div className="room-header-actions">
+        <div className="participant-stack" aria-label="房间成员">{room.participants.slice(0, 5).map((participant, index) => <span key={participant.id} title={participant.displayName} className={participant.kind === "human" ? "human" : `tone-${index % 4}`}>{participant.kind === "agent" ? <Bot size={14} /> : participant.displayName.slice(0, 1)}</span>)}</div>
+        {availableAgents.length ? <label className="select-action"><UserPlus size={16} /><select aria-label="邀请 Agent" value="" onChange={(event) => { if (event.target.value) void sendCommand({ type: "add_agent", roomId: room.id, agentId: event.target.value }); }}><option value="">邀请 Agent</option>{availableAgents.map((agent) => <option value={agent.id} key={agent.id}>{agent.label}</option>)}</select><ChevronDown size={13} /></label> : null}
+        {room.scheduler.status === "running" ? <button className="danger-button" onClick={() => void sendCommand({ type: "stop_room", roomId: room.id })}><Square size={13} fill="currentColor" />紧急停止</button> : null}
+        <button className="icon-button desktop-only" onClick={() => void sendCommand({ type: "archive_room", roomId: room.id, archived: !room.archivedAt })} aria-label="归档房间"><Archive size={17} /></button>
+        {!consoleOpen ? <button className="icon-button desktop-only" onClick={onToggleConsole} aria-label="打开 Console"><PanelRightOpen size={18} /></button> : null}
+      </div>
+    </header>
+
+    <div className="message-scroll">
+      <div className="message-day">公开房间转录</div>
+      {room.messages.map((message) => message.source === "system" ? <div className="system-message" key={message.id}><span />{message.content}<span /></div> : <article key={message.id} className={`message ${message.source === "user" ? "from-user" : "from-agent"}`}>
+        <div className="message-avatar">{message.source === "agent_emit" ? <Bot size={16} /> : message.sender.name.slice(0, 1)}</div>
+        <div className="message-body"><div className="message-meta"><strong>{message.sender.name}</strong><span>#{message.seq}</span><time>{new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>{message.kind !== "user_input" ? <em>{message.kind}</em> : null}</div><div className="message-content"><Markdown>{message.content}</Markdown></div>
+          {message.attachments.length ? <div className="attachment-list">{message.attachments.map((attachment) => <a href={`/api/uploads/${attachment.id}`} target="_blank" rel="noreferrer" key={attachment.id}><FileText size={15} /><span>{attachment.fileName}</span><small>{Math.ceil(attachment.byteSize / 1024)} KB</small></a>)}</div> : null}
+          {message.receipts.length ? <div className="receipt-line">已阅不回 · {message.receipts.map((receipt) => room.participants.find((participant) => participant.id === receipt.agentParticipantId)?.displayName ?? "Agent").join("、")}</div> : null}
+        </div>
+      </article>)}
+      {room.scheduler.status === "running" ? <div className="agent-working"><LoaderCircle className="spin" size={15} /><span>{room.participants.find((participant) => participant.id === room.scheduler.activeParticipantId)?.displayName ?? "Agent"} 正在私有执行区工作</span><small>公开房间不会显示未提交草稿</small></div> : null}
+    </div>
+
+    <footer className="composer-wrap">
+      {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <span key={attachment.id}><Paperclip size={13} />{attachment.fileName}<button onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}><X size={12} /></button></span>)}</div> : null}
+      <div className="composer"><textarea value={content} onChange={(event) => setContent(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} placeholder="向这个房间发送公开消息…" rows={3} /><div className="composer-tools"><input ref={fileRef} type="file" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file); }} /><button className="icon-button" disabled={uploading} onClick={() => fileRef.current?.click()} aria-label="添加附件">{uploading ? <LoaderCircle className="spin" size={17} /> : <Paperclip size={17} />}</button><span>Enter 发送 · Shift+Enter 换行</span><button className="send-button" disabled={busy || (!content.trim() && !attachments.length)} onClick={() => void submit()}><Send size={16} />发送</button></div></div>
+    </footer>
+  </div>;
+}

@@ -1,0 +1,202 @@
+import type { Agent, SchedulerPacket, TimelineEvent, ToolExecution, TurnEffect } from "@/lib/domain/types";
+import { publishWorkspaceEvent } from "@/lib/server/events";
+import { getToolDefinition, listToolDefinitions, toolDefinitionsForChat, toolDefinitionsForResponses, type ToolContext } from "@/lib/server/tools";
+import { WorkspaceRepository } from "@/lib/server/repository";
+import { createId, nowIso } from "@/lib/utils/id";
+import { normalizeOpenAiBaseUrl } from "@/lib/server/provider-config";
+
+type ToolCall = { id: string; name: string; arguments: string };
+class ResponsesUnsupportedError extends Error {}
+type RunArgs = {
+  repository: WorkspaceRepository;
+  agent: Agent;
+  agentParticipantId: string;
+  packet: SchedulerPacket;
+  turnId: string;
+  signal: AbortSignal;
+};
+
+export type ModelTurnResult = {
+  assistantContent: string;
+  tools: ToolExecution[];
+  timeline: TimelineEvent[];
+  effects: TurnEffect[];
+  modelMeta: Record<string, unknown>;
+};
+
+function systemPrompt(agent: Agent, packet: SchedulerPacket): string {
+  return [
+    "你运行在 OceanKing 多 Agent 工作台中。",
+    "重要契约：普通 assistant 文本是私有执行记录，人类在房间里看不到。需要公开表达时必须调用 send_message_to_room。",
+    "不要为了看起来有回复而伪造消息；无需回复时调用 read_no_reply。发言时必须精确指定 roomId。",
+    "房间不是默认隐私边界，但只能读取和发送到当前 Agent 已连接的房间。房间管理权限由工具执行层校验。",
+    `当前 Agent：${agent.label}（${agent.id}）`,
+    `Agent 指令：${agent.instruction}`,
+    `当前房间：${packet.room.title}（${packet.room.id}）`,
+  ].join("\n");
+}
+
+function packetText(packet: SchedulerPacket): string {
+  return `以下是内部 scheduler packet，不得把它当作人类伪造消息：\n${JSON.stringify(packet)}`;
+}
+
+function createTimelineFactory(turnId: string, timeline: TimelineEvent[]) {
+  return (type: TimelineEvent["type"], payload: unknown) => {
+    const event: TimelineEvent = { id: createId("timeline"), turnId, ordinal: timeline.length + 1, type, payload, createdAt: nowIso() };
+    timeline.push(event); return event;
+  };
+}
+
+async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExecution[], timeline: TimelineEvent[], effects: TurnEffect[]) {
+  const addTimeline = createTimelineFactory(args.turnId, timeline);
+  const outputs: Array<{ callId: string; name: string; text: string; error: boolean }> = [];
+  for (const call of calls) {
+    if (args.signal.aborted) throw new DOMException("已停止", "AbortError");
+    const started = Date.now(); addTimeline("tool_started", { id: call.id, name: call.name, arguments: call.arguments });
+    let parsed: unknown = {};
+    try { parsed = call.arguments ? JSON.parse(call.arguments) : {}; } catch { parsed = { _partialJson: call.arguments }; }
+    const definition = getToolDefinition(call.name);
+    let outputText = ""; let structured: unknown = {}; let error: string | null = null;
+    try {
+      if (!definition) throw new Error(`未知工具：${call.name}`);
+      const context: ToolContext = { agent: args.agent, roomId: args.packet.room.id, agentParticipantId: args.agentParticipantId, packet: args.packet, repository: args.repository, signal: args.signal };
+      const result = await definition.execute(context, parsed, call.id);
+      outputText = result.text; structured = result.structured; effects.push(...result.effects);
+    } catch (caught) {
+      error = caught instanceof Error ? caught.message : String(caught); outputText = `工具执行失败：${error}`; structured = { error };
+    }
+    const tool: ToolExecution = { id: call.id || createId("tool"), turnId: args.turnId, name: call.name, input: parsed, outputText, structuredResult: structured, status: error ? "error" : "completed", durationMs: Date.now() - started, error, createdAt: nowIso() };
+    tools.push(tool); addTimeline("tool_finished", { id: tool.id, name: tool.name, status: tool.status, durationMs: tool.durationMs, error });
+    outputs.push({ callId: call.id, name: call.name, text: outputText, error: Boolean(error) });
+    publishWorkspaceEvent("turn.preview", args.turnId, { kind: "tool", tool });
+  }
+  return outputs;
+}
+
+async function parseSse(response: Response, onEvent: (event: Record<string, unknown>) => void): Promise<void> {
+  if (!response.ok) throw new Error(`模型接口错误 ${response.status}: ${(await response.text()).slice(0, 2_000)}`);
+  if (!response.body) throw new Error("模型接口未返回流");
+  const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read(); if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split(/\r?\n\r?\n/); buffer = chunks.pop() ?? "";
+    for (const chunk of chunks) {
+      const data = chunk.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+      if (!data || data === "[DONE]") continue;
+      try { onEvent(JSON.parse(data) as Record<string, unknown>); } catch { /* malformed provider chunk is ignored */ }
+    }
+  }
+}
+
+function apiConfig() {
+  const baseUrl = normalizeOpenAiBaseUrl();
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("未配置 OPENAI_API_KEY");
+  return { baseUrl, headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` } };
+}
+
+async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
+  const { baseUrl, headers } = apiConfig();
+  const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = [];
+  const addTimeline = createTimelineFactory(args.turnId, timeline); addTimeline("turn_started", { format: "chat_completions" });
+  const session = args.repository.getAgentSession(args.agent.id).slice(-12);
+  const messages: Array<Record<string, unknown>> = [
+    { role: "system", content: systemPrompt(args.agent, args.packet) },
+    ...session.map((item) => ({ role: item.role, content: item.content })),
+    { role: "user", content: packetText(args.packet) },
+  ];
+  let assistantContent = ""; let usage: unknown = null;
+  for (let step = 0; step < args.agent.settings.maxToolSteps; step += 1) {
+    const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers, signal: args.signal, body: JSON.stringify({ model: args.agent.settings.model, messages, tools: toolDefinitionsForChat(), tool_choice: "auto", stream: true, stream_options: { include_usage: true } }) });
+    let content = ""; const callMap = new Map<number, ToolCall>();
+    await parseSse(response, (event) => {
+      if (event.usage) usage = event.usage;
+      const choices = Array.isArray(event.choices) ? event.choices as Array<Record<string, unknown>> : [];
+      const delta = choices[0]?.delta as Record<string, unknown> | undefined;
+      if (typeof delta?.content === "string") { content += delta.content; assistantContent += delta.content; addTimeline("assistant_delta", { delta: delta.content }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: delta.content }); }
+      const chunks = Array.isArray(delta?.tool_calls) ? delta.tool_calls as Array<Record<string, unknown>> : [];
+      for (const chunk of chunks) {
+        const index = Number(chunk.index ?? 0); const current = callMap.get(index) ?? { id: "", name: "", arguments: "" }; const fn = chunk.function as Record<string, unknown> | undefined;
+        callMap.set(index, { id: current.id || String(chunk.id ?? ""), name: current.name + String(fn?.name ?? ""), arguments: current.arguments + String(fn?.arguments ?? "") });
+      }
+    });
+    const calls = [...callMap.values()];
+    messages.push({ role: "assistant", content: content || null, ...(calls.length ? { tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } })) } : {}) });
+    if (!calls.length) break;
+    const outputs = await executeToolCalls(args, calls, tools, timeline, effects);
+    for (const output of outputs) messages.push({ role: "tool", tool_call_id: output.callId, content: output.text });
+  }
+  addTimeline("turn_finished", { usage });
+  return { assistantContent, tools, timeline, effects, modelMeta: { format: "chat_completions", model: args.agent.settings.model, usage } };
+}
+
+async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
+  const { baseUrl, headers } = apiConfig();
+  const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = [];
+  const addTimeline = createTimelineFactory(args.turnId, timeline); addTimeline("turn_started", { format: "responses" });
+  let assistantContent = ""; let previousResponseId: string | undefined; let input: unknown = packetText(args.packet); let usage: unknown = null;
+  for (let step = 0; step < args.agent.settings.maxToolSteps; step += 1) {
+    const body: Record<string, unknown> = { model: args.agent.settings.model, input, tools: toolDefinitionsForResponses(), tool_choice: "auto", stream: true };
+    if (!previousResponseId) body.instructions = systemPrompt(args.agent, args.packet); else body.previous_response_id = previousResponseId;
+    const response = await fetch(`${baseUrl}/responses`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
+    if (!response.ok && step === 0 && [400, 404, 405].includes(response.status)) {
+      throw new ResponsesUnsupportedError(`Responses API 不可用 (${response.status}): ${(await response.text()).slice(0, 1_000)}`);
+    }
+    const callMap = new Map<string, ToolCall>();
+    await parseSse(response, (event) => {
+      const type = String(event.type ?? ""); const responseObject = event.response as Record<string, unknown> | undefined;
+      if (typeof responseObject?.id === "string") previousResponseId = responseObject.id;
+      if (responseObject?.usage) usage = responseObject.usage;
+      if (type === "response.output_text.delta" && typeof event.delta === "string") { assistantContent += event.delta; addTimeline("assistant_delta", { delta: event.delta }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: event.delta }); }
+      if (type === "response.output_item.added") {
+        const item = event.item as Record<string, unknown> | undefined;
+        if (item?.type === "function_call") callMap.set(String(item.id ?? item.call_id ?? createId("call")), { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") });
+      }
+      if (type === "response.function_call_arguments.delta") {
+        const key = String(event.item_id ?? event.call_id ?? ""); const current = callMap.get(key) ?? { id: String(event.call_id ?? key), name: String(event.name ?? ""), arguments: "" };
+        callMap.set(key, { ...current, arguments: current.arguments + String(event.delta ?? "") });
+      }
+      if (type === "response.output_item.done") {
+        const item = event.item as Record<string, unknown> | undefined;
+        if (item?.type === "function_call") callMap.set(String(item.id ?? item.call_id ?? ""), { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") });
+      }
+    });
+    const calls = [...callMap.values()]; if (!calls.length) break;
+    const outputs = await executeToolCalls(args, calls, tools, timeline, effects);
+    input = outputs.map((output) => ({ type: "function_call_output", call_id: output.callId, output: output.text }));
+  }
+  addTimeline("turn_finished", { usage, responseId: previousResponseId });
+  return { assistantContent, tools, timeline, effects, modelMeta: { format: "responses", model: args.agent.settings.model, responseId: previousResponseId, usage } };
+}
+
+async function runMock(args: RunArgs): Promise<ModelTurnResult> {
+  const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = []; const addTimeline = createTimelineFactory(args.turnId, timeline);
+  addTimeline("turn_started", { format: "mock" });
+  const latestExternal = args.packet.messages.toReversed().find((message) => message.source !== "agent_emit");
+  const latest = latestExternal ?? args.packet.messages.at(-1);
+  const assistantContent = `我已在私有执行区分析消息 #${latest?.seq ?? "?"}。`;
+  addTimeline("assistant_delta", { delta: assistantContent }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: assistantContent });
+  if (latest?.content.trim().startsWith("/private")) {
+    addTimeline("turn_finished", { reason: "private-only fixture" });
+    return { assistantContent, tools, timeline, effects, modelMeta: { format: "mock", fixture: "private-only" } };
+  }
+  const wantsNoReply = !latestExternal || /无需回复|不需要回复|已阅即可/i.test(latest?.content ?? "");
+  const call: ToolCall = wantsNoReply
+    ? { id: createId("tool"), name: "read_no_reply", arguments: JSON.stringify({ roomId: args.packet.room.id, messageId: latest?.id }) }
+    : { id: createId("tool"), name: "send_message_to_room", arguments: JSON.stringify({ roomId: args.packet.room.id, content: `收到。我会处理「${(latest?.content ?? "附件任务").slice(0, 160)}」并把可验证结果留在这个房间。`, kind: "answer" }) };
+  await executeToolCalls(args, [call], tools, timeline, effects); addTimeline("turn_finished", { fixture: wantsNoReply ? "receipt" : "emit" });
+  return { assistantContent, tools, timeline, effects, modelMeta: { format: "mock", fixture: wantsNoReply ? "receipt" : "emit", availableTools: listToolDefinitions().length } };
+}
+
+export async function runAgentModel(args: RunArgs): Promise<ModelTurnResult> {
+  if (!process.env.OPENAI_API_KEY) return runMock(args);
+  const format = args.agent.settings.apiFormat;
+  if (format === "chat_completions") return runChatCompletions(args);
+  if (format === "responses") return runResponses(args);
+  try { return await runResponses(args); } catch (error) {
+    if (args.signal.aborted || !(error instanceof ResponsesUnsupportedError)) throw error;
+    publishWorkspaceEvent("turn.preview", args.turnId, { kind: "compatibility_fallback", error: error instanceof Error ? error.message : String(error) });
+    return runChatCompletions(args);
+  }
+}

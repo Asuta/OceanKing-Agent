@@ -1,0 +1,61 @@
+"use client";
+
+import { startTransition, useCallback, useEffect, useRef, useState } from "react";
+import type { WorkspaceSnapshot } from "@/lib/domain/types";
+import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
+
+export function useWorkspace(initialSnapshot: WorkspaceSnapshot) {
+  const [snapshot, setSnapshot] = useState(initialSnapshot);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [previews, setPreviews] = useState<Record<string, string>>({});
+  const versionRef = useRef(initialSnapshot.version);
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => { versionRef.current = snapshot.version; }, [snapshot.version]);
+
+  const refresh = useCallback(async () => {
+    const response = await fetch("/api/workspace", { cache: "no-store" });
+    if (!response.ok) return;
+    const next = await response.json() as WorkspaceSnapshot;
+    startTransition(() => setSnapshot(next));
+  }, []);
+
+  useEffect(() => {
+    const events = new EventSource(`/api/events?after=${initialSnapshot.revision}`);
+    const onEvent = (raw: MessageEvent<string>) => {
+      try {
+        const event = JSON.parse(raw.data) as { type: string; entityId?: string; payload?: { kind?: string; delta?: string; status?: string } };
+        if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "assistant_delta" && event.payload.delta) {
+          setPreviews((current) => ({ ...current, [event.entityId!]: `${current[event.entityId!] ?? ""}${event.payload!.delta}` }));
+        }
+        if (refreshTimer.current) clearTimeout(refreshTimer.current);
+        refreshTimer.current = setTimeout(() => { void refresh(); }, 80);
+      } catch { /* ignore malformed event */ }
+    };
+    ["workspace.changed", "turn.preview", "scheduler.changed", "cron.changed"].forEach((name) => events.addEventListener(name, onEvent as EventListener));
+    events.onerror = () => setError("实时连接正在重试，权威数据不会丢失");
+    return () => { events.close(); if (refreshTimer.current) clearTimeout(refreshTimer.current); };
+  }, [initialSnapshot.revision, refresh]);
+
+  const sendCommand = useCallback(async (draft: WorkspaceCommandDraft) => {
+    setBusy(true); setError(null);
+    const post = async (version: number) => fetch("/api/commands", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...draft, commandId: crypto.randomUUID(), expectedVersion: version }) });
+    try {
+      let response = await post(versionRef.current);
+      if (response.status === 409) {
+        const conflict = await response.json() as { snapshot: WorkspaceSnapshot };
+        setSnapshot(conflict.snapshot); versionRef.current = conflict.snapshot.version;
+        response = await post(conflict.snapshot.version);
+      }
+      const body = await response.json() as { error?: string; snapshot?: WorkspaceSnapshot };
+      if (!response.ok) throw new Error(body.error ?? "命令执行失败");
+      if (body.snapshot) { setSnapshot(body.snapshot); versionRef.current = body.snapshot.version; }
+      return true;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught)); return false;
+    } finally { setBusy(false); }
+  }, []);
+
+  return { snapshot, busy, error, setError, previews, refresh, sendCommand };
+}
