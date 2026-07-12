@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Archive, Bot, ChevronDown, FileText, LoaderCircle, Paperclip, PanelRightOpen, Send, Square, UserPlus, X } from "lucide-react";
+import { Archive, Bot, Check, ChevronDown, FileText, LoaderCircle, Paperclip, PanelRightOpen, Pencil, Send, Square, UserPlus, X } from "lucide-react";
 import type { Agent, Attachment, Room, RoomMessagePreview } from "@/lib/domain/types";
 import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
 import { Markdown } from "@/components/workspace/markdown";
@@ -11,6 +11,45 @@ const scrollFollowThreshold = 48;
 
 function isAtMessageBottom(element: HTMLDivElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= scrollFollowThreshold;
+}
+
+export function RoomTitleEditor({ roomId, title, busy, sendCommand }: { roomId: string; title: string; busy: boolean; sendCommand: SendCommand }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(title);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!editing) return;
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, [editing]);
+
+  const cancel = () => {
+    setDraft(title);
+    setEditing(false);
+  };
+
+  const save = async () => {
+    const nextTitle = draft.trim();
+    if (!nextTitle || busy) return;
+    if (nextTitle === title) {
+      cancel();
+      return;
+    }
+    if (await sendCommand({ type: "rename_room", roomId, title: nextTitle })) setEditing(false);
+  };
+
+  if (!editing) return <div className="room-title-display">
+    <h1>{title}</h1>
+    <button className="rename-room-button" type="button" onClick={() => setEditing(true)} aria-label="修改房间名称" title="修改房间名称"><Pencil size={13} /></button>
+  </div>;
+
+  const empty = !draft.trim();
+  return <form className="room-title-editor" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+    <input ref={inputRef} value={draft} maxLength={120} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); cancel(); } }} aria-label="房间名称" aria-invalid={empty} />
+    <button type="submit" disabled={busy || empty} aria-label="保存房间名称" title="保存"><Check size={14} /></button>
+    <button type="button" disabled={busy} onClick={cancel} aria-label="取消修改房间名称" title="取消"><X size={14} /></button>
+  </form>;
 }
 
 export function RoomPanel({ room, agents, previews, busy, sendCommand, onToggleConsole, consoleOpen }: { room: Room; agents: Agent[]; previews: RoomMessagePreview[]; busy: boolean; sendCommand: SendCommand; onToggleConsole: () => void; consoleOpen: boolean }) {
@@ -48,7 +87,7 @@ export function RoomPanel({ room, agents, previews, busy, sendCommand, onToggleC
 
   return <div className="room-panel">
     <header className="room-header">
-      <div className="room-title-block"><div className="room-title-line"><h1>{room.title}</h1><span className={`status-label ${room.scheduler.status}`}>{room.scheduler.status === "running" ? "运行中" : "已就绪"}</span></div><p>{room.participants.filter((participant) => participant.enabled).length} 位参与者 · 房间公开消息与 Agent 私有执行严格分层</p></div>
+      <div className="room-title-block"><div className="room-title-line"><RoomTitleEditor key={`${room.id}:${room.title}`} roomId={room.id} title={room.title} busy={busy} sendCommand={sendCommand} /><span className={`status-label ${room.scheduler.status}`}>{room.scheduler.status === "running" ? "运行中" : "已就绪"}</span></div><p>{room.participants.filter((participant) => participant.enabled).length} 位参与者 · 房间公开消息与 Agent 私有执行严格分层</p></div>
       <div className="room-header-actions">
         <div className="participant-stack" aria-label="房间成员">{room.participants.slice(0, 5).map((participant, index) => <span key={participant.id} title={participant.displayName} className={participant.kind === "human" ? "human" : `tone-${index % 4}`}>{participant.kind === "agent" ? <Bot size={14} /> : participant.displayName.slice(0, 1)}</span>)}</div>
         {availableAgents.length ? <label className="select-action"><UserPlus size={16} /><select aria-label="邀请 Agent" value="" onChange={(event) => { if (event.target.value) void sendCommand({ type: "add_agent", roomId: room.id, agentId: event.target.value }); }}><option value="">邀请 Agent</option>{availableAgents.map((agent) => <option value={agent.id} key={agent.id}>{agent.label}</option>)}</select><ChevronDown size={13} /></label> : null}

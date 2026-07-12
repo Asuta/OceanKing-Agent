@@ -80,6 +80,14 @@ describe("OceanKing 领域仓库", () => {
     expect(repository.getRoom("room_harbor")!.messages.some((message) => message.content === "服务端新消息")).toBe(true);
   }));
 
+  it("房间改名通过权威仓库持久化且保留房间内容", async () => withRepository((repository) => {
+    const before = repository.getRoom("room_harbor")!;
+    repository.executeCommand({ ...commandBase(repository), type: "rename_room", roomId: before.id, title: "产品讨论室" });
+    const renamed = repository.getRoom(before.id)!;
+    expect(renamed.title).toBe("产品讨论室");
+    expect(renamed.messages.map((message) => message.id)).toEqual(before.messages.map((message) => message.id));
+  }));
+
   it("停止与进程恢复会把 running turn 收敛到明确状态", async () => withRepository((repository) => {
     sendUser(repository, "room_harbor", "长任务"); const packet = packetFor(repository);
     repository.beginTurn({ turnId: "turn_recovery", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
