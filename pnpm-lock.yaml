@@ -17,6 +17,9 @@ importers:
       drizzle-orm:
         specifier: ^0.45.1
         version: 0.45.2(@types/better-sqlite3@7.6.13)(better-sqlite3@12.11.1)
+      gpt-tokenizer:
+        specifier: ^3.4.0
+        version: 3.4.0
       lucide-react:
         specifier: ^0.468.0
         version: 0.468.0(react@19.2.7)
@@ -1812,6 +1815,9 @@ packages:
   gopd@1.2.0:
     resolution: {integrity: sha512-ZUKRh6/kUFoAiTAtTYPZJ3hw9wNxx+BIBOijnlG9PnrJsCcSjs1wyyD6vJpaYtgnzDrKYRSqf3OO6Rfa93xsRg==}
     engines: {node: '>= 0.4'}
+
+  gpt-tokenizer@3.4.0:
+    resolution: {integrity: sha512-wxFLnhIXTDjYebd9A9pGl3e31ZpSypbpIJSOswbgop5jLte/AsZVDvjlbEuVFlsqZixVKqbcoNmRlFDf6pz/UQ==}
 
   has-bigints@1.1.0:
     resolution: {integrity: sha512-R3pbpkcIqv2Pm3dUwgjclDRVmWpTJW2DcMzcIhEXEx1oh/CEMObMm3KLmRJOdvhM7o4uQBnwr8pzRK2sJWIqfg==}
@@ -4787,6 +4793,8 @@ snapshots:
       gopd: 1.2.0
 
   gopd@1.2.0: {}
+
+  gpt-tokenizer@3.4.0: {}
 
   has-bigints@1.1.0: {}
 

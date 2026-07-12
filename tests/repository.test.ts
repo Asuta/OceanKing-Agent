@@ -25,6 +25,16 @@ describe("OceanKing 领域仓库", () => {
     expect(room.turns.at(-1)?.emittedMessageIds).toEqual([]);
   }));
 
+  it("Agent 会话完整持久化，不再按固定条数截断", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "长期任务"); const packet = packetFor(repository);
+    for (let index = 0; index < 25; index += 1) {
+      const turnId = `turn_history_${index}`;
+      repository.beginTurn({ turnId, roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+      repository.finishTurn({ turnId, assistantContent: `第 ${index} 轮结果`, tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
+    }
+    expect(repository.getAgentSession("navigator")).toHaveLength(50);
+  }));
+
   it("相同 messageKey 重放只保留一条正式消息", async () => withRepository((repository) => {
     sendUser(repository, "room_harbor", "请公开回复"); const packet = packetFor(repository);
     const effect: TurnEffect = { type: "send_message", roomId: "room_harbor", messageId: "msg_emit_one", messageKey: "call-stable", content: "正式结论", kind: "answer" };
@@ -98,11 +108,12 @@ describe("OceanKing 领域仓库", () => {
   it("全局模型选择会被所有 Agent 与工作流共同读取", async () => withRepository((repository) => {
     repository.executeCommand({
       ...commandBase(repository), type: "update_settings", model: "deepseek-v4-flash", availableModels: ["deepseek-v4-pro", "deepseek-v4-flash"],
-      apiFormat: "chat_completions", thinkingMode: "enabled", reasoningEffort: "max", maxToolSteps: 12, maxRoomRounds: 32, projectContextRoots: [],
+      apiFormat: "chat_completions", thinkingMode: "enabled", reasoningEffort: "max", contextTokenThreshold: 64_000, maxToolSteps: 12, maxRoomRounds: 32, projectContextRoots: [],
     });
     const snapshot = repository.getSnapshot();
     expect(snapshot.settings.model).toBe("deepseek-v4-flash");
     expect(snapshot.settings.availableModels).toEqual(["deepseek-v4-pro", "deepseek-v4-flash"]);
+    expect(snapshot.settings.contextTokenThreshold).toBe(64_000);
     expect(snapshot.agents.every((agent) => agent.settings.model === "deepseek-v4-flash")).toBe(true);
     expect(repository.getAgent("navigator")?.settings).toMatchObject({ model: "deepseek-v4-flash", apiFormat: "chat_completions", thinkingMode: "enabled", reasoningEffort: "max" });
   }));
@@ -115,7 +126,7 @@ describe("OceanKing 领域仓库", () => {
     expect(repository.getSnapshot().settings).toMatchObject({ thinkingMode: "provider_default", reasoningEffort: "high" });
   }));
 
-  it("会话历史按完整用户工具链裁剪，不拆散 assistant 与 tool 消息", async () => withRepository((repository) => {
+  it("会话历史完整保留 assistant 与 tool 消息", async () => withRepository((repository) => {
     const history: AgentSessionMessage[] = Array.from({ length: 20 }, (_, index) => {
       const callId = `call_${index}`;
       return [
@@ -125,23 +136,23 @@ describe("OceanKing 领域仓库", () => {
       ];
     }).flat();
     repository.raw.prepare("UPDATE agent_sessions SET history_json=? WHERE agent_id='navigator'").run(JSON.stringify(history));
-    sendUser(repository, "room_harbor", "触发历史裁剪"); const packet = packetFor(repository);
+    sendUser(repository, "room_harbor", "追加一轮会话"); const packet = packetFor(repository);
     repository.beginTurn({ turnId: "turn_trim_session", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
     repository.finishTurn({ turnId: "turn_trim_session", assistantContent: "done", sessionMessages: [{ role: "user", content: "current_user" }, { role: "assistant", content: "done" }], tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
 
-    const trimmed = repository.getAgentSession("navigator");
-    expect(trimmed.filter((message) => message.role === "user")).toHaveLength(20);
-    expect(trimmed[0]).toEqual({ role: "user", content: "user_1" });
-    for (let index = 0; index < trimmed.length; index += 1) {
-      const message = trimmed[index];
+    const session = repository.getAgentSession("navigator");
+    expect(session.filter((message) => message.role === "user")).toHaveLength(21);
+    expect(session[0]).toEqual({ role: "user", content: "user_0" });
+    for (let index = 0; index < session.length; index += 1) {
+      const message = session[index];
       if (message?.role !== "tool") continue;
-      const assistant = trimmed[index - 1];
+      const assistant = session[index - 1];
       expect(assistant?.role).toBe("assistant");
       if (assistant?.role === "assistant") expect(assistant.tool_calls?.[0]?.id).toBe(message.tool_call_id);
     }
   }));
 
-  it("超出会话字节预算时丢弃整个工具 Turn", async () => withRepository((repository) => {
+  it("超大会话工具结果仍完整保留", async () => withRepository((repository) => {
     sendUser(repository, "room_harbor", "超大工具结果"); const packet = packetFor(repository);
     repository.beginTurn({ turnId: "turn_oversized_session", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
     repository.finishTurn({
@@ -153,7 +164,10 @@ describe("OceanKing 领域仓库", () => {
       ],
       tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null,
     });
-    expect(repository.getAgentSession("navigator")).toEqual([]);
+    const session = repository.getAgentSession("navigator");
+    expect(session).toHaveLength(3);
+    expect(session[2]).toMatchObject({ role: "tool", tool_call_id: "call_oversized" });
+    expect(session[2]?.content).toHaveLength(600 * 1024);
   }));
 
   it("附件元数据绑定到正式消息并可在重载快照中恢复", async () => withRepository((repository) => {

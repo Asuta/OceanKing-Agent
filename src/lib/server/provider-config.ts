@@ -22,8 +22,21 @@ export function environmentRuntimeDefaults(): ModelAndRuntimeSettings {
     reasoningEffort: reasoningEffort === "max" ? "max" : "high",
     model,
     availableModels,
+    contextTokenThreshold: Number(process.env.OCEANKING_CONTEXT_TOKEN_THRESHOLD ?? 100_000),
     maxToolSteps: Number(process.env.OCEANKING_MAX_TOOL_STEPS ?? 12),
     maxRoomRounds: Number(process.env.OCEANKING_MAX_ROOM_ROUNDS ?? 32),
     projectContextRoots: [],
+  };
+}
+
+export function normalizeRuntimeSettings(persisted: Partial<ModelAndRuntimeSettings>): ModelAndRuntimeSettings {
+  const defaults = environmentRuntimeDefaults();
+  return {
+    ...defaults,
+    ...persisted,
+    contextTokenThreshold: Number.isInteger(persisted.contextTokenThreshold) && persisted.contextTokenThreshold! >= 1_024
+      ? persisted.contextTokenThreshold!
+      : defaults.contextTokenThreshold,
+    projectContextRoots: persisted.projectContextRoots ?? [],
   };
 }

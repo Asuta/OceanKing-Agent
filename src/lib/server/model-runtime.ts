@@ -1,9 +1,12 @@
-import type { Agent, AgentSessionMessage, SchedulerPacket, TimelineEvent, ToolExecution, TurnEffect } from "@/lib/domain/types";
+import type { Agent, AgentSessionMessage, ContextCompaction, SchedulerPacket, TimelineEvent, ToolExecution, TurnEffect } from "@/lib/domain/types";
 import { publishWorkspaceEvent } from "@/lib/server/events";
 import { getToolDefinition, listToolDefinitions, toolDefinitionsForChat, toolDefinitionsForResponses, type ToolContext } from "@/lib/server/tools";
 import { WorkspaceRepository } from "@/lib/server/repository";
 import { createId, nowIso } from "@/lib/utils/id";
 import { normalizeOpenAiBaseUrl } from "@/lib/server/provider-config";
+import {
+  compactedSessionContent, contextCompactionInstructions, countRenderedContextTokens,
+} from "@/lib/server/context-compaction";
 
 type ToolCall = { id: string; name: string; arguments: string };
 const terminalToolNames = new Set(["send_message_to_room", "read_no_reply"]);
@@ -24,6 +27,15 @@ export type ModelTurnResult = {
   timeline: TimelineEvent[];
   effects: TurnEffect[];
   modelMeta: Record<string, unknown>;
+  contextCompaction?: ContextCompaction;
+};
+
+type PreparedContext = {
+  messages: Array<Record<string, unknown>>;
+  estimatedTokens: number;
+  compactedTokens: number | null;
+  threshold: number;
+  compaction?: ContextCompaction;
 };
 
 function systemPrompt(agent: Agent, packet: SchedulerPacket): string {
@@ -40,6 +52,13 @@ function systemPrompt(agent: Agent, packet: SchedulerPacket): string {
 
 function packetText(packet: SchedulerPacket): string {
   return `以下是内部 scheduler packet，不得把它当作人类伪造消息：\n${JSON.stringify(packet)}`;
+}
+
+function responseContextMessage(message: AgentSessionMessage): Record<string, unknown> {
+  if (message.role === "user") return { role: "user", content: message.content };
+  if (message.role === "tool") return { role: "user", content: `工具结果（${message.tool_call_id}）：${message.content}` };
+  if (!message.reasoning_content && !message.tool_calls?.length) return { role: "assistant", content: message.content ?? "" };
+  return { role: "assistant", content: JSON.stringify({ content: message.content, reasoning_content: message.reasoning_content, tool_calls: message.tool_calls }) };
 }
 
 function createTimelineFactory(turnId: string, timeline: TimelineEvent[]) {
@@ -157,25 +176,129 @@ function isDeepSeekBaseUrl(baseUrl: string): boolean {
   catch { return false; }
 }
 
+async function compactWithChatCompletions(args: RunArgs, messages: Array<Record<string, unknown>>): Promise<string> {
+  const { baseUrl, headers } = apiConfig();
+  const body: Record<string, unknown> = {
+    model: args.agent.settings.model,
+    messages: [
+      { role: "system", content: contextCompactionInstructions },
+      ...messages,
+      { role: "user", content: "现在压缩上面的完整会话，只输出可供 Agent 继续工作的压缩上下文。" },
+    ],
+    stream: true,
+  };
+  applyChatThinkingSettings(body, args.agent, baseUrl);
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST", headers, signal: args.signal,
+    body: JSON.stringify(body),
+  });
+  let summary = "";
+  await parseSse(response, (event) => {
+    const choices = Array.isArray(event.choices) ? event.choices as Array<Record<string, unknown>> : [];
+    const delta = choices[0]?.delta as Record<string, unknown> | undefined;
+    if (typeof delta?.content === "string") summary += delta.content;
+  });
+  if (!summary.trim()) throw new Error("上下文压缩失败：模型没有返回压缩内容");
+  return summary.trim();
+}
+
+async function compactWithResponses(args: RunArgs, messages: Array<Record<string, unknown>>): Promise<string> {
+  const { baseUrl, headers } = apiConfig();
+  const response = await fetch(`${baseUrl}/responses`, {
+    method: "POST", headers, signal: args.signal,
+    body: JSON.stringify({
+      model: args.agent.settings.model,
+      instructions: contextCompactionInstructions,
+      input: [...messages, { role: "user", content: "现在压缩上面的完整会话，只输出可供 Agent 继续工作的压缩上下文。" }],
+      stream: true,
+    }),
+  });
+  if (!response.ok && [400, 404, 405].includes(response.status)) {
+    throw new ResponsesUnsupportedError(`Responses API 不可用 (${response.status}): ${(await response.text()).slice(0, 1_000)}`);
+  }
+  let summary = "";
+  await parseSse(response, (event) => {
+    if (event.type === "response.output_text.delta" && typeof event.delta === "string") summary += event.delta;
+  });
+  if (!summary.trim()) throw new Error("上下文压缩失败：模型没有返回压缩内容");
+  return summary.trim();
+}
+
+async function prepareContext(args: RunArgs, format: "responses" | "chat_completions", messages: Array<Record<string, unknown>>): Promise<PreparedContext> {
+  const tools = format === "responses" ? toolDefinitionsForResponses() : toolDefinitionsForChat();
+  const instructions = systemPrompt(args.agent, args.packet);
+  const estimatedTokens = countRenderedContextTokens({ instructions, messages, tools });
+  const threshold = args.agent.settings.contextTokenThreshold;
+  if (estimatedTokens <= threshold) return { messages, estimatedTokens, compactedTokens: null, threshold };
+
+  const summary = format === "responses"
+    ? await compactWithResponses(args, messages)
+    : await compactWithChatCompletions(args, messages.map((message) => ({ ...message })));
+  const compactedMessages: Array<Record<string, unknown>> = [{ role: "user", content: compactedSessionContent(summary) }];
+  const compactedTokens = countRenderedContextTokens({ instructions, messages: compactedMessages, tools });
+  if (compactedTokens > threshold) {
+    throw new Error(`上下文压缩后仍有 ${compactedTokens} tokens，超过阈值 ${threshold}`);
+  }
+  return {
+    messages: compactedMessages,
+    estimatedTokens,
+    compactedTokens,
+    threshold,
+    compaction: { summary, estimatedTokens, compactedTokens, threshold, sourceEntries: messages.length },
+  };
+}
+
+function contextMeta(prepared: PreparedContext): Record<string, unknown> {
+  return {
+    estimatedTokens: prepared.estimatedTokens,
+    threshold: prepared.threshold,
+    compacted: Boolean(prepared.compaction),
+    compactedTokens: prepared.compactedTokens,
+    sourceEntries: prepared.compaction?.sourceEntries,
+  };
+}
+
 async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
   const { baseUrl, headers } = apiConfig();
   const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = [];
-  const addTimeline = createTimelineFactory(args.turnId, timeline); addTimeline("turn_started", { format: "chat_completions" });
   const session = args.repository.getAgentSession(args.agent.id);
   const userMessage: AgentSessionMessage = { role: "user", content: packetText(args.packet) };
-  const sessionMessages: AgentSessionMessage[] = [userMessage];
+  const prepared = await prepareContext(args, "chat_completions", [...session, userMessage].map((message) => ({ ...message })));
+  const addTimeline = createTimelineFactory(args.turnId, timeline); addTimeline("turn_started", { format: "chat_completions", context: contextMeta(prepared) });
+  let sessionMessages: AgentSessionMessage[] = prepared.compaction
+    ? [{ role: "user", content: compactedSessionContent(prepared.compaction.summary) }]
+    : [userMessage];
   const messages: Array<Record<string, unknown>> = [
     { role: "system", content: systemPrompt(args.agent, args.packet) },
-    ...session,
-    userMessage,
+    ...prepared.messages,
   ];
+  const chatToolDefinitions = toolDefinitionsForChat();
   let assistantContent = ""; let usage: unknown = null; let toolSteps = 0; let reasoningCharacters = 0;
   for (let step = 0; step <= args.agent.settings.maxToolSteps + 1; step += 1) {
     const regularToolsAllowed = step < args.agent.settings.maxToolSteps;
     const terminalToolsOnly = step === args.agent.settings.maxToolSteps;
+    const requestTools = regularToolsAllowed
+      ? chatToolDefinitions
+      : terminalToolsOnly
+        ? chatToolDefinitions.filter((tool) => terminalToolNames.has(tool.function.name))
+        : [];
+    const requestTokens = countRenderedContextTokens({ instructions: "", messages, tools: requestTools });
+    if (requestTokens > prepared.threshold) {
+      const sourceEntries = messages.length - 1;
+      const summary = await compactWithChatCompletions(args, messages.slice(1));
+      messages.splice(0, messages.length,
+        { role: "system", content: systemPrompt(args.agent, args.packet) },
+        { role: "user", content: compactedSessionContent(summary) },
+      );
+      sessionMessages = [{ role: "user", content: compactedSessionContent(summary) }];
+      const compactedTokens = countRenderedContextTokens({ instructions: "", messages, tools: requestTools });
+      if (compactedTokens > prepared.threshold) throw new Error(`上下文压缩后仍有 ${compactedTokens} tokens，超过阈值 ${prepared.threshold}`);
+      prepared.estimatedTokens = requestTokens;
+      prepared.compactedTokens = compactedTokens;
+      prepared.compaction = { summary, estimatedTokens: requestTokens, compactedTokens, threshold: prepared.threshold, sourceEntries };
+    }
     const body: Record<string, unknown> = { model: args.agent.settings.model, messages, stream: true, stream_options: { include_usage: true } };
-    if (regularToolsAllowed) { body.tools = toolDefinitionsForChat(); body.tool_choice = "auto"; }
-    else if (terminalToolsOnly) { body.tools = toolDefinitionsForChat().filter((tool) => terminalToolNames.has(tool.function.name)); body.tool_choice = "auto"; }
+    if (requestTools.length) { body.tools = requestTools; body.tool_choice = "auto"; }
     applyChatThinkingSettings(body, args.agent, baseUrl);
     const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
     let content = ""; let reasoningContent = ""; let sawReasoningContent = false; const callMap = new Map<number, ToolCall>();
@@ -212,32 +335,58 @@ async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
     }
   }
   addTimeline("turn_finished", { usage });
-  return { assistantContent, sessionMessages, tools, timeline, effects, modelMeta: { format: "chat_completions", model: args.agent.settings.model, usage, toolSteps, reasoningCharacters } };
+  return { assistantContent, sessionMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "chat_completions", model: args.agent.settings.model, usage, toolSteps, reasoningCharacters, context: contextMeta(prepared) } };
 }
 
 async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
   const { baseUrl, headers } = apiConfig();
   const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = [];
-  const addTimeline = createTimelineFactory(args.turnId, timeline); addTimeline("turn_started", { format: "responses" });
+  const session = args.repository.getAgentSession(args.agent.id);
   const userMessage: AgentSessionMessage = { role: "user", content: packetText(args.packet) };
-  let assistantContent = ""; let previousResponseId: string | undefined; let input: unknown = userMessage.content; let usage: unknown = null;
+  const initialContext = [...session, userMessage].map(responseContextMessage);
+  const prepared = await prepareContext(args, "responses", initialContext);
+  const addTimeline = createTimelineFactory(args.turnId, timeline); addTimeline("turn_started", { format: "responses", context: contextMeta(prepared) });
+  const responseToolDefinitions = toolDefinitionsForResponses();
+  let assistantContent = ""; let previousResponseId: string | undefined; let input: unknown = prepared.messages; let usage: unknown = null;
+  let continuationMessages = [...prepared.messages];
+  let sessionMessages: AgentSessionMessage[] = prepared.compaction
+    ? [{ role: "user", content: compactedSessionContent(prepared.compaction.summary) }]
+    : [userMessage];
   for (let step = 0; step <= args.agent.settings.maxToolSteps + 1; step += 1) {
     const regularToolsAllowed = step < args.agent.settings.maxToolSteps;
     const terminalToolsOnly = step === args.agent.settings.maxToolSteps;
+    const requestTools = regularToolsAllowed
+      ? responseToolDefinitions
+      : terminalToolsOnly
+        ? responseToolDefinitions.filter((tool) => terminalToolNames.has(tool.name))
+        : [];
+    const requestTokens = countRenderedContextTokens({ instructions: systemPrompt(args.agent, args.packet), messages: continuationMessages, tools: responseToolDefinitions });
+    if (requestTokens > prepared.threshold) {
+      const sourceEntries = continuationMessages.length;
+      const summary = await compactWithResponses(args, continuationMessages);
+      continuationMessages = [{ role: "user", content: compactedSessionContent(summary) }];
+      const compactedTokens = countRenderedContextTokens({ instructions: systemPrompt(args.agent, args.packet), messages: continuationMessages, tools: responseToolDefinitions });
+      if (compactedTokens > prepared.threshold) throw new Error(`上下文压缩后仍有 ${compactedTokens} tokens，超过阈值 ${prepared.threshold}`);
+      prepared.estimatedTokens = requestTokens;
+      prepared.compactedTokens = compactedTokens;
+      prepared.compaction = { summary, estimatedTokens: requestTokens, compactedTokens, threshold: prepared.threshold, sourceEntries };
+      input = continuationMessages;
+      previousResponseId = undefined;
+      sessionMessages = [{ role: "user", content: compactedSessionContent(summary) }];
+    }
     const body: Record<string, unknown> = { model: args.agent.settings.model, input, stream: true };
-    if (regularToolsAllowed) { body.tools = toolDefinitionsForResponses(); body.tool_choice = "auto"; }
-    else if (terminalToolsOnly) { body.tools = toolDefinitionsForResponses().filter((tool) => terminalToolNames.has(tool.name)); body.tool_choice = "auto"; }
+    if (requestTools.length) { body.tools = requestTools; body.tool_choice = "auto"; }
     if (!previousResponseId) body.instructions = systemPrompt(args.agent, args.packet); else body.previous_response_id = previousResponseId;
     const response = await fetch(`${baseUrl}/responses`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
     if (!response.ok && step === 0 && [400, 404, 405].includes(response.status)) {
       throw new ResponsesUnsupportedError(`Responses API 不可用 (${response.status}): ${(await response.text()).slice(0, 1_000)}`);
     }
-    const callMap = new Map<string, ToolCall>();
+    const callMap = new Map<string, ToolCall>(); let stepContent = "";
     await parseSse(response, (event) => {
       const type = String(event.type ?? ""); const responseObject = event.response as Record<string, unknown> | undefined;
       if (typeof responseObject?.id === "string") previousResponseId = responseObject.id;
       if (responseObject?.usage) usage = responseObject.usage;
-      if (type === "response.output_text.delta" && typeof event.delta === "string") { assistantContent += event.delta; addTimeline("assistant_delta", { delta: event.delta }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: event.delta }); }
+      if (type === "response.output_text.delta" && typeof event.delta === "string") { stepContent += event.delta; assistantContent += event.delta; addTimeline("assistant_delta", { delta: event.delta }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: event.delta }); }
       if (type === "response.output_item.added") {
         const item = event.item as Record<string, unknown> | undefined;
         if (item?.type === "function_call") {
@@ -261,12 +410,22 @@ async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
     const calls = [...callMap.values()];
     if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
     if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
+    const assistantMessage: Extract<AgentSessionMessage, { role: "assistant" }> = {
+      role: "assistant",
+      content: stepContent || null,
+      ...(calls.length ? { tool_calls: calls.map((call) => ({ id: call.id, type: "function" as const, function: { name: call.name, arguments: call.arguments } })) } : {}),
+    };
+    sessionMessages.push(assistantMessage); continuationMessages.push(responseContextMessage(assistantMessage));
     if (!calls.length) break;
     const outputs = await executeToolCalls(args, calls, tools, timeline, effects);
+    for (const output of outputs) {
+      const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
+      sessionMessages.push(toolMessage); continuationMessages.push(responseContextMessage(toolMessage));
+    }
     input = outputs.map((output) => ({ type: "function_call_output", call_id: output.callId, output: output.text }));
   }
   addTimeline("turn_finished", { usage, responseId: previousResponseId });
-  return { assistantContent, sessionMessages: [userMessage, { role: "assistant", content: assistantContent }], tools, timeline, effects, modelMeta: { format: "responses", model: args.agent.settings.model, responseId: previousResponseId, usage } };
+  return { assistantContent, sessionMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "responses", model: args.agent.settings.model, responseId: previousResponseId, usage, context: contextMeta(prepared) } };
 }
 
 async function runMock(args: RunArgs): Promise<ModelTurnResult> {

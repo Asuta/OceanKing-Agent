@@ -14,6 +14,8 @@ pnpm dev
 
 模型连接使用服务端环境变量：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_MODELS`、`OPENAI_API_FORMAT`、`OPENAI_THINKING_MODE` 与 `OPENAI_REASONING_EFFORT`。`OPENAI_MODELS` 是逗号分隔的全局可选模型列表；思考模式可设为 `provider_default`、`enabled` 或 `disabled`，思考强度支持 `high` 与 `max`。设置页选择的全局配置由所有 Agent、房间调度和 Cron 工作流共同读取。
 
+Agent 会话会完整持久化，不按固定轮数截断。每次模型请求前会计算当前上下文 Token；超过设置页的“上下文压缩阈值”时，先把完整上下文压缩为可续接摘要，再继续正式请求。默认阈值为 `100000`，可通过 `OCEANKING_CONTEXT_TOKEN_THRESHOLD` 设置初始值。
+
 ## 核心边界
 
 - 模型普通文本只进入私有 Console，不自动显示在房间。

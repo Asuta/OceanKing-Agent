@@ -20,7 +20,7 @@ export const workspaceCommandSchema = z.discriminatedUnion("type", [
   z.object({ ...base, type: z.literal("update_cron"), jobId: z.string(), enabled: z.boolean().optional(), name: z.string().trim().min(1).max(100).optional(), schedule: z.string().trim().min(1).max(100).optional(), timezone: z.string().trim().min(1).max(80).optional(), prompt: z.string().trim().min(1).max(20_000).optional() }),
   z.object({ ...base, type: z.literal("delete_cron"), jobId: z.string() }),
   z.object({ ...base, type: z.literal("run_cron"), jobId: z.string() }),
-  z.object({ ...base, type: z.literal("update_settings"), model: z.string().trim().min(1).max(200), availableModels: z.array(z.string().trim().min(1).max(200)).min(1).max(32), apiFormat: z.enum(["auto", "responses", "chat_completions"]), thinkingMode: z.enum(["provider_default", "enabled", "disabled"]).optional(), reasoningEffort: z.enum(["high", "max"]).optional(), maxToolSteps: z.number().int().min(1).max(64), maxRoomRounds: z.number().int().min(1).max(256), projectContextRoots: z.array(z.string()).max(32) }),
+  z.object({ ...base, type: z.literal("update_settings"), model: z.string().trim().min(1).max(200), availableModels: z.array(z.string().trim().min(1).max(200)).min(1).max(32), apiFormat: z.enum(["auto", "responses", "chat_completions"]), thinkingMode: z.enum(["provider_default", "enabled", "disabled"]).optional(), reasoningEffort: z.enum(["high", "max"]).optional(), contextTokenThreshold: z.number().int().min(1_024).max(1_000_000), maxToolSteps: z.number().int().min(1).max(64), maxRoomRounds: z.number().int().min(1).max(256), projectContextRoots: z.array(z.string()).max(32) }),
 ]);
 
 export type WorkspaceCommand = z.infer<typeof workspaceCommandSchema>;

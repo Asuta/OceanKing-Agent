@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { extractPartialJsonStringField, runAgentModel } from "@/lib/server/model-runtime";
 import { packetFor, sendUser, withRepository } from "./helpers";
 import { normalizeOpenAiBaseUrl } from "@/lib/server/provider-config";
@@ -26,15 +28,23 @@ describe("OpenAI 兼容协议", () => {
   });
   it("解析 Responses SSE 的私有文本与 usage", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
-    vi.stubGlobal("fetch", vi.fn(async () => sse([
+    let requestBody: { input: Array<{ content: string }> } | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as typeof requestBody;
+      return sse([
       { type: "response.created", response: { id: "resp_1" } },
       { type: "response.output_text.delta", delta: "只进入 Console" },
       { type: "response.completed", response: { id: "resp_1", usage: { input_tokens: 4, output_tokens: 3 } } },
       "[DONE]",
-    ])));
+    ]);
+    }));
+    sendUser(repository, "room_harbor", "Responses 历史"); const historicalPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_responses_history", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: historicalPacket });
+    repository.finishTurn({ turnId: "turn_responses_history", assistantContent: "需要跨轮保留", tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: historicalPacket.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
     sendUser(repository, "room_harbor", "协议测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses", signal: new AbortController().signal });
     expect(result.assistantContent).toBe("只进入 Console"); expect(result.modelMeta.format).toBe("responses"); expect(result.effects).toEqual([]);
+    expect(requestBody?.input.some((item) => item.content === "需要跨轮保留")).toBe(true);
   }));
 
   it("auto 仅在首个 Responses 请求不兼容时回退 Chat Completions", async () => withRepository(async (repository) => {
@@ -48,6 +58,54 @@ describe("OpenAI 兼容协议", () => {
     sendUser(repository, "room_harbor", "兼容测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "auto" as const } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_fallback", signal: new AbortController().signal });
     expect(result.assistantContent).toBe("兼容回退成功"); expect(result.modelMeta.format).toBe("chat_completions"); expect(fetchMock).toHaveBeenCalledTimes(2);
+  }));
+
+  it("Chat Completions 会发送完整 Agent 会话，不再只取最后 12 条", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    sendUser(repository, "room_harbor", "需要长期记住的任务"); const historicalPacket = packetFor(repository);
+    for (let index = 0; index < 7; index += 1) {
+      const turnId = `turn_complete_history_${index}`;
+      repository.beginTurn({ turnId, roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: historicalPacket });
+      repository.finishTurn({ turnId, assistantContent: `完整历史结果 ${index}`, tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: historicalPacket.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
+    }
+    sendUser(repository, "room_harbor", "继续任务"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, contextTokenThreshold: 1_000_000 } };
+    let sentMessages: Array<{ role: string; content: string }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      sentMessages = (JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> }).messages;
+      return sse([{ choices: [{ delta: { content: "已续接完整历史" } }] }, "[DONE]"]);
+    }));
+    await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_full_history", signal: new AbortController().signal });
+    expect(sentMessages).toHaveLength(16);
+    expect(sentMessages.some((message) => message.content === "完整历史结果 0")).toBe(true);
+  }));
+
+  it("上下文超过 Token 阈值时先整体压缩，再持久化压缩上下文并继续请求", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    sendUser(repository, "room_harbor", `关键历史：${"必须保留的事实。".repeat(4_000)}`); const historicalPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_before_compaction", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: historicalPacket });
+    repository.finishTurn({ turnId: "turn_before_compaction", assistantContent: "旧任务尚未完成", tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: historicalPacket.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
+    sendUser(repository, "room_harbor", "请继续完成旧任务"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, contextTokenThreshold: 8_000 } };
+    repository.beginTurn({ turnId: "turn_compacted", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    const requestBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      requestBodies.push(body);
+      if (requestBodies.length === 1) return sse([{ choices: [{ delta: { content: "用户要求继续旧任务；关键事实必须保留；当前尚未完成。" } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "基于压缩上下文继续执行" } }] }, "[DONE]"]);
+    }));
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_compacted", signal: new AbortController().signal });
+    repository.finishTurn({ turnId: "turn_compacted", assistantContent: result.assistantContent, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[0]?.messages[0]?.content).toContain("上下文压缩器");
+    expect(requestBodies[1]?.messages).toHaveLength(2);
+    expect(requestBodies[1]?.messages[1]?.content).toContain("用户要求继续旧任务");
+    expect(result.contextCompaction).toMatchObject({ threshold: 8_000, sourceEntries: 3 });
+    const session = repository.getAgentSession("navigator");
+    expect(session).toHaveLength(2);
+    expect(session[0]?.content).toContain("此前完整 Agent 会话的压缩上下文");
+    expect(session[0]?.content).not.toContain("必须保留的事实。必须保留的事实。必须保留的事实。");
   }));
 
   it("Chat Completions 流式 function call 只产生结构化房间 effect", async () => withRepository(async (repository) => {
@@ -147,6 +205,31 @@ describe("OpenAI 兼容协议", () => {
     expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "达到上限后的正式结果" })]);
     expect((bodies[1]?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name).sort()).toEqual(["read_no_reply", "send_message_to_room"]);
     expect(bodies[2]?.tools).toBeUndefined();
+  }));
+
+  it("Chat 工具输出让上下文越过阈值时，会在下一次模型请求前整体压缩", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const fileName = "large-tool-context.txt";
+    await fs.writeFile(path.join(repository.dataDir, fileName), Array.from({ length: 3_000 }, (_, index) => `工具关键事实 ${index}：仍需继续处理。`).join("\n"));
+    const requestBodies: Array<{ messages: Array<{ role: string; content?: string }> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content?: string }> };
+      requestBodies.push(body);
+      if (requestBodies.length === 1) return sse([
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_large_read", function: { name: "read_project_context", arguments: JSON.stringify({ root: repository.dataDir, path: fileName }) } }] } }] },
+        "[DONE]",
+      ]);
+      if (requestBodies.length === 2) return sse([{ choices: [{ delta: { content: "工具返回了大量关键事实，任务仍需继续。" } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "已在压缩后继续处理" } }] }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "读取大文件并继续"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, contextTokenThreshold: 15_000, projectContextRoots: [repository.dataDir] } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_large_tool_context", signal: new AbortController().signal });
+    expect(result.tools[0]?.outputText.length).toBeGreaterThan(50_000);
+    expect(requestBodies).toHaveLength(3);
+    expect(requestBodies[1]?.messages[0]?.content).toContain("上下文压缩器");
+    expect(requestBodies[2]?.messages[1]?.content).toContain("工具返回了大量关键事实");
+    expect(result.contextCompaction).toMatchObject({ threshold: 15_000 });
   }));
 
   it("Responses function arguments 发布跨片段房间预览", async () => withRepository(async (repository) => {

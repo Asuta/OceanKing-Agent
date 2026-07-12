@@ -6,6 +6,7 @@ export type ModelAndRuntimeSettings = {
   reasoningEffort: "high" | "max";
   model: string;
   availableModels: string[];
+  contextTokenThreshold: number;
   maxToolSteps: number;
   maxRoomRounds: number;
   projectContextRoots: string[];
@@ -15,6 +16,14 @@ export type AgentSessionMessage =
   | { role: "user"; content: string }
   | { role: "assistant"; content: string | null; reasoning_content?: string; tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }
   | { role: "tool"; tool_call_id: string; content: string };
+
+export type ContextCompaction = {
+  summary: string;
+  estimatedTokens: number;
+  compactedTokens: number;
+  threshold: number;
+  sourceEntries: number;
+};
 
 export type Agent = {
   id: Id;

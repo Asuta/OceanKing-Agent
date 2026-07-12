@@ -2,12 +2,13 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import type { WorkspaceCommand } from "@/lib/domain/schemas";
 import type {
-  Agent, AgentSessionMessage, AgentTurn, Attachment, CronJob, CronRun, ModelAndRuntimeSettings, Participant, ReadNoReplyReceipt,
+  Agent, AgentSessionMessage, AgentTurn, Attachment, ContextCompaction, CronJob, CronRun, ModelAndRuntimeSettings, Participant, ReadNoReplyReceipt,
   Room, RoomMessage, SchedulerPacket, SchedulerState, TimelineEvent, ToolExecution, TurnEffect, WorkspaceSnapshot,
 } from "@/lib/domain/types";
 import { getDatabase, type DatabaseHandle } from "@/lib/server/db/client";
+import { compactedSessionContent } from "@/lib/server/context-compaction";
 import { createId, nowIso } from "@/lib/utils/id";
-import { environmentRuntimeDefaults, normalizeOpenAiBaseUrl } from "@/lib/server/provider-config";
+import { normalizeOpenAiBaseUrl, normalizeRuntimeSettings } from "@/lib/server/provider-config";
 
 type Row = Record<string, unknown>;
 
@@ -55,24 +56,6 @@ function normalizeSessionMessage(value: unknown): AgentSessionMessage | null {
   return normalized;
 }
 
-function trimSessionHistory(messages: AgentSessionMessage[], maxUserTurns = 20, maxBytes = 512 * 1024): AgentSessionMessage[] {
-  const turns: AgentSessionMessage[][] = [];
-  for (const message of messages) {
-    if (message.role === "user") turns.push([message]);
-    else turns.at(-1)?.push(message);
-  }
-  const selected: AgentSessionMessage[][] = [];
-  let bytes = 0;
-  for (let index = turns.length - 1; index >= 0 && selected.length < maxUserTurns; index -= 1) {
-    const turn = turns[index]!;
-    const turnBytes = Buffer.byteLength(JSON.stringify(turn), "utf8");
-    if (turnBytes > maxBytes && selected.length === 0) return [];
-    if (bytes + turnBytes > maxBytes) break;
-    selected.unshift(turn); bytes += turnBytes;
-  }
-  return selected.flat();
-}
-
 export type CommandResult = { snapshot: WorkspaceSnapshot; triggerRoomId?: string; stopRoomId?: string; runCronJobId?: string; refreshCron?: boolean };
 
 export class WorkspaceRepository {
@@ -87,7 +70,7 @@ export class WorkspaceRepository {
 
   private defaultSettings(): ModelAndRuntimeSettings {
     const row = this.raw.prepare("SELECT settings_json FROM workspace_meta WHERE id=1").get() as Row;
-    return { ...environmentRuntimeDefaults(), ...parseJson<Partial<ModelAndRuntimeSettings>>(row.settings_json, {}) };
+    return normalizeRuntimeSettings(parseJson<Partial<ModelAndRuntimeSettings>>(row.settings_json, {}));
   }
 
   private ensureSeed(): void {
@@ -129,7 +112,7 @@ export class WorkspaceRepository {
 
   getSnapshot(): WorkspaceSnapshot {
     const meta = this.raw.prepare("SELECT * FROM workspace_meta WHERE id=1").get() as Row;
-    const settings = { ...this.defaultSettings(), ...parseJson<Partial<ModelAndRuntimeSettings>>(meta.settings_json, {}) };
+    const settings = normalizeRuntimeSettings(parseJson<Partial<ModelAndRuntimeSettings>>(meta.settings_json, {}));
     const agentRows = this.raw.prepare("SELECT * FROM agents ORDER BY created_at").all() as Row[];
     const roomRows = this.raw.prepare("SELECT * FROM rooms ORDER BY archived_at IS NOT NULL, updated_at DESC").all() as Row[];
     const participantRows = this.raw.prepare("SELECT * FROM participants ORDER BY room_id,sort_order").all() as Row[];
@@ -252,7 +235,7 @@ export class WorkspaceRepository {
         case "update_settings": {
           const currentSettings = this.defaultSettings();
           if (!command.availableModels.includes(command.model)) throw new DomainError("默认模型必须来自全局可选模型列表");
-          const updated = { ...currentSettings, model: command.model, availableModels: [...new Set(command.availableModels)], apiFormat: command.apiFormat, thinkingMode: command.thinkingMode ?? currentSettings.thinkingMode, reasoningEffort: command.reasoningEffort ?? currentSettings.reasoningEffort, maxToolSteps: command.maxToolSteps, maxRoomRounds: command.maxRoomRounds, projectContextRoots: command.projectContextRoots };
+          const updated = { ...currentSettings, model: command.model, availableModels: [...new Set(command.availableModels)], apiFormat: command.apiFormat, thinkingMode: command.thinkingMode ?? currentSettings.thinkingMode, reasoningEffort: command.reasoningEffort ?? currentSettings.reasoningEffort, contextTokenThreshold: command.contextTokenThreshold, maxToolSteps: command.maxToolSteps, maxRoomRounds: command.maxRoomRounds, projectContextRoots: command.projectContextRoots };
           const encoded = JSON.stringify(updated);
           this.raw.prepare("UPDATE workspace_meta SET settings_json=? WHERE id=1").run(encoded);
           this.raw.prepare("UPDATE agents SET settings_json=?,updated_at=?").run(encoded, at); break;
@@ -319,7 +302,7 @@ export class WorkspaceRepository {
     }); tx();
   }
 
-  finishTurn(args: { turnId: string; assistantContent: string; sessionMessages?: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; superseded: boolean } {
+  finishTurn(args: { turnId: string; assistantContent: string; sessionMessages?: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; contextCompaction?: ContextCompaction; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; superseded: boolean } {
     const emittedMessageIds: string[] = [];
     let superseded = false;
     const tx = this.raw.transaction(() => {
@@ -339,8 +322,11 @@ export class WorkspaceRepository {
       const session = this.raw.prepare("SELECT history_json FROM agent_sessions WHERE agent_id=?").get(agentId) as Row;
       const history = parseJson<unknown[]>(session.history_json, []).map(normalizeSessionMessage).filter((message): message is AgentSessionMessage => message !== null);
       const packet = parseJson<SchedulerPacket>(turn.user_envelope_json, {} as SchedulerPacket);
-      history.push(...(args.sessionMessages ?? [{ role: "user" as const, content: JSON.stringify(packet) }, { role: "assistant" as const, content: args.assistantContent }]));
-      this.raw.prepare("UPDATE agent_sessions SET history_json=?,active_turn_id=NULL,updated_at=? WHERE agent_id=?").run(JSON.stringify(trimSessionHistory(history)), at, agentId);
+      const completedMessages = args.sessionMessages ?? (args.contextCompaction
+        ? [{ role: "user" as const, content: compactedSessionContent(args.contextCompaction.summary) }, { role: "assistant" as const, content: args.assistantContent }]
+        : [{ role: "user" as const, content: JSON.stringify(packet) }, { role: "assistant" as const, content: args.assistantContent }]);
+      const nextHistory = args.contextCompaction ? completedMessages : [...history, ...completedMessages];
+      this.raw.prepare("UPDATE agent_sessions SET history_json=?,active_turn_id=NULL,updated_at=? WHERE agent_id=?").run(JSON.stringify(nextHistory), at, agentId);
       const scheduler = this.raw.prepare("SELECT cursor_json,round_count FROM scheduler_states WHERE room_id=?").get(roomId) as Row;
       const cursors = parseJson<Record<string, number>>(scheduler.cursor_json, {}); cursors[participantId] = args.cutoffSeq;
       this.raw.prepare("UPDATE scheduler_states SET cursor_json=?,next_agent_participant_id=?,active_participant_id=NULL,round_count=?,rerun_requested=? WHERE room_id=?")
