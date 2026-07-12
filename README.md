@@ -12,7 +12,7 @@ pnpm dev
 
 打开 `http://127.0.0.1:3000`。未配置 `OPENAI_API_KEY` 时自动使用确定性假模型，仍可完整体验调度、Console、Cron 和房间工具。
 
-模型连接使用服务端环境变量：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_MODELS` 与 `OPENAI_API_FORMAT`。`OPENAI_MODELS` 是逗号分隔的全局可选模型列表；设置页选择的默认模型由所有 Agent、房间调度和 Cron 工作流共同读取。
+模型连接使用服务端环境变量：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_MODELS`、`OPENAI_API_FORMAT`、`OPENAI_THINKING_MODE` 与 `OPENAI_REASONING_EFFORT`。`OPENAI_MODELS` 是逗号分隔的全局可选模型列表；思考模式可设为 `provider_default`、`enabled` 或 `disabled`，思考强度支持 `high` 与 `max`。设置页选择的全局配置由所有 Agent、房间调度和 Cron 工作流共同读取。
 
 ## 核心边界
 

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { TurnEffect } from "@/lib/domain/types";
+import type { AgentSessionMessage, TurnEffect } from "@/lib/domain/types";
 import { createDatabase } from "@/lib/server/db/client";
 import { VersionConflictError, WorkspaceRepository } from "@/lib/server/repository";
 import { commandBase, packetFor, sendUser, withRepository } from "./helpers";
@@ -98,13 +98,62 @@ describe("OceanKing 领域仓库", () => {
   it("全局模型选择会被所有 Agent 与工作流共同读取", async () => withRepository((repository) => {
     repository.executeCommand({
       ...commandBase(repository), type: "update_settings", model: "deepseek-v4-flash", availableModels: ["deepseek-v4-pro", "deepseek-v4-flash"],
-      apiFormat: "chat_completions", maxToolSteps: 12, maxRoomRounds: 32, projectContextRoots: [],
+      apiFormat: "chat_completions", thinkingMode: "enabled", reasoningEffort: "max", maxToolSteps: 12, maxRoomRounds: 32, projectContextRoots: [],
     });
     const snapshot = repository.getSnapshot();
     expect(snapshot.settings.model).toBe("deepseek-v4-flash");
     expect(snapshot.settings.availableModels).toEqual(["deepseek-v4-pro", "deepseek-v4-flash"]);
     expect(snapshot.agents.every((agent) => agent.settings.model === "deepseek-v4-flash")).toBe(true);
-    expect(repository.getAgent("navigator")?.settings).toMatchObject({ model: "deepseek-v4-flash", apiFormat: "chat_completions" });
+    expect(repository.getAgent("navigator")?.settings).toMatchObject({ model: "deepseek-v4-flash", apiFormat: "chat_completions", thinkingMode: "enabled", reasoningEffort: "max" });
+  }));
+
+  it("旧设置缺少思考字段时自动补齐兼容默认值", async () => withRepository((repository) => {
+    const snapshotSettings = repository.getSnapshot().settings;
+    const legacy: Partial<typeof snapshotSettings> = { ...snapshotSettings };
+    delete legacy.thinkingMode; delete legacy.reasoningEffort;
+    repository.raw.prepare("UPDATE workspace_meta SET settings_json=? WHERE id=1").run(JSON.stringify(legacy));
+    expect(repository.getSnapshot().settings).toMatchObject({ thinkingMode: "provider_default", reasoningEffort: "high" });
+  }));
+
+  it("会话历史按完整用户工具链裁剪，不拆散 assistant 与 tool 消息", async () => withRepository((repository) => {
+    const history: AgentSessionMessage[] = Array.from({ length: 20 }, (_, index) => {
+      const callId = `call_${index}`;
+      return [
+        { role: "user" as const, content: `user_${index}` },
+        { role: "assistant" as const, content: null, reasoning_content: `reasoning_${index}`, tool_calls: [{ id: callId, type: "function" as const, function: { name: "read_room_history", arguments: "{}" } }] },
+        { role: "tool" as const, tool_call_id: callId, content: `output_${index}` },
+      ];
+    }).flat();
+    repository.raw.prepare("UPDATE agent_sessions SET history_json=? WHERE agent_id='navigator'").run(JSON.stringify(history));
+    sendUser(repository, "room_harbor", "触发历史裁剪"); const packet = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_trim_session", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    repository.finishTurn({ turnId: "turn_trim_session", assistantContent: "done", sessionMessages: [{ role: "user", content: "current_user" }, { role: "assistant", content: "done" }], tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+
+    const trimmed = repository.getAgentSession("navigator");
+    expect(trimmed.filter((message) => message.role === "user")).toHaveLength(20);
+    expect(trimmed[0]).toEqual({ role: "user", content: "user_1" });
+    for (let index = 0; index < trimmed.length; index += 1) {
+      const message = trimmed[index];
+      if (message?.role !== "tool") continue;
+      const assistant = trimmed[index - 1];
+      expect(assistant?.role).toBe("assistant");
+      if (assistant?.role === "assistant") expect(assistant.tool_calls?.[0]?.id).toBe(message.tool_call_id);
+    }
+  }));
+
+  it("超出会话字节预算时丢弃整个工具 Turn", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "超大工具结果"); const packet = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_oversized_session", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    repository.finishTurn({
+      turnId: "turn_oversized_session", assistantContent: "done",
+      sessionMessages: [
+        { role: "user", content: "oversized_user" },
+        { role: "assistant", content: null, reasoning_content: "reasoning", tool_calls: [{ id: "call_oversized", type: "function", function: { name: "workspace_read", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_oversized", content: "x".repeat(600 * 1024) },
+      ],
+      tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null,
+    });
+    expect(repository.getAgentSession("navigator")).toEqual([]);
   }));
 
   it("附件元数据绑定到正式消息并可在重载快照中恢复", async () => withRepository((repository) => {

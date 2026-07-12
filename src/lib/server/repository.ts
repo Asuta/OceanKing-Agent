@@ -2,7 +2,7 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import type { WorkspaceCommand } from "@/lib/domain/schemas";
 import type {
-  Agent, AgentTurn, Attachment, CronJob, CronRun, ModelAndRuntimeSettings, Participant, ReadNoReplyReceipt,
+  Agent, AgentSessionMessage, AgentTurn, Attachment, CronJob, CronRun, ModelAndRuntimeSettings, Participant, ReadNoReplyReceipt,
   Room, RoomMessage, SchedulerPacket, SchedulerState, TimelineEvent, ToolExecution, TurnEffect, WorkspaceSnapshot,
 } from "@/lib/domain/types";
 import { getDatabase, type DatabaseHandle } from "@/lib/server/db/client";
@@ -29,6 +29,50 @@ function str(value: unknown): string { return typeof value === "string" ? value 
 function nullableStr(value: unknown): string | null { return typeof value === "string" ? value : null; }
 function num(value: unknown): number { return typeof value === "number" ? value : Number(value ?? 0); }
 
+function normalizeSessionMessage(value: unknown): AgentSessionMessage | null {
+  if (!value || typeof value !== "object") return null;
+  const message = value as Record<string, unknown>;
+  if (message.role === "user" && typeof message.content === "string") return { role: "user", content: message.content };
+  if (message.role === "tool" && typeof message.tool_call_id === "string" && typeof message.content === "string") {
+    return { role: "tool", tool_call_id: message.tool_call_id, content: message.content };
+  }
+  if (message.role !== "assistant") return null;
+  const normalized: Extract<AgentSessionMessage, { role: "assistant" }> = {
+    role: "assistant",
+    content: typeof message.content === "string" ? message.content : null,
+  };
+  if (typeof message.reasoning_content === "string") normalized.reasoning_content = message.reasoning_content;
+  if (Array.isArray(message.tool_calls)) {
+    const toolCalls = message.tool_calls.flatMap((value) => {
+      if (!value || typeof value !== "object") return [];
+      const call = value as Record<string, unknown>;
+      const fn = call.function as Record<string, unknown> | undefined;
+      if (typeof call.id !== "string" || typeof fn?.name !== "string" || typeof fn.arguments !== "string") return [];
+      return [{ id: call.id, type: "function" as const, function: { name: fn.name, arguments: fn.arguments } }];
+    });
+    if (toolCalls.length) normalized.tool_calls = toolCalls;
+  }
+  return normalized;
+}
+
+function trimSessionHistory(messages: AgentSessionMessage[], maxUserTurns = 20, maxBytes = 512 * 1024): AgentSessionMessage[] {
+  const turns: AgentSessionMessage[][] = [];
+  for (const message of messages) {
+    if (message.role === "user") turns.push([message]);
+    else turns.at(-1)?.push(message);
+  }
+  const selected: AgentSessionMessage[][] = [];
+  let bytes = 0;
+  for (let index = turns.length - 1; index >= 0 && selected.length < maxUserTurns; index -= 1) {
+    const turn = turns[index]!;
+    const turnBytes = Buffer.byteLength(JSON.stringify(turn), "utf8");
+    if (turnBytes > maxBytes && selected.length === 0) return [];
+    if (bytes + turnBytes > maxBytes) break;
+    selected.unshift(turn); bytes += turnBytes;
+  }
+  return selected.flat();
+}
+
 export type CommandResult = { snapshot: WorkspaceSnapshot; triggerRoomId?: string; stopRoomId?: string; runCronJobId?: string; refreshCron?: boolean };
 
 export class WorkspaceRepository {
@@ -43,7 +87,7 @@ export class WorkspaceRepository {
 
   private defaultSettings(): ModelAndRuntimeSettings {
     const row = this.raw.prepare("SELECT settings_json FROM workspace_meta WHERE id=1").get() as Row;
-    return parseJson<ModelAndRuntimeSettings>(row.settings_json, environmentRuntimeDefaults());
+    return { ...environmentRuntimeDefaults(), ...parseJson<Partial<ModelAndRuntimeSettings>>(row.settings_json, {}) };
   }
 
   private ensureSeed(): void {
@@ -85,7 +129,7 @@ export class WorkspaceRepository {
 
   getSnapshot(): WorkspaceSnapshot {
     const meta = this.raw.prepare("SELECT * FROM workspace_meta WHERE id=1").get() as Row;
-    const settings = parseJson<ModelAndRuntimeSettings>(meta.settings_json, this.defaultSettings());
+    const settings = { ...this.defaultSettings(), ...parseJson<Partial<ModelAndRuntimeSettings>>(meta.settings_json, {}) };
     const agentRows = this.raw.prepare("SELECT * FROM agents ORDER BY created_at").all() as Row[];
     const roomRows = this.raw.prepare("SELECT * FROM rooms ORDER BY archived_at IS NOT NULL, updated_at DESC").all() as Row[];
     const participantRows = this.raw.prepare("SELECT * FROM participants ORDER BY room_id,sort_order").all() as Row[];
@@ -208,7 +252,7 @@ export class WorkspaceRepository {
         case "update_settings": {
           const currentSettings = this.defaultSettings();
           if (!command.availableModels.includes(command.model)) throw new DomainError("默认模型必须来自全局可选模型列表");
-          const updated = { ...currentSettings, model: command.model, availableModels: [...new Set(command.availableModels)], apiFormat: command.apiFormat, maxToolSteps: command.maxToolSteps, maxRoomRounds: command.maxRoomRounds, projectContextRoots: command.projectContextRoots };
+          const updated = { ...currentSettings, model: command.model, availableModels: [...new Set(command.availableModels)], apiFormat: command.apiFormat, thinkingMode: command.thinkingMode ?? currentSettings.thinkingMode, reasoningEffort: command.reasoningEffort ?? currentSettings.reasoningEffort, maxToolSteps: command.maxToolSteps, maxRoomRounds: command.maxRoomRounds, projectContextRoots: command.projectContextRoots };
           const encoded = JSON.stringify(updated);
           this.raw.prepare("UPDATE workspace_meta SET settings_json=? WHERE id=1").run(encoded);
           this.raw.prepare("UPDATE agents SET settings_json=?,updated_at=?").run(encoded, at); break;
@@ -275,7 +319,7 @@ export class WorkspaceRepository {
     }); tx();
   }
 
-  finishTurn(args: { turnId: string; assistantContent: string; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; superseded: boolean } {
+  finishTurn(args: { turnId: string; assistantContent: string; sessionMessages?: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; superseded: boolean } {
     const emittedMessageIds: string[] = [];
     let superseded = false;
     const tx = this.raw.transaction(() => {
@@ -293,10 +337,10 @@ export class WorkspaceRepository {
       this.raw.prepare("UPDATE agent_turns SET assistant_content=?,emitted_message_ids_json=?,status=?,model_meta_json=?,error=NULL,updated_at=? WHERE id=?")
         .run(args.assistantContent, JSON.stringify(emittedMessageIds), status, JSON.stringify(args.modelMeta), at, args.turnId);
       const session = this.raw.prepare("SELECT history_json FROM agent_sessions WHERE agent_id=?").get(agentId) as Row;
-      const history = parseJson<Array<{ role: string; content: string; at: string }>>(session.history_json, []);
+      const history = parseJson<unknown[]>(session.history_json, []).map(normalizeSessionMessage).filter((message): message is AgentSessionMessage => message !== null);
       const packet = parseJson<SchedulerPacket>(turn.user_envelope_json, {} as SchedulerPacket);
-      history.push({ role: "user", content: JSON.stringify(packet), at }, { role: "assistant", content: args.assistantContent, at });
-      this.raw.prepare("UPDATE agent_sessions SET history_json=?,active_turn_id=NULL,updated_at=? WHERE agent_id=?").run(JSON.stringify(history.slice(-40)), at, agentId);
+      history.push(...(args.sessionMessages ?? [{ role: "user" as const, content: JSON.stringify(packet) }, { role: "assistant" as const, content: args.assistantContent }]));
+      this.raw.prepare("UPDATE agent_sessions SET history_json=?,active_turn_id=NULL,updated_at=? WHERE agent_id=?").run(JSON.stringify(trimSessionHistory(history)), at, agentId);
       const scheduler = this.raw.prepare("SELECT cursor_json,round_count FROM scheduler_states WHERE room_id=?").get(roomId) as Row;
       const cursors = parseJson<Record<string, number>>(scheduler.cursor_json, {}); cursors[participantId] = args.cutoffSeq;
       this.raw.prepare("UPDATE scheduler_states SET cursor_json=?,next_agent_participant_id=?,active_participant_id=NULL,round_count=?,rerun_requested=? WHERE room_id=?")
@@ -378,9 +422,9 @@ export class WorkspaceRepository {
     }); tx(); return rows.map((row) => str(row.room_id));
   }
 
-  getAgentSession(agentId: string): Array<{ role: string; content: string; at: string }> {
+  getAgentSession(agentId: string): AgentSessionMessage[] {
     const row = this.raw.prepare("SELECT history_json FROM agent_sessions WHERE agent_id=?").get(agentId) as Row | undefined;
-    return row ? parseJson(row.history_json, []) : [];
+    return row ? parseJson<unknown[]>(row.history_json, []).map(normalizeSessionMessage).filter((message): message is AgentSessionMessage => message !== null) : [];
   }
 
   getAgent(agentId: string): Agent | null { return this.getSnapshot().agents.find((agent) => agent.id === agentId) ?? null; }

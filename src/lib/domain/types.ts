@@ -2,12 +2,19 @@ export type Id = string;
 
 export type ModelAndRuntimeSettings = {
   apiFormat: "auto" | "responses" | "chat_completions";
+  thinkingMode: "provider_default" | "enabled" | "disabled";
+  reasoningEffort: "high" | "max";
   model: string;
   availableModels: string[];
   maxToolSteps: number;
   maxRoomRounds: number;
   projectContextRoots: string[];
 };
+
+export type AgentSessionMessage =
+  | { role: "user"; content: string }
+  | { role: "assistant"; content: string | null; reasoning_content?: string; tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }
+  | { role: "tool"; tool_call_id: string; content: string };
 
 export type Agent = {
   id: Id;

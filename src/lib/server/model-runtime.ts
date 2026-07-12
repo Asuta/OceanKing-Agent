@@ -1,4 +1,4 @@
-import type { Agent, SchedulerPacket, TimelineEvent, ToolExecution, TurnEffect } from "@/lib/domain/types";
+import type { Agent, AgentSessionMessage, SchedulerPacket, TimelineEvent, ToolExecution, TurnEffect } from "@/lib/domain/types";
 import { publishWorkspaceEvent } from "@/lib/server/events";
 import { getToolDefinition, listToolDefinitions, toolDefinitionsForChat, toolDefinitionsForResponses, type ToolContext } from "@/lib/server/tools";
 import { WorkspaceRepository } from "@/lib/server/repository";
@@ -6,6 +6,7 @@ import { createId, nowIso } from "@/lib/utils/id";
 import { normalizeOpenAiBaseUrl } from "@/lib/server/provider-config";
 
 type ToolCall = { id: string; name: string; arguments: string };
+const terminalToolNames = new Set(["send_message_to_room", "read_no_reply"]);
 class ResponsesUnsupportedError extends Error {}
 type RunArgs = {
   repository: WorkspaceRepository;
@@ -18,6 +19,7 @@ type RunArgs = {
 
 export type ModelTurnResult = {
   assistantContent: string;
+  sessionMessages: AgentSessionMessage[];
   tools: ToolExecution[];
   timeline: TimelineEvent[];
   effects: TurnEffect[];
@@ -141,24 +143,47 @@ function apiConfig() {
   return { baseUrl, headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` } };
 }
 
+function applyChatThinkingSettings(body: Record<string, unknown>, agent: Agent, baseUrl: string): void {
+  if (agent.settings.thinkingMode === "provider_default") {
+    if (isDeepSeekBaseUrl(baseUrl)) body.reasoning_effort = agent.settings.reasoningEffort;
+    return;
+  }
+  body.thinking = { type: agent.settings.thinkingMode };
+  if (agent.settings.thinkingMode === "enabled") body.reasoning_effort = agent.settings.reasoningEffort;
+}
+
+function isDeepSeekBaseUrl(baseUrl: string): boolean {
+  try { const hostname = new URL(baseUrl).hostname.toLowerCase(); return hostname === "deepseek.com" || hostname.endsWith(".deepseek.com"); }
+  catch { return false; }
+}
+
 async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
   const { baseUrl, headers } = apiConfig();
   const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = [];
   const addTimeline = createTimelineFactory(args.turnId, timeline); addTimeline("turn_started", { format: "chat_completions" });
-  const session = args.repository.getAgentSession(args.agent.id).slice(-12);
+  const session = args.repository.getAgentSession(args.agent.id);
+  const userMessage: AgentSessionMessage = { role: "user", content: packetText(args.packet) };
+  const sessionMessages: AgentSessionMessage[] = [userMessage];
   const messages: Array<Record<string, unknown>> = [
     { role: "system", content: systemPrompt(args.agent, args.packet) },
-    ...session.map((item) => ({ role: item.role, content: item.content })),
-    { role: "user", content: packetText(args.packet) },
+    ...session,
+    userMessage,
   ];
-  let assistantContent = ""; let usage: unknown = null;
-  for (let step = 0; step < args.agent.settings.maxToolSteps; step += 1) {
-    const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers, signal: args.signal, body: JSON.stringify({ model: args.agent.settings.model, messages, tools: toolDefinitionsForChat(), tool_choice: "auto", stream: true, stream_options: { include_usage: true } }) });
-    let content = ""; const callMap = new Map<number, ToolCall>();
+  let assistantContent = ""; let usage: unknown = null; let toolSteps = 0; let reasoningCharacters = 0;
+  for (let step = 0; step <= args.agent.settings.maxToolSteps + 1; step += 1) {
+    const regularToolsAllowed = step < args.agent.settings.maxToolSteps;
+    const terminalToolsOnly = step === args.agent.settings.maxToolSteps;
+    const body: Record<string, unknown> = { model: args.agent.settings.model, messages, stream: true, stream_options: { include_usage: true } };
+    if (regularToolsAllowed) { body.tools = toolDefinitionsForChat(); body.tool_choice = "auto"; }
+    else if (terminalToolsOnly) { body.tools = toolDefinitionsForChat().filter((tool) => terminalToolNames.has(tool.function.name)); body.tool_choice = "auto"; }
+    applyChatThinkingSettings(body, args.agent, baseUrl);
+    const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
+    let content = ""; let reasoningContent = ""; let sawReasoningContent = false; const callMap = new Map<number, ToolCall>();
     await parseSse(response, (event) => {
       if (event.usage) usage = event.usage;
       const choices = Array.isArray(event.choices) ? event.choices as Array<Record<string, unknown>> : [];
       const delta = choices[0]?.delta as Record<string, unknown> | undefined;
+      if (typeof delta?.reasoning_content === "string") { sawReasoningContent = true; reasoningContent += delta.reasoning_content; reasoningCharacters += delta.reasoning_content.length; }
       if (typeof delta?.content === "string") { content += delta.content; assistantContent += delta.content; addTimeline("assistant_delta", { delta: delta.content }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: delta.content }); }
       const chunks = Array.isArray(delta?.tool_calls) ? delta.tool_calls as Array<Record<string, unknown>> : [];
       for (const chunk of chunks) {
@@ -168,22 +193,40 @@ async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
       }
     });
     const calls = [...callMap.values()];
-    messages.push({ role: "assistant", content: content || null, ...(calls.length ? { tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } })) } : {}) });
+    if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
+    if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
+    const includeReasoning = sawReasoningContent || args.agent.settings.thinkingMode === "enabled" || (args.agent.settings.thinkingMode === "provider_default" && isDeepSeekBaseUrl(baseUrl));
+    const assistantMessage: Extract<AgentSessionMessage, { role: "assistant" }> = {
+      role: "assistant",
+      content: content || null,
+      ...(includeReasoning ? { reasoning_content: reasoningContent } : {}),
+      ...(calls.length ? { tool_calls: calls.map((call) => ({ id: call.id, type: "function" as const, function: { name: call.name, arguments: call.arguments } })) } : {}),
+    };
+    messages.push(assistantMessage); sessionMessages.push(assistantMessage);
     if (!calls.length) break;
+    if (regularToolsAllowed) toolSteps += 1;
     const outputs = await executeToolCalls(args, calls, tools, timeline, effects);
-    for (const output of outputs) messages.push({ role: "tool", tool_call_id: output.callId, content: output.text });
+    for (const output of outputs) {
+      const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
+      messages.push(toolMessage); sessionMessages.push(toolMessage);
+    }
   }
   addTimeline("turn_finished", { usage });
-  return { assistantContent, tools, timeline, effects, modelMeta: { format: "chat_completions", model: args.agent.settings.model, usage } };
+  return { assistantContent, sessionMessages, tools, timeline, effects, modelMeta: { format: "chat_completions", model: args.agent.settings.model, usage, toolSteps, reasoningCharacters } };
 }
 
 async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
   const { baseUrl, headers } = apiConfig();
   const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = [];
   const addTimeline = createTimelineFactory(args.turnId, timeline); addTimeline("turn_started", { format: "responses" });
-  let assistantContent = ""; let previousResponseId: string | undefined; let input: unknown = packetText(args.packet); let usage: unknown = null;
-  for (let step = 0; step < args.agent.settings.maxToolSteps; step += 1) {
-    const body: Record<string, unknown> = { model: args.agent.settings.model, input, tools: toolDefinitionsForResponses(), tool_choice: "auto", stream: true };
+  const userMessage: AgentSessionMessage = { role: "user", content: packetText(args.packet) };
+  let assistantContent = ""; let previousResponseId: string | undefined; let input: unknown = userMessage.content; let usage: unknown = null;
+  for (let step = 0; step <= args.agent.settings.maxToolSteps + 1; step += 1) {
+    const regularToolsAllowed = step < args.agent.settings.maxToolSteps;
+    const terminalToolsOnly = step === args.agent.settings.maxToolSteps;
+    const body: Record<string, unknown> = { model: args.agent.settings.model, input, stream: true };
+    if (regularToolsAllowed) { body.tools = toolDefinitionsForResponses(); body.tool_choice = "auto"; }
+    else if (terminalToolsOnly) { body.tools = toolDefinitionsForResponses().filter((tool) => terminalToolNames.has(tool.name)); body.tool_choice = "auto"; }
     if (!previousResponseId) body.instructions = systemPrompt(args.agent, args.packet); else body.previous_response_id = previousResponseId;
     const response = await fetch(`${baseUrl}/responses`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
     if (!response.ok && step === 0 && [400, 404, 405].includes(response.status)) {
@@ -215,12 +258,15 @@ async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
         }
       }
     });
-    const calls = [...callMap.values()]; if (!calls.length) break;
+    const calls = [...callMap.values()];
+    if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
+    if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
+    if (!calls.length) break;
     const outputs = await executeToolCalls(args, calls, tools, timeline, effects);
     input = outputs.map((output) => ({ type: "function_call_output", call_id: output.callId, output: output.text }));
   }
   addTimeline("turn_finished", { usage, responseId: previousResponseId });
-  return { assistantContent, tools, timeline, effects, modelMeta: { format: "responses", model: args.agent.settings.model, responseId: previousResponseId, usage } };
+  return { assistantContent, sessionMessages: [userMessage, { role: "assistant", content: assistantContent }], tools, timeline, effects, modelMeta: { format: "responses", model: args.agent.settings.model, responseId: previousResponseId, usage } };
 }
 
 async function runMock(args: RunArgs): Promise<ModelTurnResult> {
@@ -232,14 +278,14 @@ async function runMock(args: RunArgs): Promise<ModelTurnResult> {
   addTimeline("assistant_delta", { delta: assistantContent }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: assistantContent });
   if (latest?.content.trim().startsWith("/private")) {
     addTimeline("turn_finished", { reason: "private-only fixture" });
-    return { assistantContent, tools, timeline, effects, modelMeta: { format: "mock", fixture: "private-only" } };
+    return { assistantContent, sessionMessages: [{ role: "user", content: packetText(args.packet) }, { role: "assistant", content: assistantContent }], tools, timeline, effects, modelMeta: { format: "mock", fixture: "private-only" } };
   }
   const wantsNoReply = !latestExternal || /无需回复|不需要回复|已阅即可/i.test(latest?.content ?? "");
   const call: ToolCall = wantsNoReply
     ? { id: createId("tool"), name: "read_no_reply", arguments: JSON.stringify({ roomId: args.packet.room.id, messageId: latest?.id }) }
     : { id: createId("tool"), name: "send_message_to_room", arguments: JSON.stringify({ roomId: args.packet.room.id, content: `收到。我会处理「${(latest?.content ?? "附件任务").slice(0, 160)}」并把可验证结果留在这个房间。`, kind: "answer" }) };
   await executeToolCalls(args, [call], tools, timeline, effects); addTimeline("turn_finished", { fixture: wantsNoReply ? "receipt" : "emit" });
-  return { assistantContent, tools, timeline, effects, modelMeta: { format: "mock", fixture: wantsNoReply ? "receipt" : "emit", availableTools: listToolDefinitions().length } };
+  return { assistantContent, sessionMessages: [{ role: "user", content: packetText(args.packet) }, { role: "assistant", content: assistantContent }], tools, timeline, effects, modelMeta: { format: "mock", fixture: wantsNoReply ? "receipt" : "emit", availableTools: listToolDefinitions().length } };
 }
 
 export async function runAgentModel(args: RunArgs): Promise<ModelTurnResult> {

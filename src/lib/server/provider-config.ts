@@ -14,8 +14,12 @@ export function environmentRuntimeDefaults(): ModelAndRuntimeSettings {
   const configuredDefault = process.env.OPENAI_MODEL?.trim();
   const model = configuredDefault && availableModels.includes(configuredDefault) ? configuredDefault : availableModels[0] ?? "gpt-5-mini";
   const format = process.env.OPENAI_API_FORMAT;
+  const thinkingMode = process.env.OPENAI_THINKING_MODE;
+  const reasoningEffort = process.env.OPENAI_REASONING_EFFORT;
   return {
     apiFormat: format === "responses" || format === "chat_completions" ? format : "auto",
+    thinkingMode: thinkingMode === "enabled" || thinkingMode === "disabled" ? thinkingMode : "provider_default",
+    reasoningEffort: reasoningEffort === "max" ? "max" : "high",
     model,
     availableModels,
     maxToolSteps: Number(process.env.OCEANKING_MAX_TOOL_STEPS ?? 12),
