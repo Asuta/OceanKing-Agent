@@ -6,7 +6,7 @@ import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
 
 type SendCommand = (draft: WorkspaceCommandDraft) => Promise<boolean>;
 
-export function RoomSidebar({ snapshot, activeRoomId, onSelect, sendCommand, busy }: { snapshot: WorkspaceSnapshot; activeRoomId: string; onSelect: (id: string) => void; sendCommand: SendCommand; busy: boolean }) {
+export function RoomSidebar({ snapshot, activeRoomId, activeAgentId, onSelect, onSelectAgent, sendCommand, busy }: { snapshot: WorkspaceSnapshot; activeRoomId: string; activeAgentId: string | null; onSelect: (id: string) => void; onSelectAgent: (id: string) => void; sendCommand: SendCommand; busy: boolean }) {
   const activeRooms = snapshot.rooms.filter((room) => !room.archivedAt);
   const archived = snapshot.rooms.filter((room) => room.archivedAt);
   return <div className="sidebar-content">
@@ -26,7 +26,7 @@ export function RoomSidebar({ snapshot, activeRoomId, onSelect, sendCommand, bus
     <div className="agent-roster">
       {snapshot.agents.map((agent, index) => {
         const active = snapshot.rooms.some((room) => room.scheduler.activeParticipantId && room.participants.some((participant) => participant.id === room.scheduler.activeParticipantId && participant.agentId === agent.id));
-        return <div key={agent.id}><span className={`agent-avatar tone-${index % 4}`}><Bot size={15} /></span><span><strong>{agent.label}</strong><small>{agent.summary}</small></span>{active ? <Circle className="agent-live" size={9} fill="currentColor" /> : <Check className="agent-ready" size={13} />}</div>;
+        return <button type="button" className={activeAgentId === agent.id ? "active" : ""} key={agent.id} onClick={() => onSelectAgent(agent.id)} aria-label={`查看 ${agent.label} 的底层对话`}><span className={`agent-avatar tone-${index % 4}`}><Bot size={15} /></span><span><strong>{agent.label}</strong><small>{agent.summary}</small></span>{active ? <Circle className="agent-live" size={9} fill="currentColor" /> : <Check className="agent-ready" size={13} />}</button>;
       })}
     </div>
   </div>;

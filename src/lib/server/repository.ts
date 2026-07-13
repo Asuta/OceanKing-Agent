@@ -2,7 +2,7 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import type { WorkspaceCommand } from "@/lib/domain/schemas";
 import type {
-  Agent, AgentSessionMessage, AgentTurn, Attachment, ContextCompaction, CronJob, CronRun, ModelAndRuntimeSettings, Participant, ReadNoReplyReceipt,
+  Agent, AgentConversationHistory, AgentSessionMessage, AgentTurn, Attachment, ContextCompaction, CronJob, CronRun, ModelAndRuntimeSettings, Participant, ReadNoReplyReceipt,
   Room, RoomMessage, SchedulerPacket, SchedulerState, TimelineEvent, ToolExecution, TurnEffect, WorkspaceSnapshot,
 } from "@/lib/domain/types";
 import { getDatabase, type DatabaseHandle } from "@/lib/server/db/client";
@@ -178,6 +178,30 @@ export class WorkspaceRepository {
     };
   }
 
+  getAgentConversation(agentId: string): AgentConversationHistory | null {
+    const snapshot = this.getSnapshot();
+    const agent = snapshot.agents.find((entry) => entry.id === agentId);
+    if (!agent) return null;
+    const detailRows = this.raw.prepare("SELECT id,system_prompt,conversation_json FROM agent_turns WHERE agent_id=?").all(agentId) as Row[];
+    const details = new Map(detailRows.map((row) => [str(row.id), {
+      systemPrompt: str(row.system_prompt),
+      messages: parseJson<unknown[]>(row.conversation_json, []).map(normalizeSessionMessage).filter((message): message is AgentSessionMessage => message !== null),
+    }]));
+    const turns = snapshot.rooms.flatMap((room) => room.turns
+      .filter((turn) => turn.agentId === agentId)
+      .map((turn) => {
+        const detail = details.get(turn.id);
+        const messages = detail?.messages.length
+          ? detail.messages
+          : turn.assistantContent
+            ? [{ role: "assistant" as const, content: turn.assistantContent }]
+            : [];
+        return { ...turn, roomTitle: room.title, systemPrompt: detail?.systemPrompt ?? "", messages };
+      }))
+      .toSorted((left, right) => right.createdAt.localeCompare(left.createdAt));
+    return { agent: { id: agent.id, label: agent.label, summary: agent.summary }, turns };
+  }
+
   executeCommand(command: WorkspaceCommand): CommandResult {
     const result: Omit<CommandResult, "snapshot"> = {};
     const tx = this.raw.transaction(() => {
@@ -302,29 +326,37 @@ export class WorkspaceRepository {
     }); tx();
   }
 
-  finishTurn(args: { turnId: string; assistantContent: string; sessionMessages?: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; contextCompaction?: ContextCompaction; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; superseded: boolean } {
+  checkpointTurn(args: { turnId: string; assistantContent: string; systemPrompt: string; conversationMessages: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[] }): void {
+    const tx = this.raw.transaction(() => {
+      const turn = this.raw.prepare("SELECT 1 found FROM agent_turns WHERE id=?").get(args.turnId) as Row | undefined;
+      if (!turn) return;
+      this.persistTurnTrace(args.turnId, args.tools, args.timeline);
+      this.raw.prepare("UPDATE agent_turns SET assistant_content=?,system_prompt=?,conversation_json=? WHERE id=?")
+        .run(args.assistantContent, args.systemPrompt, JSON.stringify(args.conversationMessages), args.turnId);
+    });
+    tx();
+  }
+
+  finishTurn(args: { turnId: string; assistantContent: string; systemPrompt?: string; sessionMessages?: AgentSessionMessage[]; auditMessages?: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; contextCompaction?: ContextCompaction; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; superseded: boolean } {
     const emittedMessageIds: string[] = [];
     let superseded = false;
     const tx = this.raw.transaction(() => {
       const turn = this.raw.prepare("SELECT * FROM agent_turns WHERE id=?").get(args.turnId) as Row;
       if (!turn) throw new DomainError("Agent turn 不存在");
       const roomId = str(turn.room_id); const agentId = str(turn.agent_id); const participantId = str(turn.agent_participant_id); const at = nowIso();
-      for (const tool of args.tools) this.raw.prepare("INSERT OR REPLACE INTO tool_executions(id,turn_id,name,input_json,output_text,structured_result_json,status,duration_ms,error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
-        .run(tool.id, args.turnId, tool.name, JSON.stringify(tool.input), tool.outputText, JSON.stringify(tool.structuredResult), tool.status, tool.durationMs, tool.error, tool.createdAt);
-      for (const event of args.timeline) this.raw.prepare("INSERT OR REPLACE INTO timeline_events(id,turn_id,ordinal,type,payload_json,created_at) VALUES(?,?,?,?,?,?)")
-        .run(event.id, args.turnId, event.ordinal, event.type, JSON.stringify(event.payload), event.createdAt);
+      this.persistTurnTrace(args.turnId, args.tools, args.timeline);
       for (const effect of args.effects) this.applyEffect(effect, agentId, participantId, emittedMessageIds, at);
       const newer = this.raw.prepare("SELECT 1 found FROM room_messages WHERE room_id=? AND seq>? AND sender_id<>? LIMIT 1").get(roomId, args.cutoffSeq, participantId) as Row | undefined;
       superseded = Boolean(newer);
       const status = superseded ? "continued" : (args.status ?? "completed");
-      this.raw.prepare("UPDATE agent_turns SET assistant_content=?,emitted_message_ids_json=?,status=?,model_meta_json=?,error=NULL,updated_at=? WHERE id=?")
-        .run(args.assistantContent, JSON.stringify(emittedMessageIds), status, JSON.stringify(args.modelMeta), at, args.turnId);
-      const session = this.raw.prepare("SELECT history_json FROM agent_sessions WHERE agent_id=?").get(agentId) as Row;
-      const history = parseJson<unknown[]>(session.history_json, []).map(normalizeSessionMessage).filter((message): message is AgentSessionMessage => message !== null);
       const packet = parseJson<SchedulerPacket>(turn.user_envelope_json, {} as SchedulerPacket);
       const completedMessages = args.sessionMessages ?? (args.contextCompaction
         ? [{ role: "user" as const, content: compactedSessionContent(args.contextCompaction.summary) }, { role: "assistant" as const, content: args.assistantContent }]
         : [{ role: "user" as const, content: JSON.stringify(packet) }, { role: "assistant" as const, content: args.assistantContent }]);
+      this.raw.prepare("UPDATE agent_turns SET assistant_content=?,system_prompt=?,conversation_json=?,emitted_message_ids_json=?,status=?,model_meta_json=?,error=NULL,updated_at=? WHERE id=?")
+        .run(args.assistantContent, args.systemPrompt ?? "", JSON.stringify(args.auditMessages ?? completedMessages), JSON.stringify(emittedMessageIds), status, JSON.stringify(args.modelMeta), at, args.turnId);
+      const session = this.raw.prepare("SELECT history_json FROM agent_sessions WHERE agent_id=?").get(agentId) as Row;
+      const history = parseJson<unknown[]>(session.history_json, []).map(normalizeSessionMessage).filter((message): message is AgentSessionMessage => message !== null);
       const nextHistory = args.contextCompaction ? completedMessages : [...history, ...completedMessages];
       this.raw.prepare("UPDATE agent_sessions SET history_json=?,active_turn_id=NULL,updated_at=? WHERE agent_id=?").run(JSON.stringify(nextHistory), at, agentId);
       const scheduler = this.raw.prepare("SELECT cursor_json,round_count FROM scheduler_states WHERE room_id=?").get(roomId) as Row;
@@ -334,6 +366,13 @@ export class WorkspaceRepository {
       this.bump();
     }); tx();
     return { emittedMessageIds, superseded };
+  }
+
+  private persistTurnTrace(turnId: string, tools: ToolExecution[], timeline: TimelineEvent[]): void {
+    for (const tool of tools) this.raw.prepare("INSERT OR REPLACE INTO tool_executions(id,turn_id,name,input_json,output_text,structured_result_json,status,duration_ms,error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+      .run(tool.id, turnId, tool.name, JSON.stringify(tool.input), tool.outputText, JSON.stringify(tool.structuredResult), tool.status, tool.durationMs, tool.error, tool.createdAt);
+    for (const event of timeline) this.raw.prepare("INSERT OR REPLACE INTO timeline_events(id,turn_id,ordinal,type,payload_json,created_at) VALUES(?,?,?,?,?,?)")
+      .run(event.id, turnId, event.ordinal, event.type, JSON.stringify(event.payload), event.createdAt);
   }
 
   private applyEffect(effect: TurnEffect, agentId: string, participantId: string, emitted: string[], at: string): void {

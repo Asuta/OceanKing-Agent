@@ -148,6 +148,17 @@ export type AgentTurn = {
   updatedAt: string;
 };
 
+export type AgentConversationTurn = AgentTurn & {
+  roomTitle: string;
+  systemPrompt: string;
+  messages: AgentSessionMessage[];
+};
+
+export type AgentConversationHistory = {
+  agent: Pick<Agent, "id" | "label" | "summary">;
+  turns: AgentConversationTurn[];
+};
+
 export type SchedulerState = {
   roomId: Id;
   status: "idle" | "running";

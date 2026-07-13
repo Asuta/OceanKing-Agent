@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -23,6 +24,91 @@ describe("OceanKing 领域仓库", () => {
     expect(room.messages).toHaveLength(before);
     expect(room.turns.at(-1)?.assistantContent).toContain("Console");
     expect(room.turns.at(-1)?.emittedMessageIds).toEqual([]);
+  }));
+
+  it("按 Agent 汇总跨房间底层输入、推理、回复与工具命令", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "分析港湾任务");
+    const firstPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_agent_history_room", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: firstPacket });
+    repository.finishTurn({
+      turnId: "turn_agent_history_room",
+      assistantContent: "已分析港湾任务",
+      systemPrompt: "你是测试领航员",
+      sessionMessages: [
+        { role: "user", content: "完整输入" },
+        { role: "assistant", content: null, reasoning_content: "先核对上下文", tool_calls: [{ id: "call_history", type: "function", function: { name: "read_room_history", arguments: "{\"roomId\":\"room_harbor\"}" } }] },
+        { role: "tool", tool_call_id: "call_history", content: "历史读取完成" },
+        { role: "assistant", content: "已分析港湾任务" },
+      ],
+      tools: [{ id: "tool_history", turnId: "turn_agent_history_room", name: "read_room_history", input: { roomId: "room_harbor" }, outputText: "历史读取完成", structuredResult: { count: 1 }, status: "completed", durationMs: 8, error: null, createdAt: new Date().toISOString() }],
+      timeline: [], effects: [], modelMeta: { format: "chat_completions" }, cutoffSeq: firstPacket.cutoffSeq, nextParticipantId: null,
+    });
+
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "跨房间任务", agentId: "navigator" });
+    const secondRoom = repository.getSnapshot().rooms.find((room) => room.title === "跨房间任务")!;
+    repository.executeCommand({ ...commandBase(repository), type: "create_cron", roomId: secondRoom.id, agentId: "navigator", name: "历史审计 Cron", schedule: "0 9 * * *", timezone: "Asia/Shanghai", prompt: "执行跨房间检查" });
+    repository.appendCronMessage(repository.getSnapshot().cronJobs[0]!.id);
+    const secondPacket = { ...packetFor(repository, secondRoom.id), type: "cron_packet" as const };
+    const participant = secondRoom.participants.find((entry) => entry.agentId === "navigator")!;
+    repository.beginTurn({ turnId: "turn_agent_history_cron", roomId: secondRoom.id, agentId: "navigator", agentParticipantId: participant.id, packet: secondPacket });
+    repository.finishTurn({ turnId: "turn_agent_history_cron", assistantContent: "Cron 已处理", systemPrompt: "Cron system", sessionMessages: [{ role: "user", content: "Cron 输入" }, { role: "assistant", content: "Cron 已处理" }], tools: [], timeline: [], effects: [], modelMeta: { format: "responses" }, cutoffSeq: secondPacket.cutoffSeq, nextParticipantId: null });
+
+    const history = repository.getAgentConversation("navigator")!;
+    expect(history.agent).toMatchObject({ id: "navigator", label: "领航员" });
+    expect(history.turns.map((turn) => turn.roomTitle)).toEqual(expect.arrayContaining(["港湾协作室", "跨房间任务"]));
+    expect(history.turns.find((turn) => turn.id === "turn_agent_history_cron")?.userEnvelope.type).toBe("cron_packet");
+    const roomTurn = history.turns.find((turn) => turn.id === "turn_agent_history_room")!;
+    expect(roomTurn.systemPrompt).toBe("你是测试领航员");
+    expect(roomTurn.messages[1]).toMatchObject({ role: "assistant", reasoning_content: "先核对上下文" });
+    expect(roomTurn.tools[0]).toMatchObject({ name: "read_room_history", outputText: "历史读取完成" });
+    expect(repository.getAgentConversation("missing-agent")).toBeNull();
+  }));
+
+  it("失败或停止前的回复与工具记录通过检查点保留，且检查点不推进工作区版本", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "执行后故意失败"); const packet = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_failed_checkpoint", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    const versionBeforeCheckpoint = repository.getVersion();
+    const messages: AgentSessionMessage[] = [
+      { role: "user", content: "底层输入" },
+      { role: "assistant", content: "先执行命令", tool_calls: [{ id: "call_before_failure", type: "function", function: { name: "read_room_history", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_before_failure", content: "已读取一条记录" },
+    ];
+    repository.checkpointTurn({
+      turnId: "turn_failed_checkpoint",
+      assistantContent: "先执行命令",
+      systemPrompt: "测试 System",
+      conversationMessages: messages,
+      tools: [{ id: "call_before_failure", turnId: "turn_failed_checkpoint", name: "read_room_history", input: {}, outputText: "已读取一条记录", structuredResult: { count: 1 }, status: "completed", durationMs: 3, error: null, createdAt: new Date().toISOString() }],
+      timeline: [{ id: "timeline_before_failure", turnId: "turn_failed_checkpoint", ordinal: 1, type: "tool_finished", payload: { id: "call_before_failure" }, createdAt: new Date().toISOString() }],
+    });
+    expect(repository.getVersion()).toEqual(versionBeforeCheckpoint);
+
+    repository.failTurn("turn_failed_checkpoint", "用户已停止", true);
+    const turn = repository.getAgentConversation("navigator")!.turns.find((entry) => entry.id === "turn_failed_checkpoint")!;
+    expect(turn).toMatchObject({ status: "stopped", assistantContent: "先执行命令", systemPrompt: "测试 System" });
+    expect(turn.messages).toEqual(messages);
+    expect(turn.tools[0]).toMatchObject({ id: "call_before_failure", outputText: "已读取一条记录" });
+    expect(turn.timeline[0]).toMatchObject({ id: "timeline_before_failure", type: "tool_finished" });
+  }));
+
+  it("上下文压缩只裁剪后续会话上下文，不裁剪 Turn 审计记录", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "压缩审计测试"); const packet = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_compaction_audit", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    const compactedMessages: AgentSessionMessage[] = [{ role: "user", content: "压缩后的继续上下文" }, { role: "assistant", content: "最终回复" }];
+    const auditMessages: AgentSessionMessage[] = [
+      { role: "user", content: "原始模型输入" },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_before_compaction", type: "function", function: { name: "read_room_history", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_before_compaction", content: "压缩前的工具结果" },
+      ...compactedMessages,
+    ];
+    repository.finishTurn({
+      turnId: "turn_compaction_audit", assistantContent: "最终回复", sessionMessages: compactedMessages, auditMessages,
+      tools: [], timeline: [], effects: [], modelMeta: {}, contextCompaction: { summary: "压缩后的继续上下文", estimatedTokens: 100, compactedTokens: 10, threshold: 50, sourceEntries: 3 },
+      cutoffSeq: packet.cutoffSeq, nextParticipantId: null,
+    });
+
+    expect(repository.getAgentSession("navigator")).toEqual(compactedMessages);
+    expect(repository.getAgentConversation("navigator")!.turns.find((turn) => turn.id === "turn_compaction_audit")?.messages).toEqual(auditMessages);
   }));
 
   it("Agent 会话完整持久化，不再按固定条数截断", async () => withRepository((repository) => {
@@ -192,6 +278,19 @@ describe("OceanKing 领域仓库", () => {
       expect(second.getRoom("room_harbor")!.messages.at(-1)?.content).toBe("重启后仍在");
       expect(second.getRoom("room_harbor")!.messages.at(-1)?.seq).toBe(2);
       secondHandle.raw.close();
+    } finally { await fs.rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("旧数据库启动时自动补齐 Turn 对话审计字段", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oceanking-agent-history-migration-"));
+    try {
+      const legacy = new Database(path.join(dir, "oceanking.db"));
+      legacy.exec("CREATE TABLE agent_turns (id TEXT PRIMARY KEY, room_id TEXT NOT NULL, agent_id TEXT NOT NULL, agent_participant_id TEXT NOT NULL, user_envelope_json TEXT NOT NULL, anchor_message_id TEXT, assistant_content TEXT NOT NULL, emitted_message_ids_json TEXT NOT NULL, status TEXT NOT NULL, model_meta_json TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+      legacy.close();
+      const handle = createDatabase(dir);
+      const columns = (handle.raw.prepare("PRAGMA table_info(agent_turns)").all() as Array<{ name: string }>).map((column) => column.name);
+      expect(columns).toEqual(expect.arrayContaining(["system_prompt", "conversation_json"]));
+      handle.raw.close();
     } finally { await fs.rm(dir, { recursive: true, force: true }); }
   });
 });

@@ -33,8 +33,9 @@ CREATE TABLE IF NOT EXISTS room_messages (id TEXT PRIMARY KEY, room_id TEXT NOT 
 CREATE INDEX IF NOT EXISTS messages_room_seq_idx ON room_messages(room_id, seq);
 CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, room_id TEXT REFERENCES rooms(id) ON DELETE SET NULL, message_id TEXT REFERENCES room_messages(id) ON DELETE SET NULL, file_name TEXT NOT NULL, mime_type TEXT NOT NULL, byte_size INTEGER NOT NULL, storage_path TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS message_receipts (id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES room_messages(id) ON DELETE CASCADE, agent_participant_id TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(message_id,agent_participant_id));
-CREATE TABLE IF NOT EXISTS agent_turns (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, agent_id TEXT NOT NULL, agent_participant_id TEXT NOT NULL, user_envelope_json TEXT NOT NULL, anchor_message_id TEXT, assistant_content TEXT NOT NULL, emitted_message_ids_json TEXT NOT NULL, status TEXT NOT NULL, model_meta_json TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS agent_turns (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, agent_id TEXT NOT NULL, agent_participant_id TEXT NOT NULL, user_envelope_json TEXT NOT NULL, anchor_message_id TEXT, assistant_content TEXT NOT NULL, system_prompt TEXT NOT NULL DEFAULT '', conversation_json TEXT NOT NULL DEFAULT '[]', emitted_message_ids_json TEXT NOT NULL, status TEXT NOT NULL, model_meta_json TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS turns_room_idx ON agent_turns(room_id, created_at);
+CREATE INDEX IF NOT EXISTS turns_agent_idx ON agent_turns(agent_id, created_at);
 CREATE TABLE IF NOT EXISTS tool_executions (id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES agent_turns(id) ON DELETE CASCADE, name TEXT NOT NULL, input_json TEXT NOT NULL, output_text TEXT NOT NULL, structured_result_json TEXT NOT NULL, status TEXT NOT NULL, duration_ms INTEGER NOT NULL, error TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS timeline_events (id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES agent_turns(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS scheduler_states (room_id TEXT PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE, status TEXT NOT NULL, next_agent_participant_id TEXT, active_participant_id TEXT, round_count INTEGER NOT NULL, cursor_json TEXT NOT NULL, receipt_revision_json TEXT NOT NULL, rerun_requested INTEGER NOT NULL);
@@ -112,6 +113,9 @@ export function createDatabase(explicitDataDir?: string): DatabaseHandle {
   raw.pragma("foreign_keys = ON");
   raw.pragma("busy_timeout = 5000");
   raw.exec(createSql);
+  const turnColumns = new Set((raw.prepare("PRAGMA table_info(agent_turns)").all() as Array<{ name: string }>).map((column) => column.name));
+  if (!turnColumns.has("system_prompt")) raw.exec("ALTER TABLE agent_turns ADD COLUMN system_prompt TEXT NOT NULL DEFAULT ''");
+  if (!turnColumns.has("conversation_json")) raw.exec("ALTER TABLE agent_turns ADD COLUMN conversation_json TEXT NOT NULL DEFAULT '[]'");
   const environmentDefaults = environmentRuntimeDefaults();
   const defaults = JSON.stringify(environmentDefaults);
   raw.prepare("INSERT OR IGNORE INTO workspace_meta(id,version,revision,settings_json) VALUES(1,0,0,?)").run(defaults);

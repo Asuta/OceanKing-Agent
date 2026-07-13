@@ -228,6 +228,33 @@ describe("OpenAI 兼容协议", () => {
     expectProgressivePreview(previewContents, completeContent);
   }));
 
+  it("工具执行后模型续轮失败时仍可从 Turn 审计中还原命令与工具结果", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    let requestCount = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      requestCount += 1;
+      if (requestCount === 1) return sse([{
+        choices: [{ delta: { content: "我先读取历史。", tool_calls: [{ index: 0, id: "call_before_provider_failure", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor", limit: 1 }) } }] } }],
+      }, "[DONE]"]);
+      return new Response("provider failed", { status: 500 });
+    }));
+    sendUser(repository, "room_harbor", "失败检查点测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const } };
+    repository.beginTurn({ turnId: "turn_provider_failure", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+
+    await expect(runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_provider_failure", signal: new AbortController().signal })).rejects.toThrow("模型接口错误 500");
+    repository.failTurn("turn_provider_failure", "模型接口错误 500");
+
+    const turn = repository.getAgentConversation("navigator")!.turns.find((entry) => entry.id === "turn_provider_failure")!;
+    expect(turn.status).toBe("error");
+    expect(turn.assistantContent).toBe("我先读取历史。");
+    expect(turn.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "assistant", content: "我先读取历史。", tool_calls: [expect.objectContaining({ id: "call_before_provider_failure" })] }),
+      expect.objectContaining({ role: "tool", tool_call_id: "call_before_provider_failure" }),
+    ]));
+    expect(turn.tools[0]).toMatchObject({ id: "call_before_provider_failure", name: "read_room_history", status: "completed" });
+  }));
+
   it("DeepSeek 思考模式在工具子轮和后续用户轮次完整回传 reasoning_content", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://api.deepseek.com/v1";
     const bodies: Array<Record<string, unknown>> = [];
@@ -327,6 +354,12 @@ describe("OpenAI 兼容协议", () => {
     expect(requestBodies[1]?.messages[0]?.content).toContain("上下文压缩器");
     expect(requestBodies[2]?.messages[1]?.content).toContain("工具返回了大量关键事实");
     expect(result.contextCompaction).toMatchObject({ threshold: 15_000 });
+    expect(result.sessionMessages.some((message) => message.role === "tool" && message.tool_call_id === "call_large_read")).toBe(false);
+    expect(result.auditMessages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "assistant", tool_calls: [expect.objectContaining({ id: "call_large_read" })] }),
+      expect.objectContaining({ role: "tool", tool_call_id: "call_large_read" }),
+      expect.objectContaining({ role: "user", content: expect.stringContaining("此前完整 Agent 会话的压缩上下文") }),
+    ]));
   }));
 
   it("Responses function arguments 发布跨片段房间预览", async () => withRepository(async (repository) => {

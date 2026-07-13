@@ -31,6 +31,7 @@ export const messageReceipts = sqliteTable("message_receipts", {
 export const agentTurns = sqliteTable("agent_turns", {
   id: text("id").primaryKey(), roomId: text("room_id").notNull(), agentId: text("agent_id").notNull(), agentParticipantId: text("agent_participant_id").notNull(),
   userEnvelopeJson: text("user_envelope_json").notNull(), anchorMessageId: text("anchor_message_id"), assistantContent: text("assistant_content").notNull(),
+  systemPrompt: text("system_prompt").notNull().default(""), conversationJson: text("conversation_json").notNull().default("[]"),
   emittedMessageIdsJson: text("emitted_message_ids_json").notNull(), status: text("status").notNull(), modelMetaJson: text("model_meta_json"), error: text("error"),
   createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
 });

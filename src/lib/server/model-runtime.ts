@@ -36,7 +36,9 @@ type RunArgs = {
 
 export type ModelTurnResult = {
   assistantContent: string;
+  systemPrompt: string;
   sessionMessages: AgentSessionMessage[];
+  auditMessages: AgentSessionMessage[];
   tools: ToolExecution[];
   timeline: TimelineEvent[];
   effects: TurnEffect[];
@@ -276,7 +278,7 @@ function createRoomMessagePreviewStream(args: RunArgs) {
   return { update, flush };
 }
 
-async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExecution[], timeline: TimelineEvent[], effects: TurnEffect[]) {
+async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExecution[], timeline: TimelineEvent[], effects: TurnEffect[], onOutput?: (output: { callId: string; name: string; text: string; error: boolean }) => void) {
   const addTimeline = createTimelineFactory(args.turnId, timeline);
   const outputs: Array<{ callId: string; name: string; text: string; error: boolean }> = [];
   for (const call of calls) {
@@ -296,7 +298,8 @@ async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExe
     }
     const tool: ToolExecution = { id: call.id || createId("tool"), turnId: args.turnId, name: call.name, input: parsed, outputText, structuredResult: structured, status: error ? "error" : "completed", durationMs: Date.now() - started, error, createdAt: nowIso() };
     tools.push(tool); addTimeline("tool_finished", { id: tool.id, name: tool.name, status: tool.status, durationMs: tool.durationMs, error });
-    outputs.push({ callId: call.id, name: call.name, text: outputText, error: Boolean(error) });
+    const output = { callId: call.id, name: call.name, text: outputText, error: Boolean(error) };
+    outputs.push(output); onOutput?.(output);
     publishWorkspaceEvent("turn.preview", args.turnId, { kind: "tool", tool }, args.repository.getVersion().revision);
   }
   return outputs;
@@ -463,6 +466,7 @@ function contextMeta(prepared: PreparedContext): Record<string, unknown> {
 async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]): Promise<ModelTurnResult> {
   const { baseUrl, headers } = apiConfig();
   const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = [];
+  const turnSystemPrompt = systemPrompt(args.agent, args.packet);
   const session = args.repository.getAgentSession(args.agent.id);
   const userMessage: AgentSessionMessage = { role: "user", content: packetText(args.packet) };
   const prepared = await prepareContext(args, "chat_completions", [...session, userMessage].map((message) => ({ ...message })), modelCalls);
@@ -470,12 +474,14 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
   let sessionMessages: AgentSessionMessage[] = prepared.compaction
     ? [{ role: "user", content: compactedSessionContent(prepared.compaction.summary) }]
     : [userMessage];
+  const auditMessages = [...sessionMessages];
   const messages: Array<Record<string, unknown>> = [
-    { role: "system", content: systemPrompt(args.agent, args.packet) },
+    { role: "system", content: turnSystemPrompt },
     ...prepared.messages,
   ];
   const chatToolDefinitions = toolDefinitionsForChat();
   let assistantContent = ""; let usage: unknown = null; let toolSteps = 0; let reasoningCharacters = 0;
+  checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
   for (let step = 0; step <= args.agent.settings.maxToolSteps + 1; step += 1) {
     const regularToolsAllowed = step < args.agent.settings.maxToolSteps;
     const terminalToolsOnly = step === args.agent.settings.maxToolSteps;
@@ -489,15 +495,18 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       const sourceEntries = messages.length - 1;
       const summary = await compactWithChatCompletions(args, messages.slice(1), modelCalls);
       messages.splice(0, messages.length,
-        { role: "system", content: systemPrompt(args.agent, args.packet) },
+        { role: "system", content: turnSystemPrompt },
         { role: "user", content: compactedSessionContent(summary) },
       );
-      sessionMessages = [{ role: "user", content: compactedSessionContent(summary) }];
+      const compactedMessage: AgentSessionMessage = { role: "user", content: compactedSessionContent(summary) };
+      sessionMessages = [compactedMessage];
+      auditMessages.push(compactedMessage);
       const compactedTokens = countRenderedContextTokens({ instructions: "", messages, tools: requestTools });
       if (compactedTokens > prepared.threshold) throw new Error(`上下文压缩后仍有 ${compactedTokens} tokens，超过阈值 ${prepared.threshold}`);
       prepared.estimatedTokens = requestTokens;
       prepared.compactedTokens = compactedTokens;
       prepared.compaction = { summary, estimatedTokens: requestTokens, compactedTokens, threshold: prepared.threshold, sourceEntries };
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
     }
     const body: Record<string, unknown> = { model: args.agent.settings.model, messages, stream: true, stream_options: { include_usage: true } };
     if (requestTools.length) { body.tools = requestTools; body.tool_choice = "auto"; }
@@ -524,12 +533,20 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       appendModelCall(modelCalls, { purpose: "generation", format: "chat_completions", startedAt, startedMs, usage: stepUsage });
     } catch (error) {
       appendModelCall(modelCalls, { purpose: "generation", format: "chat_completions", startedAt, startedMs, usage: stepUsage, error });
+      const partialCalls = [...callMap.values()];
+      if (content || reasoningContent || partialCalls.length) {
+        auditMessages.push({
+          role: "assistant",
+          content: content || null,
+          ...(sawReasoningContent ? { reasoning_content: reasoningContent } : {}),
+          ...(partialCalls.length ? { tool_calls: partialCalls.map((call) => ({ id: call.id, type: "function" as const, function: { name: call.name, arguments: call.arguments } })) } : {}),
+        });
+      }
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
       throw error;
     }
     const calls = [...callMap.values()];
     await roomMessagePreviewStream.flush();
-    if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
-    if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
     const includeReasoning = sawReasoningContent || args.agent.settings.thinkingMode === "enabled" || (args.agent.settings.thinkingMode === "provider_default" && isDeepSeekBaseUrl(baseUrl));
     const assistantMessage: Extract<AgentSessionMessage, { role: "assistant" }> = {
       role: "assistant",
@@ -537,22 +554,27 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       ...(includeReasoning ? { reasoning_content: reasoningContent } : {}),
       ...(calls.length ? { tool_calls: calls.map((call) => ({ id: call.id, type: "function" as const, function: { name: call.name, arguments: call.arguments } })) } : {}),
     };
-    messages.push(assistantMessage); sessionMessages.push(assistantMessage);
+    messages.push(assistantMessage); sessionMessages.push(assistantMessage); auditMessages.push(assistantMessage);
+    checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+    if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
+    if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
     if (!calls.length) break;
     if (regularToolsAllowed) toolSteps += 1;
-    const outputs = await executeToolCalls(args, calls, tools, timeline, effects);
-    for (const output of outputs) {
+    await executeToolCalls(args, calls, tools, timeline, effects, (output) => {
       const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
-      messages.push(toolMessage); sessionMessages.push(toolMessage);
-    }
+      messages.push(toolMessage); sessionMessages.push(toolMessage); auditMessages.push(toolMessage);
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+    });
   }
   addTimeline("turn_finished", { usage });
-  return { assistantContent, sessionMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "chat_completions", model: args.agent.settings.model, usage, modelCalls, toolSteps, reasoningCharacters, context: contextMeta(prepared) } };
+  checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+  return { assistantContent, systemPrompt: turnSystemPrompt, sessionMessages, auditMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "chat_completions", model: args.agent.settings.model, usage, modelCalls, toolSteps, reasoningCharacters, context: contextMeta(prepared) } };
 }
 
 async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promise<ModelTurnResult> {
   const { baseUrl, headers } = apiConfig();
   const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = [];
+  const turnSystemPrompt = systemPrompt(args.agent, args.packet);
   const session = args.repository.getAgentSession(args.agent.id);
   const userMessage: AgentSessionMessage = { role: "user", content: packetText(args.packet) };
   const initialContext = [...session, userMessage].map(responseContextMessage);
@@ -564,6 +586,8 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
   let sessionMessages: AgentSessionMessage[] = prepared.compaction
     ? [{ role: "user", content: compactedSessionContent(prepared.compaction.summary) }]
     : [userMessage];
+  const auditMessages = [...sessionMessages];
+  checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
   for (let step = 0; step <= args.agent.settings.maxToolSteps + 1; step += 1) {
     const regularToolsAllowed = step < args.agent.settings.maxToolSteps;
     const terminalToolsOnly = step === args.agent.settings.maxToolSteps;
@@ -572,23 +596,26 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       : terminalToolsOnly
         ? responseToolDefinitions.filter((tool) => terminalToolNames.has(tool.name))
         : [];
-    const requestTokens = countRenderedContextTokens({ instructions: systemPrompt(args.agent, args.packet), messages: continuationMessages, tools: responseToolDefinitions });
+    const requestTokens = countRenderedContextTokens({ instructions: turnSystemPrompt, messages: continuationMessages, tools: responseToolDefinitions });
     if (requestTokens > prepared.threshold) {
       const sourceEntries = continuationMessages.length;
       const summary = await compactWithResponses(args, continuationMessages, modelCalls);
       continuationMessages = [{ role: "user", content: compactedSessionContent(summary) }];
-      const compactedTokens = countRenderedContextTokens({ instructions: systemPrompt(args.agent, args.packet), messages: continuationMessages, tools: responseToolDefinitions });
+      const compactedTokens = countRenderedContextTokens({ instructions: turnSystemPrompt, messages: continuationMessages, tools: responseToolDefinitions });
       if (compactedTokens > prepared.threshold) throw new Error(`上下文压缩后仍有 ${compactedTokens} tokens，超过阈值 ${prepared.threshold}`);
       prepared.estimatedTokens = requestTokens;
       prepared.compactedTokens = compactedTokens;
       prepared.compaction = { summary, estimatedTokens: requestTokens, compactedTokens, threshold: prepared.threshold, sourceEntries };
       input = continuationMessages;
       previousResponseId = undefined;
-      sessionMessages = [{ role: "user", content: compactedSessionContent(summary) }];
+      const compactedMessage: AgentSessionMessage = { role: "user", content: compactedSessionContent(summary) };
+      sessionMessages = [compactedMessage];
+      auditMessages.push(compactedMessage);
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
     }
     const body: Record<string, unknown> = { model: args.agent.settings.model, input, stream: true };
     if (requestTools.length) { body.tools = requestTools; body.tool_choice = "auto"; }
-    if (!previousResponseId) body.instructions = systemPrompt(args.agent, args.packet); else body.previous_response_id = previousResponseId;
+    if (!previousResponseId) body.instructions = turnSystemPrompt; else body.previous_response_id = previousResponseId;
     applyResponsesThinkingSettings(body, args.agent, baseUrl);
     const startedAt = nowIso(); const startedMs = Date.now(); let stepUsage: unknown = null;
     const callMap = new Map<string, ToolCall>(); const roomMessagePreviewStream = createRoomMessagePreviewStream(args); let stepContent = "";
@@ -627,47 +654,85 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       appendModelCall(modelCalls, { purpose: "generation", format: "responses", startedAt, startedMs, usage: stepUsage });
     } catch (error) {
       appendModelCall(modelCalls, { purpose: "generation", format: "responses", startedAt, startedMs, usage: stepUsage, error });
+      const partialCalls = [...callMap.values()];
+      if (stepContent || partialCalls.length) {
+        auditMessages.push({
+          role: "assistant",
+          content: stepContent || null,
+          ...(partialCalls.length ? { tool_calls: partialCalls.map((call) => ({ id: call.id, type: "function" as const, function: { name: call.name, arguments: call.arguments } })) } : {}),
+        });
+      }
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
       throw error;
     }
     const calls = [...callMap.values()];
     await roomMessagePreviewStream.flush();
-    if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
-    if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
     const assistantMessage: Extract<AgentSessionMessage, { role: "assistant" }> = {
       role: "assistant",
       content: stepContent || null,
       ...(calls.length ? { tool_calls: calls.map((call) => ({ id: call.id, type: "function" as const, function: { name: call.name, arguments: call.arguments } })) } : {}),
     };
-    sessionMessages.push(assistantMessage); continuationMessages.push(responseContextMessage(assistantMessage));
+    sessionMessages.push(assistantMessage); auditMessages.push(assistantMessage); continuationMessages.push(responseContextMessage(assistantMessage));
+    checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+    if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
+    if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
     if (!calls.length) break;
-    const outputs = await executeToolCalls(args, calls, tools, timeline, effects);
-    for (const output of outputs) {
+    const outputs = await executeToolCalls(args, calls, tools, timeline, effects, (output) => {
       const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
-      sessionMessages.push(toolMessage); continuationMessages.push(responseContextMessage(toolMessage));
-    }
+      sessionMessages.push(toolMessage); auditMessages.push(toolMessage); continuationMessages.push(responseContextMessage(toolMessage));
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+    });
     input = outputs.map((output) => ({ type: "function_call_output", call_id: output.callId, output: output.text }));
   }
   addTimeline("turn_finished", { usage, responseId: previousResponseId });
-  return { assistantContent, sessionMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "responses", model: args.agent.settings.model, responseId: previousResponseId, usage, modelCalls, context: contextMeta(prepared) } };
+  checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+  return { assistantContent, systemPrompt: turnSystemPrompt, sessionMessages, auditMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "responses", model: args.agent.settings.model, responseId: previousResponseId, usage, modelCalls, context: contextMeta(prepared) } };
 }
 
 async function runMock(args: RunArgs): Promise<ModelTurnResult> {
   const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = []; const addTimeline = createTimelineFactory(args.turnId, timeline);
+  const turnSystemPrompt = systemPrompt(args.agent, args.packet);
+  const sessionMessages: AgentSessionMessage[] = [{ role: "user", content: packetText(args.packet) }];
+  const auditMessages = [...sessionMessages];
   addTimeline("turn_started", { format: "mock" });
   const latestExternal = args.packet.messages.toReversed().find((message) => message.source !== "agent_emit");
   const latest = latestExternal ?? args.packet.messages.at(-1);
   const assistantContent = `我已在私有执行区分析消息 #${latest?.seq ?? "?"}。`;
+  checkpointTurn(args, turnSystemPrompt, "", auditMessages, tools, timeline);
   addTimeline("assistant_delta", { delta: assistantContent }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: assistantContent }, args.repository.getVersion().revision);
   if (latest?.content.trim().startsWith("/private")) {
+    const assistantMessage: AgentSessionMessage = { role: "assistant", content: assistantContent };
+    sessionMessages.push(assistantMessage); auditMessages.push(assistantMessage);
     addTimeline("turn_finished", { reason: "private-only fixture" });
-    return { assistantContent, sessionMessages: [{ role: "user", content: packetText(args.packet) }, { role: "assistant", content: assistantContent }], tools, timeline, effects, modelMeta: { format: "mock", fixture: "private-only" } };
+    checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+    return { assistantContent, systemPrompt: turnSystemPrompt, sessionMessages, auditMessages, tools, timeline, effects, modelMeta: { format: "mock", fixture: "private-only" } };
   }
   const wantsNoReply = !latestExternal || /无需回复|不需要回复|已阅即可/i.test(latest?.content ?? "");
   const call: ToolCall = wantsNoReply
     ? { id: createId("tool"), name: "read_no_reply", arguments: JSON.stringify({ roomId: args.packet.room.id, messageId: latest?.id }) }
     : { id: createId("tool"), name: "send_message_to_room", arguments: JSON.stringify({ roomId: args.packet.room.id, content: `收到。我会处理「${(latest?.content ?? "附件任务").slice(0, 160)}」并把可验证结果留在这个房间。`, kind: "answer" }) };
-  await executeToolCalls(args, [call], tools, timeline, effects); addTimeline("turn_finished", { fixture: wantsNoReply ? "receipt" : "emit" });
-  return { assistantContent, sessionMessages: [{ role: "user", content: packetText(args.packet) }, { role: "assistant", content: assistantContent }], tools, timeline, effects, modelMeta: { format: "mock", fixture: wantsNoReply ? "receipt" : "emit", availableTools: listToolDefinitions().length } };
+  const assistantMessage: AgentSessionMessage = { role: "assistant", content: assistantContent, tool_calls: [{ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } }] };
+  sessionMessages.push(assistantMessage); auditMessages.push(assistantMessage);
+  checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+  await executeToolCalls(args, [call], tools, timeline, effects, (output) => {
+    const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
+    sessionMessages.push(toolMessage); auditMessages.push(toolMessage);
+    checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+  });
+  addTimeline("turn_finished", { fixture: wantsNoReply ? "receipt" : "emit" });
+  checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+  return { assistantContent, systemPrompt: turnSystemPrompt, sessionMessages, auditMessages, tools, timeline, effects, modelMeta: { format: "mock", fixture: wantsNoReply ? "receipt" : "emit", availableTools: listToolDefinitions().length } };
+}
+
+function checkpointTurn(args: RunArgs, system: string, assistantContent: string, auditMessages: AgentSessionMessage[], tools: ToolExecution[], timeline: TimelineEvent[]): void {
+  args.repository.checkpointTurn({
+    turnId: args.turnId,
+    assistantContent,
+    systemPrompt: system,
+    conversationMessages: auditMessages,
+    tools,
+    timeline,
+  });
 }
 
 export async function runAgentModel(args: RunArgs): Promise<ModelTurnResult> {
