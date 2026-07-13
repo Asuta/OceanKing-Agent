@@ -33,7 +33,7 @@ const snapshot: WorkspaceSnapshot = {
 describe("工作台设置", () => {
   it("以 K Token 显示阈值并在保存时换算回整数 Token", async () => {
     const sendCommand = vi.fn().mockResolvedValue(true);
-    render(<SettingsDialog snapshot={snapshot} busy={false} sendCommand={sendCommand} onClose={vi.fn()} />);
+    render(<SettingsDialog snapshot={snapshot} busy={false} sendCommand={sendCommand} onReset={vi.fn()} onClose={vi.fn()} />);
 
     const threshold = screen.getByRole("spinbutton", { name: "上下文压缩阈值（K Token）" }) as HTMLInputElement;
     expect(threshold.value).toBe("100");
@@ -47,10 +47,27 @@ describe("工作台设置", () => {
   });
 
   it("阈值超出原有 Token 合法范围时禁止保存", () => {
-    render(<SettingsDialog snapshot={snapshot} busy={false} sendCommand={vi.fn()} onClose={vi.fn()} />);
+    render(<SettingsDialog snapshot={snapshot} busy={false} sendCommand={vi.fn()} onReset={vi.fn()} onClose={vi.fn()} />);
 
     fireEvent.change(screen.getByRole("spinbutton", { name: "上下文压缩阈值（K Token）" }), { target: { value: "1" } });
 
     expect((screen.getByRole("button", { name: "保存全局模型设置" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("重置工作台需要二次确认，成功后返回初始房间视图", async () => {
+    const sendCommand = vi.fn().mockResolvedValue(true);
+    const onReset = vi.fn(); const onClose = vi.fn();
+    render(<SettingsDialog snapshot={snapshot} busy={false} sendCommand={sendCommand} onReset={onReset} onClose={onClose} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "数据重置" }));
+    expect(screen.getByText("Agent 注册信息、全局模型、思考模式和思考强度保持不变。")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "重置工作台" }));
+    expect(screen.getByRole("alert").textContent).toContain("不可撤销");
+    expect(sendCommand).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认重置全部历史" }));
+    await waitFor(() => expect(sendCommand).toHaveBeenCalledWith({ type: "reset_workspace" }));
+    expect(onReset).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledOnce();
   });
 });

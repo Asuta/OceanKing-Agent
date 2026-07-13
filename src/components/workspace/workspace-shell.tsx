@@ -88,7 +88,7 @@ export function WorkspaceShell({ initialSnapshot }: { initialSnapshot: Workspace
       </aside> : <button className="console-reopen desktop-only" onClick={() => setConsoleOpen(true)} aria-label="打开 Console"><PanelRightOpen size={18} /></button>}
 
       {workspace.error ? <div className="toast" role="status"><span>{workspace.error}</span><button onClick={() => workspace.setError(null)}><X size={15} /></button></div> : null}
-      {settingsOpen ? <SettingsDialog snapshot={workspace.snapshot} busy={workspace.busy} sendCommand={workspace.sendCommand} onClose={() => setSettingsOpen(false)} /> : null}
+      {settingsOpen ? <SettingsDialog snapshot={workspace.snapshot} busy={workspace.busy} sendCommand={workspace.sendCommand} onReset={() => { setActiveRoomId("room_harbor"); setActiveAgentId(null); setMobileView("room"); }} onClose={() => setSettingsOpen(false)} /> : null}
       {cronOpen ? <CronDrawer snapshot={workspace.snapshot} roomId={room?.id ?? ""} busy={workspace.busy} sendCommand={workspace.sendCommand} onClose={() => setCronOpen(false)} /> : null}
       {navOpen ? <button className="nav-scrim mobile-only" aria-label="关闭导航遮罩" onClick={() => setNavOpen(false)} /> : null}
     </main>

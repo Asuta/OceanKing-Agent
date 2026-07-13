@@ -296,6 +296,8 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .settings-body > nav { display: flex; flex-direction: column; gap: 4px; padding: 14px 10px; border-right: 1px solid var(--line); background: var(--bg-deep); }
 .settings-body > nav button { display: flex; align-items: center; gap: 9px; padding: 9px 10px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font-size: 10px; text-align: left; cursor: pointer; }
 .settings-body > nav button.active { color: var(--accent); background: var(--accent-soft); }
+.settings-body > nav button.danger-tab { margin-top: auto; color: #d98b92; }
+.settings-body > nav button.danger-tab.active { color: #ffb9be; background: rgba(255, 107, 117, .1); }
 .settings-content { overflow: auto; padding: 20px; }
 .settings-content > label, .new-agent-form label, .cron-form label { display: grid; gap: 6px; margin-bottom: 13px; color: var(--text-soft); font-size: 9px; font-weight: 650; letter-spacing: .04em; }
 .settings-content input, .settings-content textarea, .settings-content select, .cron-form input, .cron-form textarea, .cron-form select { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; outline: 0; background: var(--bg-deep); color: var(--text); font-size: 10px; }
@@ -320,6 +322,17 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .tool-policy-list { display: grid; gap: 7px; margin-top: 16px; }
 .tool-policy-list > div { display: flex; align-items: center; justify-content: space-between; padding: 10px; border-bottom: 1px solid var(--line); }
 .tool-policy-list strong { font-size: 10px; }.tool-policy-list span { color: var(--muted); font-size: 9px; }
+.reset-workspace-panel { display: grid; gap: 16px; padding: 18px; border: 1px solid rgba(255, 107, 117, .22); border-radius: 12px; background: linear-gradient(145deg, rgba(255, 107, 117, .08), rgba(255, 107, 117, .025)); }
+.reset-workspace-heading { display: flex; align-items: flex-start; gap: 11px; }
+.reset-workspace-heading > span { flex: 0 0 auto; width: 34px; height: 34px; display: grid; place-items: center; border-radius: 9px; color: var(--danger); background: rgba(255, 107, 117, .1); }
+.reset-workspace-heading h3 { margin: 1px 0 5px; color: #ffb9be; font-size: 12px; }
+.reset-workspace-heading p, .reset-confirmation p { margin: 0; color: var(--text-soft); font-size: 9px; line-height: 1.65; }
+.reset-preserved { display: flex; align-items: center; gap: 8px; padding: 10px; border: 1px solid rgba(58, 211, 191, .15); border-radius: 8px; color: var(--accent); background: rgba(58, 211, 191, .05); font-size: 9px; line-height: 1.5; }
+.reset-workspace-panel > .danger-button { justify-self: start; }
+.reset-confirmation { display: grid; gap: 7px; padding: 12px; border: 1px solid rgba(255, 107, 117, .3); border-radius: 9px; background: rgba(8, 17, 27, .5); }
+.reset-confirmation strong { color: #ffd3d6; font-size: 10px; }
+.reset-confirmation > div { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.reset-confirmation > div > button:not(.danger-button) { height: 32px; padding: 0 11px; border: 1px solid var(--line-strong); border-radius: 9px; background: transparent; color: var(--text-soft); font-size: 10px; cursor: pointer; }
 
 .drawer-backdrop { place-items: stretch end; padding: 0; }
 .cron-drawer { width: min(430px, 100vw); height: 100%; overflow: auto; border-left: 1px solid var(--line-strong); background: var(--panel); box-shadow: var(--shadow); }
@@ -390,6 +403,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   .settings-body { grid-template-columns: 1fr; height: calc(100dvh - 69px); }
   .settings-body > nav { flex-direction: row; overflow-x: auto; padding: 8px; border-right: 0; border-bottom: 1px solid var(--line); }
   .settings-body > nav button { white-space: nowrap; }
+  .settings-body > nav button.danger-tab { margin-top: 0; }
   .settings-content { padding: 15px; }
   .field-pair { grid-template-columns: 1fr; gap: 0; }
 }

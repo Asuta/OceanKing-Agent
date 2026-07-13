@@ -8,8 +8,13 @@ class CronDispatcher {
   private jobs = new Map<string, Cron>();
   constructor(private repository: WorkspaceRepository = getRepository()) {}
 
+  stopAll(): void {
+    for (const job of this.jobs.values()) job.stop();
+    this.jobs.clear();
+  }
+
   refresh(): void {
-    for (const job of this.jobs.values()) job.stop(); this.jobs.clear();
+    this.stopAll();
     for (const definition of this.repository.getSnapshot().cronJobs) {
       if (!definition.enabled) continue;
       try {

@@ -40,3 +40,7 @@ export function eventsAfterRevision(revision: number): WorkspaceEvent[] {
 export function eventsAfterId(eventId: number): WorkspaceEvent[] {
   return history.filter((event) => event.id > eventId);
 }
+
+export function resetWorkspaceEventHistory(): void {
+  history.length = 0;
+}

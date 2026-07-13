@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import type { WorkspaceCommand } from "@/lib/domain/schemas";
@@ -85,18 +86,43 @@ export class WorkspaceRepository {
       this.raw.prepare("INSERT INTO agent_sessions(agent_id,history_json,active_turn_id,updated_at) VALUES(?,?,NULL,?)").run("navigator", "[]", at);
       this.raw.prepare("INSERT INTO agent_sessions(agent_id,history_json,active_turn_id,updated_at) VALUES(?,?,NULL,?)").run("builder", "[]", at);
 
-      const roomId = "room_harbor";
-      const humanId = "human_local";
-      const agentParticipantId = "participant_navigator_harbor";
-      this.raw.prepare("INSERT INTO rooms(id,title,owner_participant_id,next_seq,archived_at,created_at,updated_at) VALUES(?,?,?,?,NULL,?,?)").run(roomId, "港湾协作室", humanId, 2, at, at);
-      this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?)").run(humanId, roomId, "human", null, "你", 1, 0, at);
-      this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?)").run(agentParticipantId, roomId, "agent", "navigator", "领航员", 1, 1, at);
-      this.raw.prepare("INSERT INTO scheduler_states(room_id,status,next_agent_participant_id,active_participant_id,round_count,cursor_json,receipt_revision_json,rerun_requested) VALUES(?,?,?,?,?,?,?,0)").run(roomId, "idle", agentParticipantId, null, 0, JSON.stringify({ [agentParticipantId]: 1 }), "{}");
-      this.raw.prepare("INSERT INTO room_messages(id,room_id,seq,sender_id,sender_name,sender_role,source,kind,status,content,final,message_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
-        .run("msg_welcome", roomId, 1, "system", "OceanKing", "system", "system", "system", "completed", "房间是公开协作事实；Agent 的思考与工具过程只会出现在右侧 Console。", 1, null, at);
+      this.insertInitialRoom(at);
       this.bump();
     });
     tx();
+  }
+
+  private insertInitialRoom(at: string): void {
+    const roomId = "room_harbor";
+    const humanId = "human_local";
+    const agentParticipantId = "participant_navigator_harbor";
+    const navigator = this.raw.prepare("SELECT label FROM agents WHERE id='navigator'").get() as Row | undefined;
+    if (!navigator) throw new DomainError("初始领航员不存在，无法重置工作台");
+    this.raw.prepare("INSERT INTO rooms(id,title,owner_participant_id,next_seq,archived_at,created_at,updated_at) VALUES(?,?,?,?,NULL,?,?)").run(roomId, "港湾协作室", humanId, 2, at, at);
+    this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?)").run(humanId, roomId, "human", null, "你", 1, 0, at);
+    this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?)").run(agentParticipantId, roomId, "agent", "navigator", str(navigator.label), 1, 1, at);
+    this.raw.prepare("INSERT INTO scheduler_states(room_id,status,next_agent_participant_id,active_participant_id,round_count,cursor_json,receipt_revision_json,rerun_requested) VALUES(?,?,?,?,?,?,?,0)").run(roomId, "idle", agentParticipantId, null, 0, JSON.stringify({ [agentParticipantId]: 1 }), "{}");
+    this.raw.prepare("INSERT INTO room_messages(id,room_id,seq,sender_id,sender_name,sender_role,source,kind,status,content,final,message_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run("msg_welcome", roomId, 1, "system", "OceanKing", "system", "system", "system", "completed", "房间是公开协作事实；Agent 的思考与工具过程只会出现在右侧 Console。", 1, null, at);
+  }
+
+  private resetWorkspaceState(at: string): string[] {
+    const attachmentPaths = (this.raw.prepare("SELECT storage_path FROM attachments").all() as Row[]).map((row) => str(row.storage_path));
+    this.raw.prepare("DELETE FROM attachments").run();
+    this.raw.prepare("DELETE FROM rooms").run();
+    this.raw.prepare("UPDATE agent_sessions SET history_json='[]',active_turn_id=NULL,updated_at=?").run(at);
+    this.raw.prepare("INSERT OR IGNORE INTO agent_sessions(agent_id,history_json,active_turn_id,updated_at) SELECT id,'[]',NULL,? FROM agents").run(at);
+    this.insertInitialRoom(at);
+    return attachmentPaths;
+  }
+
+  private removeResetAttachments(storagePaths: string[]): void {
+    const uploadsRoot = path.resolve(this.dataDir, "uploads");
+    for (const storagePath of storagePaths) {
+      const target = path.resolve(this.dataDir, storagePath);
+      if (!target.startsWith(`${uploadsRoot}${path.sep}`)) continue;
+      try { fs.rmSync(target, { force: true }); } catch { /* 数据已清空；磁盘清理失败不回滚已提交的重置。 */ }
+    }
   }
 
   private bump(): { version: number; revision: number } {
@@ -108,6 +134,14 @@ export class WorkspaceRepository {
   getVersion(): { version: number; revision: number } {
     const row = this.raw.prepare("SELECT version,revision FROM workspace_meta WHERE id=1").get() as Row;
     return { version: num(row.version), revision: num(row.revision) };
+  }
+
+  hasProcessedCommand(commandId: string): boolean {
+    return Boolean(this.raw.prepare("SELECT 1 FROM command_dedup WHERE command_id=?").get(commandId));
+  }
+
+  getRoomIds(): string[] {
+    return (this.raw.prepare("SELECT id FROM rooms ORDER BY created_at").all() as Row[]).map((row) => str(row.id));
   }
 
   getSnapshot(): WorkspaceSnapshot {
@@ -204,6 +238,7 @@ export class WorkspaceRepository {
 
   executeCommand(command: WorkspaceCommand): CommandResult {
     const result: Omit<CommandResult, "snapshot"> = {};
+    let resetAttachmentPaths: string[] = [];
     const tx = this.raw.transaction(() => {
       const deduped = this.raw.prepare("SELECT 1 found FROM command_dedup WHERE command_id=?").get(command.commandId) as Row | undefined;
       if (deduped) return;
@@ -256,6 +291,7 @@ export class WorkspaceRepository {
         }
         case "delete_cron": this.raw.prepare("DELETE FROM cron_jobs WHERE id=?").run(command.jobId); result.refreshCron = true; break;
         case "run_cron": result.runCronJobId = command.jobId; break;
+        case "reset_workspace": resetAttachmentPaths = this.resetWorkspaceState(at); result.refreshCron = true; break;
         case "update_settings": {
           const currentSettings = this.defaultSettings();
           if (!command.availableModels.includes(command.model)) throw new DomainError("默认模型必须来自全局可选模型列表");
@@ -269,6 +305,7 @@ export class WorkspaceRepository {
       this.bump();
     });
     tx();
+    if (resetAttachmentPaths.length) this.removeResetAttachments(resetAttachmentPaths);
     return { ...result, snapshot: this.getSnapshot() };
   }
 

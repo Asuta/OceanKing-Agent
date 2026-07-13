@@ -60,6 +60,7 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot) {
       const body = await response.json() as { error?: string; snapshot?: WorkspaceSnapshot };
       if (!response.ok) throw new Error(body.error ?? "命令执行失败");
       if (body.snapshot) { setSnapshot(body.snapshot); versionRef.current = body.snapshot.version; }
+      if (draft.type === "reset_workspace") { setPreviews({}); setRoomPreviews({}); }
       return true;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught)); return false;

@@ -16,6 +16,62 @@ describe("OceanKing 领域仓库", () => {
     expect(snapshot.rooms[0]?.messages[0]?.source).toBe("system");
   }));
 
+  it("重置工作台会清空全部历史并只重建初始房间，同时保留 Agent 与模型思考配置", async () => withRepository(async (repository) => {
+    const initialSettings = repository.getSnapshot().settings;
+    repository.executeCommand({
+      ...commandBase(repository), type: "update_settings", model: initialSettings.model, availableModels: initialSettings.availableModels,
+      apiFormat: initialSettings.apiFormat, thinkingMode: "enabled", reasoningEffort: "max", contextTokenThreshold: initialSettings.contextTokenThreshold,
+      maxToolSteps: initialSettings.maxToolSteps, maxRoomRounds: initialSettings.maxRoomRounds, projectContextRoots: initialSettings.projectContextRoots,
+    });
+    repository.executeCommand({ ...commandBase(repository), type: "create_agent", label: "审计 Agent", summary: "确认保留注册表", instruction: "执行审计" });
+    const customAgentId = repository.getSnapshot().agents.find((agent) => agent.label === "审计 Agent")!.id;
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "待删除房间", agentId: "navigator" });
+    const extraRoom = repository.getSnapshot().rooms.find((room) => room.title === "待删除房间")!;
+    const oldMessageCommandId = crypto.randomUUID();
+    repository.executeCommand({ commandId: oldMessageCommandId, expectedVersion: repository.getVersion().version, type: "send_message", roomId: "room_harbor", content: "需要被清空的历史", attachmentIds: [] });
+    const packet = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_before_reset", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    repository.finishTurn({ turnId: "turn_before_reset", assistantContent: "旧回复", sessionMessages: [{ role: "user", content: "旧输入" }, { role: "assistant", content: "旧回复" }], tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+    repository.raw.prepare("UPDATE agent_sessions SET history_json=?").run(JSON.stringify([{ role: "user", content: "所有 Agent 的旧会话" }]));
+    repository.executeCommand({ ...commandBase(repository), type: "create_cron", roomId: extraRoom.id, agentId: "navigator", name: "待删除 Cron", schedule: "0 9 * * *", timezone: "Asia/Shanghai", prompt: "旧任务" });
+    repository.appendCronMessage(repository.getSnapshot().cronJobs[0]!.id);
+    const attachmentPath = path.join(repository.dataDir, "uploads", "reset-history.txt");
+    await fs.writeFile(attachmentPath, "旧附件");
+    repository.registerAttachment({ id: "attachment_before_reset", fileName: "reset-history.txt", mimeType: "text/plain", byteSize: 9, storagePath: path.join("uploads", "reset-history.txt") });
+    const settingsJsonBefore = (repository.raw.prepare("SELECT settings_json FROM workspace_meta WHERE id=1").get() as { settings_json: string }).settings_json;
+    const dedupCountBefore = (repository.raw.prepare("SELECT COUNT(*) count FROM command_dedup").get() as { count: number }).count;
+    const resetCommandId = crypto.randomUUID();
+
+    const result = repository.executeCommand({ commandId: resetCommandId, expectedVersion: repository.getVersion().version, type: "reset_workspace" });
+
+    expect(result.snapshot.rooms).toHaveLength(1);
+    expect(result.snapshot.rooms[0]).toMatchObject({ id: "room_harbor", title: "港湾协作室", archivedAt: null });
+    expect(result.snapshot.rooms[0]?.messages).toEqual([expect.objectContaining({ id: "msg_welcome", seq: 1, source: "system" })]);
+    expect(result.snapshot.rooms[0]?.turns).toEqual([]);
+    expect(result.snapshot.rooms[0]?.participants.map((participant) => participant.id)).toEqual(["human_local", "participant_navigator_harbor"]);
+    expect(result.snapshot.cronJobs).toEqual([]); expect(result.snapshot.cronRuns).toEqual([]);
+    expect(result.snapshot.agents.some((agent) => agent.id === customAgentId)).toBe(true);
+    expect(result.snapshot.settings).toMatchObject({ thinkingMode: "enabled", reasoningEffort: "max", model: initialSettings.model });
+    expect((repository.raw.prepare("SELECT settings_json FROM workspace_meta WHERE id=1").get() as { settings_json: string }).settings_json).toBe(settingsJsonBefore);
+    expect((repository.raw.prepare("SELECT COUNT(*) count FROM agent_sessions WHERE history_json<>'[]' OR active_turn_id IS NOT NULL").get() as { count: number }).count).toBe(0);
+    expect((repository.raw.prepare("SELECT COUNT(*) count FROM attachments").get() as { count: number }).count).toBe(0);
+    expect((repository.raw.prepare("SELECT COUNT(*) count FROM command_dedup").get() as { count: number }).count).toBe(dedupCountBefore + 1);
+    expect(repository.hasProcessedCommand(resetCommandId)).toBe(true);
+    expect(repository.hasProcessedCommand(oldMessageCommandId)).toBe(true);
+    expect(repository.getRoomIds()).toEqual(["room_harbor"]);
+    expect(repository.getAgentConversation("navigator")?.turns).toEqual([]);
+    await expect(fs.stat(attachmentPath)).rejects.toThrow();
+
+    const replayedMessage = repository.executeCommand({ commandId: oldMessageCommandId, expectedVersion: -1, type: "send_message", roomId: "room_harbor", content: "旧命令不应复活", attachmentIds: [] });
+    expect(replayedMessage.snapshot.rooms[0]?.messages).toHaveLength(1);
+
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "重置后的新房间" });
+    const versionBeforeReplay = repository.getVersion();
+    const replay = repository.executeCommand({ commandId: resetCommandId, expectedVersion: -1, type: "reset_workspace" });
+    expect(replay.snapshot.rooms.some((room) => room.title === "重置后的新房间")).toBe(true);
+    expect(repository.getVersion()).toEqual(versionBeforeReplay);
+  }));
+
   it("普通 assistant 文本只保存到 Console，不产生公开房间消息", async () => withRepository((repository) => {
     sendUser(repository, "room_harbor", "/private 只做内部分析"); const packet = packetFor(repository); const before = repository.getRoom("room_harbor")!.messages.length;
     repository.beginTurn({ turnId: "turn_private", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });

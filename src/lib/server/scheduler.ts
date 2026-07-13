@@ -36,6 +36,16 @@ class RoomScheduler {
     publishWorkspaceEvent("scheduler.changed", roomId, { status: "idle", stopped: true });
   }
 
+  async stopRoomsAndWait(roomIds: string[], timeoutMs = 15_000): Promise<void> {
+    const targets = [...new Set(roomIds)];
+    for (const roomId of targets) this.stop(roomId);
+    const deadline = Date.now() + timeoutMs;
+    while (targets.some((roomId) => this.runningRooms.has(roomId))) {
+      if (Date.now() >= deadline) throw new Error("等待活动 Agent 停止超时，工作台尚未重置");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
   private async drain(roomId: string): Promise<void> {
     let idlePasses = 0;
     try {
@@ -96,8 +106,10 @@ class RoomScheduler {
         }
       }
     } finally {
-      const rerun = this.repository.getRoom(roomId)?.scheduler.rerunRequested ?? false;
-      this.repository.setScheduler(roomId, { status: "idle", active: null, rerun: false }); this.runningRooms.delete(roomId);
+      const finalRoom = this.repository.getRoom(roomId);
+      const rerun = finalRoom?.scheduler.rerunRequested ?? false;
+      if (finalRoom) this.repository.setScheduler(roomId, { status: "idle", active: null, rerun: false });
+      this.runningRooms.delete(roomId);
       publishWorkspaceEvent("scheduler.changed", roomId, { status: "idle" });
       if (!rerun || this.stoppedRooms.has(roomId)) completeCronRunsForRoom(roomId, this.stoppedRooms.has(roomId) ? "房间已停止" : undefined);
       if (!this.stoppedRooms.has(roomId) && rerun) this.enqueue(roomId);
