@@ -202,6 +202,26 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .console-section-title small { margin-left: auto; color: var(--muted); font-size: 8px; font-weight: 500; }
 .assistant-draft { padding: 11px; border: 1px dashed var(--line-strong); border-radius: 8px; background: var(--bg-deep); color: var(--text-soft); font: 10px/1.6 ui-monospace, Consolas, monospace; }
 .assistant-draft p { margin: 0; }
+.model-call-list { display: grid; gap: 8px; }
+.model-call-card { overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); }
+.model-call-card.error { border-color: rgba(255, 107, 117, .3); }
+.model-call-card > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+.model-call-card > header div { display: flex; align-items: center; gap: 7px; }
+.model-call-card > header strong { color: var(--text-soft); font: 9px ui-monospace, Consolas, monospace; }
+.model-call-card > header span { padding: 2px 5px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); font-size: 7px; }
+.model-call-card > header small { color: var(--muted); font: 7px ui-monospace, Consolas, monospace; }
+.model-call-metrics { display: grid; grid-template-columns: repeat(3, 1fr); margin: 0; }
+.model-call-metrics > div { min-width: 0; padding: 8px 9px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.model-call-metrics > div:nth-child(3n) { border-right: 0; }
+.model-call-metrics dt { margin-bottom: 4px; color: var(--muted); font-size: 7px; }
+.model-call-metrics dd { overflow: hidden; margin: 0; color: var(--text-soft); font: 9px ui-monospace, Consolas, monospace; text-overflow: ellipsis; }
+.model-call-metrics .cache-hit dd { color: var(--success); }
+.cache-rate-bar { height: 3px; margin: 8px 10px 2px; overflow: hidden; border-radius: 999px; background: var(--line); }
+.cache-rate-bar span { display: block; height: 100%; border-radius: inherit; background: var(--success); }
+.model-call-error { margin: 8px 10px; color: var(--danger); font-size: 8px; line-height: 1.5; }
+.raw-usage { margin: 7px 10px 9px; }
+.raw-usage summary { color: var(--muted); font-size: 8px; cursor: pointer; }
+.raw-usage pre { max-height: 180px; overflow: auto; margin: 7px 0 0; padding: 8px; border-radius: 6px; background: var(--bg-deep); color: var(--text-soft); font: 8px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 .tool-list { display: grid; gap: 6px; }
 .tool-row { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .tool-row > button { width: 100%; display: grid; grid-template-columns: 17px 1fr auto auto; align-items: center; gap: 6px; padding: 8px; border: 0; background: var(--panel-soft); color: var(--text-soft); font: 9px ui-monospace, Consolas, monospace; text-align: left; cursor: pointer; }

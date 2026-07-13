@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { extractPartialJsonStringField, runAgentModel } from "@/lib/server/model-runtime";
+import { extractPartialJsonStringField, ModelRunError, runAgentModel } from "@/lib/server/model-runtime";
 import { packetFor, sendUser, withRepository } from "./helpers";
 import { normalizeOpenAiBaseUrl } from "@/lib/server/provider-config";
 import { subscribeWorkspaceEvents } from "@/lib/server/events";
@@ -66,7 +66,7 @@ describe("OpenAI 兼容协议", () => {
       return sse([
       { type: "response.created", response: { id: "resp_1" } },
       { type: "response.output_text.delta", delta: "只进入 Console" },
-      { type: "response.completed", response: { id: "resp_1", usage: { input_tokens: 4, output_tokens: 3 } } },
+      { type: "response.completed", response: { id: "resp_1", usage: { input_tokens: 10, input_tokens_details: { cached_tokens: 6 }, output_tokens: 3, total_tokens: 13 } } },
       "[DONE]",
     ]);
     }));
@@ -76,6 +76,7 @@ describe("OpenAI 兼容协议", () => {
     sendUser(repository, "room_harbor", "协议测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const, thinkingMode: "disabled" as const } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses", signal: new AbortController().signal });
     expect(result.assistantContent).toBe("只进入 Console"); expect(result.modelMeta.format).toBe("responses"); expect(result.effects).toEqual([]);
+    expect(result.modelMeta.modelCalls).toEqual([expect.objectContaining({ index: 1, format: "responses", purpose: "generation", inputTokens: 10, cachedInputTokens: 6, cacheMissInputTokens: 4, outputTokens: 3, totalTokens: 13, cacheHitRate: 0.6 })]);
     expect(sentBody?.input.some((item) => item.content === "需要跨轮保留")).toBe(true);
     expect(sentBody?.thinking).toEqual({ type: "disabled" });
   }));
@@ -91,6 +92,38 @@ describe("OpenAI 兼容协议", () => {
     sendUser(repository, "room_harbor", "兼容测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "auto" as const } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_fallback", signal: new AbortController().signal });
     expect(result.assistantContent).toBe("兼容回退成功"); expect(result.modelMeta.format).toBe("chat_completions"); expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.modelMeta.modelCalls).toEqual([
+      expect.objectContaining({ index: 1, format: "responses", status: "error" }),
+      expect.objectContaining({ index: 2, format: "chat_completions", status: "completed" }),
+    ]);
+  }));
+
+  it("模型运行失败时仍把已经发生的调用统计保存到 Turn", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    vi.stubGlobal("fetch", vi.fn(async () => sse([
+      { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_invalid", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor", limit: 1 }) } }] } }] },
+      { choices: [], usage: { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 75 }, completion_tokens: 5, total_tokens: 105 } },
+      "[DONE]",
+    ])));
+    sendUser(repository, "room_harbor", "失败调用统计"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, maxToolSteps: 0 } };
+    repository.beginTurn({ turnId: "turn_failed_model_call", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+
+    let failure: unknown;
+    try {
+      await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_failed_model_call", signal: new AbortController().signal });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(ModelRunError);
+    if (!(failure instanceof ModelRunError)) throw new Error("预期 ModelRunError");
+    repository.failTurn("turn_failed_model_call", failure.message, false, failure.modelMeta);
+
+    const turn = repository.getRoom("room_harbor")?.turns.find((candidate) => candidate.id === "turn_failed_model_call");
+    expect(turn?.status).toBe("error");
+    expect(turn?.modelMeta?.modelCalls).toEqual([
+      expect.objectContaining({ index: 1, cachedInputTokens: 75, cacheHitRate: 0.75 }),
+    ]);
   }));
 
   it("Chat Completions 会发送完整 Agent 会话，不再只取最后 12 条", async () => withRepository(async (repository) => {
@@ -135,6 +168,7 @@ describe("OpenAI 兼容协议", () => {
     expect(requestBodies[1]?.messages).toHaveLength(2);
     expect(requestBodies[1]?.messages[1]?.content).toContain("用户要求继续旧任务");
     expect(result.contextCompaction).toMatchObject({ threshold: 8_000, sourceEntries: 3 });
+    expect((result.modelMeta.modelCalls as Array<{ purpose: string }>).map((call) => call.purpose)).toEqual(["compaction", "generation"]);
     const session = repository.getAgentSession("navigator");
     expect(session).toHaveLength(2);
     expect(session[0]?.content).toContain("此前完整 Agent 会话的压缩上下文");
@@ -154,13 +188,22 @@ describe("OpenAI 兼容协议", () => {
         { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_emit", function: { name: "send_message_to_room", arguments: '{"roomId":"room_harbor","content":"正式' } }] } }] },
         { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "工具" } }] } }] },
         { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '消息","kind":"answer"}' } }] } }] },
+        { choices: [], usage: { prompt_tokens: 100, prompt_cache_hit_tokens: 80, prompt_cache_miss_tokens: 20, completion_tokens: 5, total_tokens: 105 } },
         "[DONE]",
       ]);
-      return sse([{ choices: [{ delta: { content: "工具之后的私有总结" } }] }, "[DONE]"]);
+      return sse([
+        { choices: [{ delta: { content: "工具之后的私有总结" } }] },
+        { choices: [], usage: { prompt_tokens: 120, prompt_tokens_details: { cached_tokens: 90 }, completion_tokens: 8, total_tokens: 128 } },
+        "[DONE]",
+      ]);
     }));
     sendUser(repository, "room_harbor", "工具流测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_chat_tool", signal: new AbortController().signal }); unsubscribe();
     expect(result.assistantContent).toBe("工具之后的私有总结"); expect(result.effects).toHaveLength(1); expect(result.effects[0]).toMatchObject({ type: "send_message", content: "正式工具消息" }); expect(result.tools[0]?.status).toBe("completed");
+    expect(result.modelMeta.modelCalls).toEqual([
+      expect.objectContaining({ index: 1, cachedInputTokens: 80, cacheMissInputTokens: 20, cacheHitRate: 0.8 }),
+      expect.objectContaining({ index: 2, cachedInputTokens: 90, cacheMissInputTokens: 30, cacheHitRate: 0.75 }),
+    ]);
     expectProgressivePreview(previewContents, "正式工具消息");
   }));
 

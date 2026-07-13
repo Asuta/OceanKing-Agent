@@ -378,12 +378,13 @@ export class WorkspaceRepository {
     const row = this.requireRoom(roomId); if (row.owner_participant_id !== participantId) throw new DomainError("只有房间 owner Agent 能管理成员");
   }
 
-  failTurn(turnId: string, error: string, stopped = false): void {
+  failTurn(turnId: string, error: string, stopped = false, modelMeta?: Record<string, unknown>): void {
     const at = nowIso();
     const tx = this.raw.transaction(() => {
       const row = this.raw.prepare("SELECT agent_id,room_id FROM agent_turns WHERE id=?").get(turnId) as Row | undefined;
       if (!row) return;
-      this.raw.prepare("UPDATE agent_turns SET status=?,error=?,updated_at=? WHERE id=?").run(stopped ? "stopped" : "error", error, at, turnId);
+      this.raw.prepare("UPDATE agent_turns SET status=?,error=?,model_meta_json=COALESCE(?,model_meta_json),updated_at=? WHERE id=?")
+        .run(stopped ? "stopped" : "error", error, modelMeta ? JSON.stringify(modelMeta) : null, at, turnId);
       this.raw.prepare("UPDATE agent_sessions SET active_turn_id=NULL,updated_at=? WHERE agent_id=?").run(at, row.agent_id);
       this.raw.prepare("UPDATE scheduler_states SET active_participant_id=NULL WHERE room_id=?").run(row.room_id);
       this.bump();

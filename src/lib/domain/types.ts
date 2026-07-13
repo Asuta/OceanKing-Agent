@@ -25,6 +25,24 @@ export type ContextCompaction = {
   sourceEntries: number;
 };
 
+export type ModelCallRecord = {
+  index: number;
+  purpose: "generation" | "compaction";
+  format: "responses" | "chat_completions";
+  status: "completed" | "error";
+  startedAt: string;
+  durationMs: number;
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheMissInputTokens: number | null;
+  cacheWriteInputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  cacheHitRate: number | null;
+  rawUsage: Record<string, unknown> | null;
+  error: string | null;
+};
+
 export type Agent = {
   id: Id;
   label: string;

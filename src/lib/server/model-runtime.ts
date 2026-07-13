@@ -1,4 +1,4 @@
-import type { Agent, AgentSessionMessage, ContextCompaction, SchedulerPacket, TimelineEvent, ToolExecution, TurnEffect } from "@/lib/domain/types";
+import type { Agent, AgentSessionMessage, ContextCompaction, ModelCallRecord, SchedulerPacket, TimelineEvent, ToolExecution, TurnEffect } from "@/lib/domain/types";
 import { publishWorkspaceEvent } from "@/lib/server/events";
 import { getToolDefinition, listToolDefinitions, toolDefinitionsForChat, toolDefinitionsForResponses, type ToolContext } from "@/lib/server/tools";
 import { WorkspaceRepository } from "@/lib/server/repository";
@@ -44,6 +44,18 @@ export type ModelTurnResult = {
   contextCompaction?: ContextCompaction;
 };
 
+export class ModelRunError extends Error {
+  readonly originalError: unknown;
+  readonly modelMeta: Record<string, unknown>;
+
+  constructor(error: unknown, modelMeta: Record<string, unknown>) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = "ModelRunError";
+    this.originalError = error;
+    this.modelMeta = modelMeta;
+  }
+}
+
 type PreparedContext = {
   messages: Array<Record<string, unknown>>;
   estimatedTokens: number;
@@ -51,6 +63,74 @@ type PreparedContext = {
   threshold: number;
   compaction?: ContextCompaction;
 };
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function firstFiniteNumber(...values: unknown[]): number | null {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  }
+  return null;
+}
+
+function appendModelCall(modelCalls: ModelCallRecord[], args: {
+  purpose: ModelCallRecord["purpose"];
+  format: ModelCallRecord["format"];
+  startedAt: string;
+  startedMs: number;
+  usage: unknown;
+  error?: unknown;
+}): void {
+  const rawUsage = asRecord(args.usage);
+  const inputDetails = asRecord(rawUsage?.input_tokens_details);
+  const promptDetails = asRecord(rawUsage?.prompt_tokens_details);
+  const cachedInputTokens = firstFiniteNumber(
+    inputDetails?.cached_tokens,
+    promptDetails?.cached_tokens,
+    rawUsage?.prompt_cache_hit_tokens,
+    rawUsage?.cache_read_input_tokens,
+  );
+  const reportedCacheMissTokens = firstFiniteNumber(rawUsage?.prompt_cache_miss_tokens);
+  const cacheWriteInputTokens = firstFiniteNumber(
+    inputDetails?.cache_creation_tokens,
+    promptDetails?.cache_creation_tokens,
+    rawUsage?.cache_creation_input_tokens,
+  );
+  let inputTokens = firstFiniteNumber(rawUsage?.input_tokens, rawUsage?.prompt_tokens);
+  if (inputTokens === null && cachedInputTokens !== null && reportedCacheMissTokens !== null) {
+    inputTokens = cachedInputTokens + reportedCacheMissTokens;
+  }
+  const cacheMissInputTokens = reportedCacheMissTokens ?? (
+    inputTokens !== null && cachedInputTokens !== null ? Math.max(0, inputTokens - cachedInputTokens) : null
+  );
+  const outputTokens = firstFiniteNumber(rawUsage?.output_tokens, rawUsage?.completion_tokens);
+  const totalTokens = firstFiniteNumber(rawUsage?.total_tokens) ?? (
+    inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null
+  );
+  const cacheHitRate = inputTokens !== null && inputTokens > 0 && cachedInputTokens !== null
+    ? Math.min(1, cachedInputTokens / inputTokens)
+    : null;
+  const error = args.error === undefined ? null : args.error instanceof Error ? args.error.message : String(args.error);
+  modelCalls.push({
+    index: modelCalls.length + 1,
+    purpose: args.purpose,
+    format: args.format,
+    status: error ? "error" : "completed",
+    startedAt: args.startedAt,
+    durationMs: Date.now() - args.startedMs,
+    inputTokens,
+    cachedInputTokens,
+    cacheMissInputTokens,
+    cacheWriteInputTokens,
+    outputTokens,
+    totalTokens,
+    cacheHitRate,
+    rawUsage,
+    error,
+  });
+}
 
 function systemPrompt(agent: Agent, packet: SchedulerPacket): string {
   return [
@@ -278,7 +358,7 @@ function isDeepSeekBaseUrl(baseUrl: string): boolean {
   catch { return false; }
 }
 
-async function compactWithChatCompletions(args: RunArgs, messages: Array<Record<string, unknown>>): Promise<string> {
+async function compactWithChatCompletions(args: RunArgs, messages: Array<Record<string, unknown>>, modelCalls: ModelCallRecord[]): Promise<string> {
   const { baseUrl, headers } = apiConfig();
   const body: Record<string, unknown> = {
     model: args.agent.settings.model,
@@ -288,23 +368,32 @@ async function compactWithChatCompletions(args: RunArgs, messages: Array<Record<
       { role: "user", content: "现在压缩上面的完整会话，只输出可供 Agent 继续工作的压缩上下文。" },
     ],
     stream: true,
+    stream_options: { include_usage: true },
   };
   applyChatThinkingSettings(body, args.agent, baseUrl);
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST", headers, signal: args.signal,
-    body: JSON.stringify(body),
-  });
-  let summary = "";
-  await parseSse(response, (event) => {
-    const choices = Array.isArray(event.choices) ? event.choices as Array<Record<string, unknown>> : [];
-    const delta = choices[0]?.delta as Record<string, unknown> | undefined;
-    if (typeof delta?.content === "string") summary += delta.content;
-  });
-  if (!summary.trim()) throw new Error("上下文压缩失败：模型没有返回压缩内容");
-  return summary.trim();
+  const startedAt = nowIso(); const startedMs = Date.now(); let usage: unknown = null;
+  try {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST", headers, signal: args.signal,
+      body: JSON.stringify(body),
+    });
+    let summary = "";
+    await parseSse(response, (event) => {
+      if (event.usage) usage = event.usage;
+      const choices = Array.isArray(event.choices) ? event.choices as Array<Record<string, unknown>> : [];
+      const delta = choices[0]?.delta as Record<string, unknown> | undefined;
+      if (typeof delta?.content === "string") summary += delta.content;
+    });
+    if (!summary.trim()) throw new Error("上下文压缩失败：模型没有返回压缩内容");
+    appendModelCall(modelCalls, { purpose: "compaction", format: "chat_completions", startedAt, startedMs, usage });
+    return summary.trim();
+  } catch (error) {
+    appendModelCall(modelCalls, { purpose: "compaction", format: "chat_completions", startedAt, startedMs, usage, error });
+    throw error;
+  }
 }
 
-async function compactWithResponses(args: RunArgs, messages: Array<Record<string, unknown>>): Promise<string> {
+async function compactWithResponses(args: RunArgs, messages: Array<Record<string, unknown>>, modelCalls: ModelCallRecord[]): Promise<string> {
   const { baseUrl, headers } = apiConfig();
   const body: Record<string, unknown> = {
     model: args.agent.settings.model,
@@ -313,22 +402,31 @@ async function compactWithResponses(args: RunArgs, messages: Array<Record<string
     stream: true,
   };
   applyResponsesThinkingSettings(body, args.agent, baseUrl);
-  const response = await fetch(`${baseUrl}/responses`, {
-    method: "POST", headers, signal: args.signal,
-    body: JSON.stringify(body),
-  });
-  if (!response.ok && [400, 404, 405].includes(response.status)) {
-    throw new ResponsesUnsupportedError(`Responses API 不可用 (${response.status}): ${(await response.text()).slice(0, 1_000)}`);
+  const startedAt = nowIso(); const startedMs = Date.now(); let usage: unknown = null;
+  try {
+    const response = await fetch(`${baseUrl}/responses`, {
+      method: "POST", headers, signal: args.signal,
+      body: JSON.stringify(body),
+    });
+    if (!response.ok && [400, 404, 405].includes(response.status)) {
+      throw new ResponsesUnsupportedError(`Responses API 不可用 (${response.status}): ${(await response.text()).slice(0, 1_000)}`);
+    }
+    let summary = "";
+    await parseSse(response, (event) => {
+      const responseObject = event.response as Record<string, unknown> | undefined;
+      if (responseObject?.usage) usage = responseObject.usage;
+      if (event.type === "response.output_text.delta" && typeof event.delta === "string") summary += event.delta;
+    });
+    if (!summary.trim()) throw new Error("上下文压缩失败：模型没有返回压缩内容");
+    appendModelCall(modelCalls, { purpose: "compaction", format: "responses", startedAt, startedMs, usage });
+    return summary.trim();
+  } catch (error) {
+    appendModelCall(modelCalls, { purpose: "compaction", format: "responses", startedAt, startedMs, usage, error });
+    throw error;
   }
-  let summary = "";
-  await parseSse(response, (event) => {
-    if (event.type === "response.output_text.delta" && typeof event.delta === "string") summary += event.delta;
-  });
-  if (!summary.trim()) throw new Error("上下文压缩失败：模型没有返回压缩内容");
-  return summary.trim();
 }
 
-async function prepareContext(args: RunArgs, format: "responses" | "chat_completions", messages: Array<Record<string, unknown>>): Promise<PreparedContext> {
+async function prepareContext(args: RunArgs, format: "responses" | "chat_completions", messages: Array<Record<string, unknown>>, modelCalls: ModelCallRecord[]): Promise<PreparedContext> {
   const tools = format === "responses" ? toolDefinitionsForResponses() : toolDefinitionsForChat();
   const instructions = systemPrompt(args.agent, args.packet);
   const estimatedTokens = countRenderedContextTokens({ instructions, messages, tools });
@@ -336,8 +434,8 @@ async function prepareContext(args: RunArgs, format: "responses" | "chat_complet
   if (estimatedTokens <= threshold) return { messages, estimatedTokens, compactedTokens: null, threshold };
 
   const summary = format === "responses"
-    ? await compactWithResponses(args, messages)
-    : await compactWithChatCompletions(args, messages.map((message) => ({ ...message })));
+    ? await compactWithResponses(args, messages, modelCalls)
+    : await compactWithChatCompletions(args, messages.map((message) => ({ ...message })), modelCalls);
   const compactedMessages: Array<Record<string, unknown>> = [{ role: "user", content: compactedSessionContent(summary) }];
   const compactedTokens = countRenderedContextTokens({ instructions, messages: compactedMessages, tools });
   if (compactedTokens > threshold) {
@@ -362,12 +460,12 @@ function contextMeta(prepared: PreparedContext): Record<string, unknown> {
   };
 }
 
-async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
+async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]): Promise<ModelTurnResult> {
   const { baseUrl, headers } = apiConfig();
   const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = [];
   const session = args.repository.getAgentSession(args.agent.id);
   const userMessage: AgentSessionMessage = { role: "user", content: packetText(args.packet) };
-  const prepared = await prepareContext(args, "chat_completions", [...session, userMessage].map((message) => ({ ...message })));
+  const prepared = await prepareContext(args, "chat_completions", [...session, userMessage].map((message) => ({ ...message })), modelCalls);
   const addTimeline = createTimelineFactory(args.turnId, timeline); addTimeline("turn_started", { format: "chat_completions", context: contextMeta(prepared) });
   let sessionMessages: AgentSessionMessage[] = prepared.compaction
     ? [{ role: "user", content: compactedSessionContent(prepared.compaction.summary) }]
@@ -389,7 +487,7 @@ async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
     const requestTokens = countRenderedContextTokens({ instructions: "", messages, tools: requestTools });
     if (requestTokens > prepared.threshold) {
       const sourceEntries = messages.length - 1;
-      const summary = await compactWithChatCompletions(args, messages.slice(1));
+      const summary = await compactWithChatCompletions(args, messages.slice(1), modelCalls);
       messages.splice(0, messages.length,
         { role: "system", content: systemPrompt(args.agent, args.packet) },
         { role: "user", content: compactedSessionContent(summary) },
@@ -404,22 +502,30 @@ async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
     const body: Record<string, unknown> = { model: args.agent.settings.model, messages, stream: true, stream_options: { include_usage: true } };
     if (requestTools.length) { body.tools = requestTools; body.tool_choice = "auto"; }
     applyChatThinkingSettings(body, args.agent, baseUrl);
-    const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
+    const startedAt = nowIso(); const startedMs = Date.now(); let stepUsage: unknown = null;
     const roomMessagePreviewStream = createRoomMessagePreviewStream(args);
     let content = ""; let reasoningContent = ""; let sawReasoningContent = false; const callMap = new Map<number, ToolCall>();
-    await parseSse(response, (event) => {
-      if (event.usage) usage = event.usage;
-      const choices = Array.isArray(event.choices) ? event.choices as Array<Record<string, unknown>> : [];
-      const delta = choices[0]?.delta as Record<string, unknown> | undefined;
-      if (typeof delta?.reasoning_content === "string") { sawReasoningContent = true; reasoningContent += delta.reasoning_content; reasoningCharacters += delta.reasoning_content.length; }
-      if (typeof delta?.content === "string") { content += delta.content; assistantContent += delta.content; addTimeline("assistant_delta", { delta: delta.content }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: delta.content }, args.repository.getVersion().revision); }
-      const chunks = Array.isArray(delta?.tool_calls) ? delta.tool_calls as Array<Record<string, unknown>> : [];
-      for (const chunk of chunks) {
-        const index = Number(chunk.index ?? 0); const current = callMap.get(index) ?? { id: "", name: "", arguments: "" }; const fn = chunk.function as Record<string, unknown> | undefined;
-        const next = { id: current.id || String(chunk.id ?? ""), name: current.name + String(fn?.name ?? ""), arguments: current.arguments + String(fn?.arguments ?? "") };
-        callMap.set(index, next); roomMessagePreviewStream.update(next, String(index));
-      }
-    });
+    try {
+      const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
+      await parseSse(response, (event) => {
+        if (event.usage) stepUsage = event.usage;
+        const choices = Array.isArray(event.choices) ? event.choices as Array<Record<string, unknown>> : [];
+        const delta = choices[0]?.delta as Record<string, unknown> | undefined;
+        if (typeof delta?.reasoning_content === "string") { sawReasoningContent = true; reasoningContent += delta.reasoning_content; reasoningCharacters += delta.reasoning_content.length; }
+        if (typeof delta?.content === "string") { content += delta.content; assistantContent += delta.content; addTimeline("assistant_delta", { delta: delta.content }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: delta.content }, args.repository.getVersion().revision); }
+        const chunks = Array.isArray(delta?.tool_calls) ? delta.tool_calls as Array<Record<string, unknown>> : [];
+        for (const chunk of chunks) {
+          const index = Number(chunk.index ?? 0); const current = callMap.get(index) ?? { id: "", name: "", arguments: "" }; const fn = chunk.function as Record<string, unknown> | undefined;
+          const next = { id: current.id || String(chunk.id ?? ""), name: current.name + String(fn?.name ?? ""), arguments: current.arguments + String(fn?.arguments ?? "") };
+          callMap.set(index, next); roomMessagePreviewStream.update(next, String(index));
+        }
+      });
+      usage = stepUsage;
+      appendModelCall(modelCalls, { purpose: "generation", format: "chat_completions", startedAt, startedMs, usage: stepUsage });
+    } catch (error) {
+      appendModelCall(modelCalls, { purpose: "generation", format: "chat_completions", startedAt, startedMs, usage: stepUsage, error });
+      throw error;
+    }
     const calls = [...callMap.values()];
     await roomMessagePreviewStream.flush();
     if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
@@ -441,16 +547,16 @@ async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
     }
   }
   addTimeline("turn_finished", { usage });
-  return { assistantContent, sessionMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "chat_completions", model: args.agent.settings.model, usage, toolSteps, reasoningCharacters, context: contextMeta(prepared) } };
+  return { assistantContent, sessionMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "chat_completions", model: args.agent.settings.model, usage, modelCalls, toolSteps, reasoningCharacters, context: contextMeta(prepared) } };
 }
 
-async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
+async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promise<ModelTurnResult> {
   const { baseUrl, headers } = apiConfig();
   const tools: ToolExecution[] = []; const timeline: TimelineEvent[] = []; const effects: TurnEffect[] = [];
   const session = args.repository.getAgentSession(args.agent.id);
   const userMessage: AgentSessionMessage = { role: "user", content: packetText(args.packet) };
   const initialContext = [...session, userMessage].map(responseContextMessage);
-  const prepared = await prepareContext(args, "responses", initialContext);
+  const prepared = await prepareContext(args, "responses", initialContext, modelCalls);
   const addTimeline = createTimelineFactory(args.turnId, timeline); addTimeline("turn_started", { format: "responses", context: contextMeta(prepared) });
   const responseToolDefinitions = toolDefinitionsForResponses();
   let assistantContent = ""; let previousResponseId: string | undefined; let input: unknown = prepared.messages; let usage: unknown = null;
@@ -469,7 +575,7 @@ async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
     const requestTokens = countRenderedContextTokens({ instructions: systemPrompt(args.agent, args.packet), messages: continuationMessages, tools: responseToolDefinitions });
     if (requestTokens > prepared.threshold) {
       const sourceEntries = continuationMessages.length;
-      const summary = await compactWithResponses(args, continuationMessages);
+      const summary = await compactWithResponses(args, continuationMessages, modelCalls);
       continuationMessages = [{ role: "user", content: compactedSessionContent(summary) }];
       const compactedTokens = countRenderedContextTokens({ instructions: systemPrompt(args.agent, args.packet), messages: continuationMessages, tools: responseToolDefinitions });
       if (compactedTokens > prepared.threshold) throw new Error(`上下文压缩后仍有 ${compactedTokens} tokens，超过阈值 ${prepared.threshold}`);
@@ -484,37 +590,45 @@ async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
     if (requestTools.length) { body.tools = requestTools; body.tool_choice = "auto"; }
     if (!previousResponseId) body.instructions = systemPrompt(args.agent, args.packet); else body.previous_response_id = previousResponseId;
     applyResponsesThinkingSettings(body, args.agent, baseUrl);
-    const response = await fetch(`${baseUrl}/responses`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
-    if (!response.ok && step === 0 && [400, 404, 405].includes(response.status)) {
-      throw new ResponsesUnsupportedError(`Responses API 不可用 (${response.status}): ${(await response.text()).slice(0, 1_000)}`);
-    }
+    const startedAt = nowIso(); const startedMs = Date.now(); let stepUsage: unknown = null;
     const callMap = new Map<string, ToolCall>(); const roomMessagePreviewStream = createRoomMessagePreviewStream(args); let stepContent = "";
-    await parseSse(response, (event) => {
-      const type = String(event.type ?? ""); const responseObject = event.response as Record<string, unknown> | undefined;
-      if (typeof responseObject?.id === "string") previousResponseId = responseObject.id;
-      if (responseObject?.usage) usage = responseObject.usage;
-      if (type === "response.output_text.delta" && typeof event.delta === "string") { stepContent += event.delta; assistantContent += event.delta; addTimeline("assistant_delta", { delta: event.delta }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: event.delta }, args.repository.getVersion().revision); }
-      if (type === "response.output_item.added") {
-        const item = event.item as Record<string, unknown> | undefined;
-        if (item?.type === "function_call") {
-          const key = String(item.id ?? item.call_id ?? createId("call")); const call = { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") };
+    try {
+      const response = await fetch(`${baseUrl}/responses`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
+      if (!response.ok && step === 0 && [400, 404, 405].includes(response.status)) {
+        throw new ResponsesUnsupportedError(`Responses API 不可用 (${response.status}): ${(await response.text()).slice(0, 1_000)}`);
+      }
+      await parseSse(response, (event) => {
+        const type = String(event.type ?? ""); const responseObject = event.response as Record<string, unknown> | undefined;
+        if (typeof responseObject?.id === "string") previousResponseId = responseObject.id;
+        if (responseObject?.usage) stepUsage = responseObject.usage;
+        if (type === "response.output_text.delta" && typeof event.delta === "string") { stepContent += event.delta; assistantContent += event.delta; addTimeline("assistant_delta", { delta: event.delta }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: event.delta }, args.repository.getVersion().revision); }
+        if (type === "response.output_item.added") {
+          const item = event.item as Record<string, unknown> | undefined;
+          if (item?.type === "function_call") {
+            const key = String(item.id ?? item.call_id ?? createId("call")); const call = { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") };
+            callMap.set(key, call); roomMessagePreviewStream.update(call, key);
+          }
+        }
+        if (type === "response.function_call_arguments.delta") {
+          const key = String(event.item_id ?? event.call_id ?? ""); const current = callMap.get(key) ?? { id: String(event.call_id ?? key), name: String(event.name ?? ""), arguments: "" };
+          const call = { ...current, arguments: current.arguments + String(event.delta ?? "") };
           callMap.set(key, call); roomMessagePreviewStream.update(call, key);
         }
-      }
-      if (type === "response.function_call_arguments.delta") {
-        const key = String(event.item_id ?? event.call_id ?? ""); const current = callMap.get(key) ?? { id: String(event.call_id ?? key), name: String(event.name ?? ""), arguments: "" };
-        const call = { ...current, arguments: current.arguments + String(event.delta ?? "") };
-        callMap.set(key, call); roomMessagePreviewStream.update(call, key);
-      }
-      if (type === "response.output_item.done") {
-        const item = event.item as Record<string, unknown> | undefined;
-        if (item?.type === "function_call") {
-          const call = { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") };
-          const key = String(item.id ?? item.call_id ?? "");
-          callMap.set(key, call); roomMessagePreviewStream.update(call, key);
+        if (type === "response.output_item.done") {
+          const item = event.item as Record<string, unknown> | undefined;
+          if (item?.type === "function_call") {
+            const call = { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") };
+            const key = String(item.id ?? item.call_id ?? "");
+            callMap.set(key, call); roomMessagePreviewStream.update(call, key);
+          }
         }
-      }
-    });
+      });
+      usage = stepUsage;
+      appendModelCall(modelCalls, { purpose: "generation", format: "responses", startedAt, startedMs, usage: stepUsage });
+    } catch (error) {
+      appendModelCall(modelCalls, { purpose: "generation", format: "responses", startedAt, startedMs, usage: stepUsage, error });
+      throw error;
+    }
     const calls = [...callMap.values()];
     await roomMessagePreviewStream.flush();
     if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
@@ -534,7 +648,7 @@ async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
     input = outputs.map((output) => ({ type: "function_call_output", call_id: output.callId, output: output.text }));
   }
   addTimeline("turn_finished", { usage, responseId: previousResponseId });
-  return { assistantContent, sessionMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "responses", model: args.agent.settings.model, responseId: previousResponseId, usage, context: contextMeta(prepared) } };
+  return { assistantContent, sessionMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "responses", model: args.agent.settings.model, responseId: previousResponseId, usage, modelCalls, context: contextMeta(prepared) } };
 }
 
 async function runMock(args: RunArgs): Promise<ModelTurnResult> {
@@ -558,12 +672,23 @@ async function runMock(args: RunArgs): Promise<ModelTurnResult> {
 
 export async function runAgentModel(args: RunArgs): Promise<ModelTurnResult> {
   if (!process.env.OPENAI_API_KEY) return runMock(args);
+  const modelCalls: ModelCallRecord[] = [];
   const format = args.agent.settings.apiFormat;
-  if (format === "chat_completions") return runChatCompletions(args);
-  if (format === "responses") return runResponses(args);
-  try { return await runResponses(args); } catch (error) {
-    if (args.signal.aborted || !(error instanceof ResponsesUnsupportedError)) throw error;
-    publishWorkspaceEvent("turn.preview", args.turnId, { kind: "compatibility_fallback", error: error instanceof Error ? error.message : String(error) }, args.repository.getVersion().revision);
-    return runChatCompletions(args);
+  try {
+    if (format === "chat_completions") return await runChatCompletions(args, modelCalls);
+    if (format === "responses") return await runResponses(args, modelCalls);
+    try { return await runResponses(args, modelCalls); } catch (error) {
+      if (args.signal.aborted || !(error instanceof ResponsesUnsupportedError)) throw error;
+      publishWorkspaceEvent("turn.preview", args.turnId, { kind: "compatibility_fallback", error: error instanceof Error ? error.message : String(error) }, args.repository.getVersion().revision);
+      return await runChatCompletions(args, modelCalls);
+    }
+  } catch (error) {
+    const lastCall = modelCalls.at(-1);
+    throw new ModelRunError(error, {
+      format: lastCall?.format ?? (format === "auto" ? "responses" : format),
+      model: args.agent.settings.model,
+      usage: lastCall?.rawUsage ?? null,
+      modelCalls,
+    });
   }
 }

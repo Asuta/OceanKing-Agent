@@ -2,7 +2,7 @@ import type { Participant, Room, SchedulerPacket } from "@/lib/domain/types";
 import { getAgentExecutor } from "@/lib/server/agent-executor";
 import { completeCronRunsForRoom } from "@/lib/server/cron-run-tracker";
 import { publishWorkspaceEvent } from "@/lib/server/events";
-import { runAgentModel } from "@/lib/server/model-runtime";
+import { ModelRunError, runAgentModel } from "@/lib/server/model-runtime";
 import { getRepository, WorkspaceRepository } from "@/lib/server/repository";
 import { createId } from "@/lib/utils/id";
 
@@ -80,8 +80,14 @@ class RoomScheduler {
           const applied = this.repository.finishTurn({ turnId, assistantContent: result.assistantContent, sessionMessages: result.sessionMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq, nextParticipantId: next?.id ?? null });
           publishWorkspaceEvent("workspace.changed", turnId, { status: applied.superseded ? "continued" : "completed", emittedMessageIds: applied.emittedMessageIds });
         } catch (error) {
-          const stopped = error instanceof DOMException && error.name === "AbortError";
-          this.repository.failTurn(turnId, error instanceof Error ? error.message : String(error), stopped);
+          const originalError = error instanceof ModelRunError ? error.originalError : error;
+          const stopped = originalError instanceof DOMException && originalError.name === "AbortError";
+          this.repository.failTurn(
+            turnId,
+            originalError instanceof Error ? originalError.message : String(originalError),
+            stopped,
+            error instanceof ModelRunError ? error.modelMeta : undefined,
+          );
           publishWorkspaceEvent("workspace.changed", turnId, { status: stopped ? "stopped" : "error" });
           if (stopped) break;
         }
