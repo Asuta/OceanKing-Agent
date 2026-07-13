@@ -140,6 +140,7 @@ function systemPrompt(agent: Agent, packet: SchedulerPacket): string {
     "重要契约：普通 assistant 文本是私有执行记录，人类在房间里看不到。需要公开表达时必须调用 send_message_to_room。",
     "不要为了看起来有回复而伪造消息；无需回复时调用 read_no_reply。发言时必须精确指定 roomId。",
     "房间不是默认隐私边界，但只能读取和发送到当前 Agent 已连接的房间。房间管理权限由工具执行层校验。",
+    "创建房间时，create_room 会让你自动成为 owner 并连接；如需拉人，直接在同一次调用的 agentIds 中列出所有目标 Agent，不要要求人类手动操作。",
     `当前 Agent：${agent.label}（${agent.id}）`,
     `Agent 指令：${agent.instruction}`,
     `当前房间：${packet.room.title}（${packet.room.id}）`,

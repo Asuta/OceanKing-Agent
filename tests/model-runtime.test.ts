@@ -41,6 +41,61 @@ describe("Agent runtime 与 canonical tools", () => {
     for (const name of ["send_message_to_room", "read_no_reply", "read_room_history", "workspace_read", "workspace_write", "shell", "web_fetch", "create_cron_job"]) expect(names.has(name)).toBe(true);
   });
 
+  it("创建房间时当前 Agent 自动连接并原子邀请多个 Agent", async () => withRepository(async (repository) => {
+    sendUser(repository, "room_harbor", "创建自由讨论房间并邀请执行者");
+    const packet = packetFor(repository);
+    const agent = repository.getAgent("navigator")!;
+    const context = { agent, roomId: "room_harbor", agentParticipantId: "participant_navigator_harbor", packet, repository, signal: new AbortController().signal };
+    const result = await getToolDefinition("create_room")!.execute(context, { title: "自由讨论", agentIds: ["navigator", "builder", "builder"] }, "tool_create_room");
+    const effect = result.effects[0];
+    expect(effect).toMatchObject({ type: "create_room", title: "自由讨论", invitedAgentIds: ["builder"] });
+    if (!effect || effect.type !== "create_room") throw new Error("create_room 未返回预期 effect");
+
+    repository.beginTurn({ turnId: "turn_create_room", roomId: "room_harbor", agentId: agent.id, agentParticipantId: context.agentParticipantId, packet });
+    repository.finishTurn({ turnId: "turn_create_room", assistantContent: "internal", tools: [], timeline: [], effects: result.effects, modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+
+    const room = repository.getRoom(effect.roomId)!;
+    expect(room.participants.filter((participant) => participant.agentId).map((participant) => participant.agentId)).toEqual(["navigator", "builder"]);
+    expect(room.participants.find((participant) => participant.id === room.ownerParticipantId)?.agentId).toBe("navigator");
+  }));
+
+  it("创建房间会在产生 effect 前拒绝不存在的受邀 Agent", async () => withRepository(async (repository) => {
+    const packet = packetFor(repository);
+    const agent = repository.getAgent("navigator")!;
+    const context = { agent, roomId: "room_harbor", agentParticipantId: "participant_navigator_harbor", packet, repository, signal: new AbortController().signal };
+    await expect(getToolDefinition("create_room")!.execute(context, { title: "无效邀请", agentIds: ["missing-agent"] }, "tool_invalid_invite"))
+      .rejects.toThrow("Agent 不存在：missing-agent");
+    expect(repository.getSnapshot().rooms.some((room) => room.title === "无效邀请")).toBe(false);
+  }));
+
+  it("owner Agent 可从其他房间上下文继续邀请成员", async () => withRepository(async (repository) => {
+    sendUser(repository, "room_harbor", "先创建房间");
+    const packet = packetFor(repository);
+    const agent = repository.getAgent("navigator")!;
+    const context = { agent, roomId: "room_harbor", agentParticipantId: "participant_navigator_harbor", packet, repository, signal: new AbortController().signal };
+    const created = await getToolDefinition("create_room")!.execute(context, { title: "跨房间管理", agentIds: [] }, "tool_create_owned_room");
+    const createEffect = created.effects[0];
+    if (!createEffect || createEffect.type !== "create_room") throw new Error("create_room 未返回预期 effect");
+    repository.beginTurn({ turnId: "turn_create_owned_room", roomId: "room_harbor", agentId: agent.id, agentParticipantId: context.agentParticipantId, packet });
+    repository.finishTurn({ turnId: "turn_create_owned_room", assistantContent: "internal", tools: [], timeline: [], effects: created.effects, modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+
+    const invited = await getToolDefinition("invite_agent")!.execute(context, { roomId: createEffect.roomId, agentId: "builder" }, "tool_invite_cross_room");
+    sendUser(repository, "room_harbor", "继续邀请");
+    const nextPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_invite_cross_room", roomId: "room_harbor", agentId: agent.id, agentParticipantId: context.agentParticipantId, packet: nextPacket });
+    const applied = repository.finishTurn({ turnId: "turn_invite_cross_room", assistantContent: "internal", tools: [], timeline: [], effects: invited.effects, modelMeta: {}, cutoffSeq: nextPacket.cutoffSeq, nextParticipantId: null });
+    expect(applied.triggerRoomIds).toEqual([createEffect.roomId]);
+    expect(repository.getRoom(createEffect.roomId)!.participants.some((participant) => participant.agentId === "builder")).toBe(true);
+
+    const duplicate = await getToolDefinition("invite_agent")!.execute(context, { roomId: createEffect.roomId, agentId: "builder" }, "tool_invite_cross_room_duplicate");
+    sendUser(repository, "room_harbor", "重复邀请");
+    const duplicatePacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_invite_cross_room_duplicate", roomId: "room_harbor", agentId: agent.id, agentParticipantId: context.agentParticipantId, packet: duplicatePacket });
+    const duplicateApplied = repository.finishTurn({ turnId: "turn_invite_cross_room_duplicate", assistantContent: "internal", tools: [], timeline: [], effects: duplicate.effects, modelMeta: {}, cutoffSeq: duplicatePacket.cutoffSeq, nextParticipantId: null });
+    expect(duplicateApplied.triggerRoomIds).toEqual([]);
+    expect(repository.getRoom(createEffect.roomId)!.participants.filter((participant) => participant.agentId === "builder")).toHaveLength(1);
+  }));
+
   it("shell 收到 abort 时终止活动进程树", async () => withRepository(async (repository) => {
     if (process.platform !== "win32") return;
     sendUser(repository, "room_harbor", "测试停止"); const packet = packetFor(repository); const agent = repository.getAgent("navigator")!; const controller = new AbortController();

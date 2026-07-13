@@ -141,6 +141,31 @@ describe("OceanKing 领域仓库", () => {
     expect(repository.getRoom("room_harbor")!.messages.some((message) => message.id === "msg_to_b")).toBe(false);
   }));
 
+  it("跨房间 Agent 新消息返回目标房间且幂等重放不会重复触发", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "创建讨论房间");
+    const createPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_create_trigger_room", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: createPacket });
+    repository.finishTurn({
+      turnId: "turn_create_trigger_room", assistantContent: "internal", tools: [], timeline: [],
+      effects: [{ type: "create_room", roomId: "room_agent_started", title: "AI 发起的讨论", invitedAgentIds: ["builder"] }],
+      modelMeta: {}, cutoffSeq: createPacket.cutoffSeq, nextParticipantId: null,
+    });
+
+    sendUser(repository, "room_harbor", "向新房间发起讨论");
+    const emitPacket = packetFor(repository);
+    const effect: TurnEffect = { type: "send_message", roomId: "room_agent_started", messageId: "msg_agent_started", messageKey: "agent-started", content: "由 AI 发起的第一句话", kind: "answer" };
+    repository.beginTurn({ turnId: "turn_emit_trigger_room", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: emitPacket });
+    const first = repository.finishTurn({ turnId: "turn_emit_trigger_room", assistantContent: "internal", tools: [], timeline: [], effects: [effect], modelMeta: {}, cutoffSeq: emitPacket.cutoffSeq, nextParticipantId: null });
+    expect(first.triggerRoomIds).toEqual(["room_agent_started"]);
+
+    sendUser(repository, "room_harbor", "重放同一工具调用");
+    const replayPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_replay_trigger_room", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: replayPacket });
+    const replay = repository.finishTurn({ turnId: "turn_replay_trigger_room", assistantContent: "internal", tools: [], timeline: [], effects: [effect], modelMeta: {}, cutoffSeq: replayPacket.cutoffSeq, nextParticipantId: null });
+    expect(replay.triggerRoomIds).toEqual([]);
+    expect(repository.getRoom("room_agent_started")!.messages.filter((message) => message.messageKey === "agent-started")).toHaveLength(1);
+  }));
+
   it("无需回复通过 receipt 表达而不创建空气泡", async () => withRepository((repository) => {
     sendUser(repository, "room_harbor", "已阅即可，无需回复"); const packet = packetFor(repository); const before = repository.getRoom("room_harbor")!.messages.length;
     repository.beginTurn({ turnId: "turn_receipt", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });

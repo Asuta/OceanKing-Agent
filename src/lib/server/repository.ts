@@ -217,7 +217,7 @@ export class WorkspaceRepository {
           this.raw.prepare("INSERT INTO rooms(id,title,owner_participant_id,next_seq,archived_at,created_at,updated_at) VALUES(?,?,?,?,NULL,?,?)").run(roomId, command.title, humanId, 1, at, at);
           this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,1,0,?)").run(humanId, roomId, "human", null, "你", at);
           let nextParticipant: string | null = null;
-          if (command.agentId) nextParticipant = this.insertAgentParticipant(roomId, command.agentId, at);
+          if (command.agentId) nextParticipant = this.insertAgentParticipant(roomId, command.agentId, at).participantId;
           this.raw.prepare("INSERT INTO scheduler_states(room_id,status,next_agent_participant_id,active_participant_id,round_count,cursor_json,receipt_revision_json,rerun_requested) VALUES(?,?,?,?,0,?,?,0)").run(roomId, "idle", nextParticipant, null, "{}", "{}");
           break;
         }
@@ -277,16 +277,16 @@ export class WorkspaceRepository {
     if (!row) throw new DomainError("房间不存在"); return row;
   }
 
-  private insertAgentParticipant(roomId: string, agentId: string, at: string, participantId = createId("participant")): string {
+  private insertAgentParticipant(roomId: string, agentId: string, at: string, participantId = createId("participant")): { participantId: string; inserted: boolean } {
     const agent = this.raw.prepare("SELECT label FROM agents WHERE id=?").get(agentId) as Row | undefined;
     if (!agent) throw new DomainError("Agent 不存在");
     const existing = this.raw.prepare("SELECT id FROM participants WHERE room_id=? AND agent_id=?").get(roomId, agentId) as Row | undefined;
-    if (existing) return str(existing.id);
+    if (existing) return { participantId: str(existing.id), inserted: false };
     const order = num((this.raw.prepare("SELECT COALESCE(MAX(sort_order),0)+1 next_order FROM participants WHERE room_id=?").get(roomId) as Row).next_order);
     this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,1,?,?)").run(participantId, roomId, "agent", agentId, str(agent.label), order, at);
     const scheduler = this.raw.prepare("SELECT next_agent_participant_id FROM scheduler_states WHERE room_id=?").get(roomId) as Row | undefined;
     if (scheduler && !scheduler.next_agent_participant_id) this.raw.prepare("UPDATE scheduler_states SET next_agent_participant_id=? WHERE room_id=?").run(participantId, roomId);
-    return participantId;
+    return { participantId, inserted: true };
   }
 
   private takeNextSeq(roomId: string, at: string): number {
@@ -337,15 +337,16 @@ export class WorkspaceRepository {
     tx();
   }
 
-  finishTurn(args: { turnId: string; assistantContent: string; systemPrompt?: string; sessionMessages?: AgentSessionMessage[]; auditMessages?: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; contextCompaction?: ContextCompaction; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; superseded: boolean } {
+  finishTurn(args: { turnId: string; assistantContent: string; systemPrompt?: string; sessionMessages?: AgentSessionMessage[]; auditMessages?: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; contextCompaction?: ContextCompaction; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; triggerRoomIds: string[]; superseded: boolean } {
     const emittedMessageIds: string[] = [];
+    const triggerRoomIds = new Set<string>();
     let superseded = false;
     const tx = this.raw.transaction(() => {
       const turn = this.raw.prepare("SELECT * FROM agent_turns WHERE id=?").get(args.turnId) as Row;
       if (!turn) throw new DomainError("Agent turn 不存在");
       const roomId = str(turn.room_id); const agentId = str(turn.agent_id); const participantId = str(turn.agent_participant_id); const at = nowIso();
       this.persistTurnTrace(args.turnId, args.tools, args.timeline);
-      for (const effect of args.effects) this.applyEffect(effect, agentId, participantId, emittedMessageIds, at);
+      for (const effect of args.effects) this.applyEffect(effect, agentId, participantId, emittedMessageIds, triggerRoomIds, at);
       const newer = this.raw.prepare("SELECT 1 found FROM room_messages WHERE room_id=? AND seq>? AND sender_id<>? LIMIT 1").get(roomId, args.cutoffSeq, participantId) as Row | undefined;
       superseded = Boolean(newer);
       const status = superseded ? "continued" : (args.status ?? "completed");
@@ -365,7 +366,7 @@ export class WorkspaceRepository {
         .run(JSON.stringify(cursors), args.nextParticipantId, num(scheduler.round_count) + 1, superseded ? 1 : 0, roomId);
       this.bump();
     }); tx();
-    return { emittedMessageIds, superseded };
+    return { emittedMessageIds, triggerRoomIds: [...triggerRoomIds], superseded };
   }
 
   private persistTurnTrace(turnId: string, tools: ToolExecution[], timeline: TimelineEvent[]): void {
@@ -375,7 +376,7 @@ export class WorkspaceRepository {
       .run(event.id, turnId, event.ordinal, event.type, JSON.stringify(event.payload), event.createdAt);
   }
 
-  private applyEffect(effect: TurnEffect, agentId: string, participantId: string, emitted: string[], at: string): void {
+  private applyEffect(effect: TurnEffect, agentId: string, participantId: string, emitted: string[], triggerRooms: Set<string>, at: string): void {
     if (effect.type === "send_message") {
       const membership = this.raw.prepare("SELECT id,display_name FROM participants WHERE room_id=? AND agent_id=? AND enabled=1").get(effect.roomId, agentId) as Row | undefined;
       if (!membership) throw new DomainError("Agent 不能向未连接房间发言");
@@ -384,7 +385,7 @@ export class WorkspaceRepository {
       const seq = this.takeNextSeq(effect.roomId, at);
       this.raw.prepare("INSERT INTO room_messages(id,room_id,seq,sender_id,sender_name,sender_role,source,kind,status,content,final,message_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .run(effect.messageId, effect.roomId, seq, str(membership.id), str(membership.display_name), "participant", "agent_emit", effect.kind, "completed", effect.content, 1, effect.messageKey, at);
-      emitted.push(effect.messageId); return;
+      emitted.push(effect.messageId); triggerRooms.add(effect.roomId); return;
     }
     if (effect.type === "read_no_reply") {
       const message = this.raw.prepare("SELECT id FROM room_messages WHERE id=? AND room_id=?").get(effect.messageId, effect.roomId) as Row | undefined;
@@ -397,10 +398,24 @@ export class WorkspaceRepository {
       this.raw.prepare("INSERT INTO rooms(id,title,owner_participant_id,next_seq,archived_at,created_at,updated_at) VALUES(?,?,?,?,NULL,?,?)").run(effect.roomId, effect.title, ownerId, 1, at, at);
       this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,1,0,?)").run(ownerId, effect.roomId, "agent", agentId, label, at);
       this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,1,1,?)").run(createId("human"), effect.roomId, "human", null, "你", at);
-      this.raw.prepare("INSERT INTO scheduler_states(room_id,status,next_agent_participant_id,active_participant_id,round_count,cursor_json,receipt_revision_json,rerun_requested) VALUES(?,'idle',?,NULL,0,'{}','{}',0)").run(effect.roomId, ownerId); return;
+      this.raw.prepare("INSERT INTO scheduler_states(room_id,status,next_agent_participant_id,active_participant_id,round_count,cursor_json,receipt_revision_json,rerun_requested) VALUES(?,'idle',?,NULL,0,'{}','{}',0)").run(effect.roomId, ownerId);
+      for (const invitedAgentId of [...new Set(effect.invitedAgentIds)]) {
+        if (invitedAgentId !== agentId) this.insertAgentParticipant(effect.roomId, invitedAgentId, at);
+      }
+      return;
     }
-    if (effect.type === "invite_agent") { this.assertAgentOwner(effect.roomId, participantId); this.insertAgentParticipant(effect.roomId, effect.agentId, at, effect.participantId); return; }
-    if (effect.type === "remove_participant") { this.assertAgentOwner(effect.roomId, participantId); this.raw.prepare("DELETE FROM participants WHERE room_id=? AND id=? AND id<>?").run(effect.roomId, effect.participantId, participantId); return; }
+    if (effect.type === "invite_agent") {
+      this.assertAgentOwner(effect.roomId, agentId);
+      const invitation = this.insertAgentParticipant(effect.roomId, effect.agentId, at, effect.participantId);
+      if (invitation.inserted) triggerRooms.add(effect.roomId);
+      return;
+    }
+    if (effect.type === "remove_participant") {
+      this.assertAgentOwner(effect.roomId, agentId);
+      this.raw.prepare("DELETE FROM participants WHERE room_id=? AND id=? AND id<>(SELECT owner_participant_id FROM rooms WHERE id=?)")
+        .run(effect.roomId, effect.participantId, effect.roomId);
+      return;
+    }
     if (effect.type === "leave_room") { this.raw.prepare("DELETE FROM participants WHERE room_id=? AND id=?").run(effect.roomId, participantId); return; }
     if (effect.type === "create_cron") {
       const job = effect.job; this.raw.prepare("INSERT OR IGNORE INTO cron_jobs(id,agent_id,room_id,name,schedule,timezone,prompt,enabled,last_run_at,next_run_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
@@ -413,8 +428,10 @@ export class WorkspaceRepository {
     if (effect.type === "delete_cron") { this.raw.prepare("DELETE FROM cron_jobs WHERE id=? AND agent_id=?").run(effect.jobId, agentId); }
   }
 
-  private assertAgentOwner(roomId: string, participantId: string): void {
-    const row = this.requireRoom(roomId); if (row.owner_participant_id !== participantId) throw new DomainError("只有房间 owner Agent 能管理成员");
+  private assertAgentOwner(roomId: string, agentId: string): void {
+    const room = this.requireRoom(roomId);
+    const owner = this.raw.prepare("SELECT agent_id FROM participants WHERE id=? AND room_id=?").get(room.owner_participant_id, roomId) as Row | undefined;
+    if (!owner || owner.agent_id !== agentId) throw new DomainError("只有房间 owner Agent 能管理成员");
   }
 
   failTurn(turnId: string, error: string, stopped = false, modelMeta?: Record<string, unknown>): void {
@@ -453,6 +470,7 @@ export class WorkspaceRepository {
     return row ? parseJson<unknown[]>(row.history_json, []).map(normalizeSessionMessage).filter((message): message is AgentSessionMessage => message !== null) : [];
   }
 
+  hasAgent(agentId: string): boolean { return Boolean(this.raw.prepare("SELECT 1 FROM agents WHERE id=?").get(agentId)); }
   getAgent(agentId: string): Agent | null { return this.getSnapshot().agents.find((agent) => agent.id === agentId) ?? null; }
   getRoom(roomId: string): Room | null { return this.getSnapshot().rooms.find((room) => room.id === roomId) ?? null; }
 

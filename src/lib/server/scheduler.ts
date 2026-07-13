@@ -78,7 +78,10 @@ class RoomScheduler {
         try {
           const result = await getAgentExecutor().run(agent.id, roomId, (signal) => runAgentModel({ repository: this.repository, agent, agentParticipantId: current.id, packet, turnId, signal }));
           const applied = this.repository.finishTurn({ turnId, assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq, nextParticipantId: next?.id ?? null });
-          publishWorkspaceEvent("workspace.changed", turnId, { status: applied.superseded ? "continued" : "completed", emittedMessageIds: applied.emittedMessageIds });
+          for (const targetRoomId of applied.triggerRoomIds) {
+            if (targetRoomId !== roomId) this.enqueue(targetRoomId);
+          }
+          publishWorkspaceEvent("workspace.changed", turnId, { status: applied.superseded ? "continued" : "completed", emittedMessageIds: applied.emittedMessageIds, triggerRoomIds: applied.triggerRoomIds });
         } catch (error) {
           const originalError = error instanceof ModelRunError ? error.originalError : error;
           const stopped = originalError instanceof DOMException && originalError.name === "AbortError";
