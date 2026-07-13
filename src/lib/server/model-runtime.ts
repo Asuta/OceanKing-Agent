@@ -9,7 +9,21 @@ import {
 } from "@/lib/server/context-compaction";
 
 type ToolCall = { id: string; name: string; arguments: string };
+type RoomMessagePreviewPayload = {
+  roomId: string;
+  agentId: string;
+  messageKey: string;
+  content: string;
+  messageKind: "answer" | "progress" | "warning" | "error" | "clarification";
+};
+type RoomMessagePreviewState = {
+  payload: RoomMessagePreviewPayload;
+  publishedContent: string;
+  worker: Promise<void> | null;
+};
 const terminalToolNames = new Set(["send_message_to_room", "read_no_reply"]);
+const roomMessagePreviewFrameMs = 35;
+const roomMessagePreviewMaxFrames = 16;
 class ResponsesUnsupportedError extends Error {}
 type RunArgs = {
   repository: WorkspaceRepository;
@@ -97,20 +111,89 @@ export function extractPartialJsonStringField(input: string, field: string): str
   return value;
 }
 
-function publishRoomMessagePreview(args: RunArgs, call: ToolCall): void {
-  if (call.name !== "send_message_to_room" || !call.id) return;
+function roomMessagePreviewPayload(args: RunArgs, call: ToolCall): RoomMessagePreviewPayload | null {
+  if (call.name !== "send_message_to_room" || !call.id) return null;
   const roomId = extractPartialJsonStringField(call.arguments, "roomId");
   const content = extractPartialJsonStringField(call.arguments, "content");
-  if (!roomId || !content) return;
+  if (!roomId || !content) return null;
   const connected = args.repository.getSnapshot().rooms.some((room) => room.id === roomId && room.participants.some((participant) => participant.agentId === args.agent.id && participant.enabled));
-  if (!connected) return;
+  if (!connected) return null;
   const rawKind = extractPartialJsonStringField(call.arguments, "kind");
-  const kind = (["answer", "progress", "warning", "error", "clarification"] as const).find((entry) => entry === rawKind) ?? "answer";
-  publishWorkspaceEvent("turn.preview", args.turnId, {
-    kind: "room_message_preview", roomId, agentId: args.agent.id,
+  const messageKind = (["answer", "progress", "warning", "error", "clarification"] as const).find((entry) => entry === rawKind) ?? "answer";
+  return {
+    roomId,
+    agentId: args.agent.id,
     messageKey: extractPartialJsonStringField(call.arguments, "messageKey") || call.id,
-    content, messageKind: kind,
+    content,
+    messageKind,
+  };
+}
+
+function publishRoomMessagePreview(args: RunArgs, payload: RoomMessagePreviewPayload, content: string): void {
+  publishWorkspaceEvent("turn.preview", args.turnId, {
+    kind: "room_message_preview",
+    ...payload,
+    content,
   }, args.repository.getVersion().revision);
+}
+
+function waitForRoomMessagePreviewFrame(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onAbort = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, roomMessagePreviewFrameMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function createRoomMessagePreviewStream(args: RunArgs) {
+  const states = new Map<string, RoomMessagePreviewState>();
+
+  const startWorker = (state: RoomMessagePreviewState): void => {
+    if (state.worker) return;
+    state.worker = (async () => {
+      await Promise.resolve();
+      try {
+        while (!args.signal.aborted && state.publishedContent !== state.payload.content) {
+          if (!state.payload.content.startsWith(state.publishedContent)) state.publishedContent = "";
+          const targetCharacters = Array.from(state.payload.content);
+          const publishedCharacters = Array.from(state.publishedContent).length;
+          const step = Math.max(1, Math.ceil(targetCharacters.length / roomMessagePreviewMaxFrames));
+          const nextLength = Math.min(targetCharacters.length, publishedCharacters + step);
+          state.publishedContent = targetCharacters.slice(0, nextLength).join("");
+          publishRoomMessagePreview(args, state.payload, state.publishedContent);
+          if (state.publishedContent !== state.payload.content) await waitForRoomMessagePreviewFrame(args.signal);
+        }
+      } finally {
+        state.worker = null;
+        if (!args.signal.aborted && state.publishedContent !== state.payload.content) startWorker(state);
+      }
+    })();
+  };
+
+  const update = (call: ToolCall, streamKey = call.id): void => {
+    const payload = roomMessagePreviewPayload(args, call);
+    if (!payload) return;
+    const current = states.get(streamKey);
+    if (current) {
+      current.payload = payload;
+      startWorker(current);
+      return;
+    }
+    const state: RoomMessagePreviewState = { payload, publishedContent: "", worker: null };
+    states.set(streamKey, state);
+    startWorker(state);
+  };
+
+  const flush = async (): Promise<void> => {
+    while (true) {
+      const workers = [...states.values()].map((state) => state.worker).filter((worker): worker is Promise<void> => Boolean(worker));
+      if (!workers.length) return;
+      await Promise.all(workers);
+    }
+  };
+
+  return { update, flush };
 }
 
 async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExecution[], timeline: TimelineEvent[], effects: TurnEffect[]) {
@@ -322,6 +405,7 @@ async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
     if (requestTools.length) { body.tools = requestTools; body.tool_choice = "auto"; }
     applyChatThinkingSettings(body, args.agent, baseUrl);
     const response = await fetch(`${baseUrl}/chat/completions`, { method: "POST", headers, signal: args.signal, body: JSON.stringify(body) });
+    const roomMessagePreviewStream = createRoomMessagePreviewStream(args);
     let content = ""; let reasoningContent = ""; let sawReasoningContent = false; const callMap = new Map<number, ToolCall>();
     await parseSse(response, (event) => {
       if (event.usage) usage = event.usage;
@@ -333,10 +417,11 @@ async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
       for (const chunk of chunks) {
         const index = Number(chunk.index ?? 0); const current = callMap.get(index) ?? { id: "", name: "", arguments: "" }; const fn = chunk.function as Record<string, unknown> | undefined;
         const next = { id: current.id || String(chunk.id ?? ""), name: current.name + String(fn?.name ?? ""), arguments: current.arguments + String(fn?.arguments ?? "") };
-        callMap.set(index, next); publishRoomMessagePreview(args, next);
+        callMap.set(index, next); roomMessagePreviewStream.update(next, String(index));
       }
     });
     const calls = [...callMap.values()];
+    await roomMessagePreviewStream.flush();
     if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
     if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
     const includeReasoning = sawReasoningContent || args.agent.settings.thinkingMode === "enabled" || (args.agent.settings.thinkingMode === "provider_default" && isDeepSeekBaseUrl(baseUrl));
@@ -403,7 +488,7 @@ async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
     if (!response.ok && step === 0 && [400, 404, 405].includes(response.status)) {
       throw new ResponsesUnsupportedError(`Responses API 不可用 (${response.status}): ${(await response.text()).slice(0, 1_000)}`);
     }
-    const callMap = new Map<string, ToolCall>(); let stepContent = "";
+    const callMap = new Map<string, ToolCall>(); const roomMessagePreviewStream = createRoomMessagePreviewStream(args); let stepContent = "";
     await parseSse(response, (event) => {
       const type = String(event.type ?? ""); const responseObject = event.response as Record<string, unknown> | undefined;
       if (typeof responseObject?.id === "string") previousResponseId = responseObject.id;
@@ -413,23 +498,25 @@ async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
         const item = event.item as Record<string, unknown> | undefined;
         if (item?.type === "function_call") {
           const key = String(item.id ?? item.call_id ?? createId("call")); const call = { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") };
-          callMap.set(key, call); publishRoomMessagePreview(args, call);
+          callMap.set(key, call); roomMessagePreviewStream.update(call, key);
         }
       }
       if (type === "response.function_call_arguments.delta") {
         const key = String(event.item_id ?? event.call_id ?? ""); const current = callMap.get(key) ?? { id: String(event.call_id ?? key), name: String(event.name ?? ""), arguments: "" };
         const call = { ...current, arguments: current.arguments + String(event.delta ?? "") };
-        callMap.set(key, call); publishRoomMessagePreview(args, call);
+        callMap.set(key, call); roomMessagePreviewStream.update(call, key);
       }
       if (type === "response.output_item.done") {
         const item = event.item as Record<string, unknown> | undefined;
         if (item?.type === "function_call") {
           const call = { id: String(item.call_id ?? item.id ?? ""), name: String(item.name ?? ""), arguments: String(item.arguments ?? "") };
-          callMap.set(String(item.id ?? item.call_id ?? ""), call); publishRoomMessagePreview(args, call);
+          const key = String(item.id ?? item.call_id ?? "");
+          callMap.set(key, call); roomMessagePreviewStream.update(call, key);
         }
       }
     });
     const calls = [...callMap.values()];
+    await roomMessagePreviewStream.flush();
     if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
     if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
     const assistantMessage: Extract<AgentSessionMessage, { role: "assistant" }> = {

@@ -14,6 +14,16 @@ function requestBody(init?: RequestInit): Record<string, unknown> {
   return JSON.parse(String(init?.body)) as Record<string, unknown>;
 }
 
+function expectProgressivePreview(contents: string[], completeContent: string): void {
+  expect(contents.length).toBeGreaterThan(1);
+  expect(contents[0]?.length).toBeLessThan(completeContent.length);
+  expect(contents.at(-1)).toBe(completeContent);
+  contents.forEach((content, index) => {
+    expect(completeContent.startsWith(content)).toBe(true);
+    if (index > 0) expect(content.length).toBeGreaterThan(contents[index - 1]!.length);
+  });
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   delete process.env.OPENAI_API_KEY;
@@ -151,7 +161,28 @@ describe("OpenAI 兼容协议", () => {
     sendUser(repository, "room_harbor", "工具流测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_chat_tool", signal: new AbortController().signal }); unsubscribe();
     expect(result.assistantContent).toBe("工具之后的私有总结"); expect(result.effects).toHaveLength(1); expect(result.effects[0]).toMatchObject({ type: "send_message", content: "正式工具消息" }); expect(result.tools[0]?.status).toBe("completed");
-    expect(previewContents).toEqual(["正式", "正式工具", "正式工具消息"]);
+    expectProgressivePreview(previewContents, "正式工具消息");
+  }));
+
+  it("Chat Completions 单块 function call 也逐步发布房间预览", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const previewContents: string[] = []; const unsubscribe = subscribeWorkspaceEvents((event) => {
+      const payload = event.payload as { kind?: string; content?: string } | undefined;
+      if (event.entityId === "turn_chat_single_chunk" && payload?.kind === "room_message_preview" && payload.content) previewContents.push(payload.content);
+    });
+    let call = 0; const completeContent = "供应商一次返回的完整公开消息";
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      call += 1;
+      if (call === 1) return sse([
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_single_chunk", function: { name: "send_message_to_room", arguments: JSON.stringify({ content: completeContent, kind: "answer", roomId: "room_harbor" }) } }] } }] },
+        "[DONE]",
+      ]);
+      return sse([{ choices: [{ delta: { content: "私有总结" } }] }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "单块工具参数测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_chat_single_chunk", signal: new AbortController().signal }); unsubscribe();
+    expect(result.effects[0]).toMatchObject({ type: "send_message", content: completeContent });
+    expectProgressivePreview(previewContents, completeContent);
   }));
 
   it("DeepSeek 思考模式在工具子轮和后续用户轮次完整回传 reasoning_content", async () => withRepository(async (repository) => {
@@ -276,6 +307,28 @@ describe("OpenAI 兼容协议", () => {
     sendUser(repository, "room_harbor", "Responses 工具流测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses_tool", signal: new AbortController().signal }); unsubscribe();
     expect(result.effects[0]).toMatchObject({ type: "send_message", content: "Responses 流式消息" });
-    expect(previewContents).toEqual(["Responses ", "Responses 流式消息"]);
+    expectProgressivePreview(previewContents, "Responses 流式消息");
+  }));
+
+  it("Responses 完成事件一次给出完整参数时也逐步发布房间预览", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const previewContents: string[] = []; const unsubscribe = subscribeWorkspaceEvents((event) => {
+      const payload = event.payload as { kind?: string; content?: string } | undefined;
+      if (event.entityId === "turn_responses_single_chunk" && payload?.kind === "room_message_preview" && payload.content) previewContents.push(payload.content);
+    });
+    let call = 0; const completeContent = "Responses 一次返回的完整公开消息"; const fullArguments = JSON.stringify({ content: completeContent, kind: "answer", roomId: "room_harbor" });
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      call += 1;
+      if (call === 1) return sse([
+        { type: "response.output_item.added", item: { id: "item_single", call_id: "call_responses_single", type: "function_call", name: "send_message_to_room", arguments: "" } },
+        { type: "response.output_item.done", item: { id: "item_single", call_id: "call_responses_single", type: "function_call", name: "send_message_to_room", arguments: fullArguments } },
+        { type: "response.completed", response: { id: "resp_single" } }, "[DONE]",
+      ]);
+      return sse([{ type: "response.output_text.delta", delta: "私有总结" }, { type: "response.completed", response: { id: "resp_single_done" } }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "Responses 单块工具参数测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses_single_chunk", signal: new AbortController().signal }); unsubscribe();
+    expect(result.effects[0]).toMatchObject({ type: "send_message", content: completeContent });
+    expectProgressivePreview(previewContents, completeContent);
   }));
 });
