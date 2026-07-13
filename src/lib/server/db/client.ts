@@ -11,6 +11,18 @@ export type DatabaseHandle = {
   dataDir: string;
 };
 
+type DatabaseInstanceLock = {
+  lockPath: string;
+  token: string;
+};
+
+type DatabaseInstanceLockMetadata = {
+  pid: number;
+  token: string;
+  cwd: string;
+  startedAt: string;
+};
+
 const createSql = `
 CREATE TABLE IF NOT EXISTS workspace_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, revision INTEGER NOT NULL, settings_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, label TEXT NOT NULL, summary TEXT NOT NULL, instruction TEXT NOT NULL, skills_json TEXT NOT NULL, settings_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -37,6 +49,56 @@ function resolveDataDir(explicit?: string): string {
   return path.isAbsolute(configured)
     ? path.normalize(configured)
     : path.join(/* turbopackIgnore: true */ process.cwd(), configured);
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function releaseDatabaseInstanceLock(lock: DatabaseInstanceLock): void {
+  try {
+    const current = JSON.parse(fs.readFileSync(lock.lockPath, "utf8")) as DatabaseInstanceLockMetadata;
+    if (current.token === lock.token) fs.unlinkSync(lock.lockPath);
+  } catch { /* 陈旧锁会在下次启动时按 PID 自动清理。 */ }
+}
+
+export function acquireDatabaseInstanceLock(dataDir: string): () => void {
+  fs.mkdirSync(dataDir, { recursive: true });
+  const lockPath = path.join(dataDir, ".oceanking-instance.lock");
+  const token = crypto.randomUUID();
+  const metadata: DatabaseInstanceLockMetadata = { pid: process.pid, token, cwd: process.cwd(), startedAt: new Date().toISOString() };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const temporaryPath = `${lockPath}.${process.pid}.${token}.tmp`;
+    try {
+      fs.writeFileSync(temporaryPath, JSON.stringify(metadata), { flag: "wx" });
+      fs.linkSync(temporaryPath, lockPath);
+      fs.unlinkSync(temporaryPath);
+      const lock = { lockPath, token };
+      return () => releaseDatabaseInstanceLock(lock);
+    } catch (error) {
+      try { fs.unlinkSync(temporaryPath); } catch (cleanupError) { if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") throw cleanupError; }
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+
+      let owner: DatabaseInstanceLockMetadata;
+      try {
+        owner = JSON.parse(fs.readFileSync(lockPath, "utf8")) as DatabaseInstanceLockMetadata;
+      } catch {
+        throw new Error(`OceanKing 数据目录锁损坏：${lockPath}。确认没有服务使用该目录后再删除锁文件。`);
+      }
+      if (owner.pid === process.pid) return () => {};
+      if (processIsAlive(owner.pid)) {
+        throw new Error(`OceanKing 数据目录已被另一个后端占用（PID ${owner.pid}，工作目录 ${owner.cwd}）：${dataDir}。同时运行多个工作树时，请为每个进程设置不同的 OCEANKING_DATA_DIR。`);
+      }
+      try { fs.unlinkSync(lockPath); } catch (cleanupError) { if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") throw cleanupError; }
+    }
+  }
+  throw new Error(`无法获取 OceanKing 数据目录锁：${lockPath}`);
 }
 
 export function createDatabase(explicitDataDir?: string): DatabaseHandle {
@@ -70,14 +132,34 @@ export function createDatabase(explicitDataDir?: string): DatabaseHandle {
   return { raw, orm: drizzle(raw, { schema }), dataDir };
 }
 
-const globalDb = globalThis as typeof globalThis & { __oceanKingDb?: DatabaseHandle };
+const globalDb = globalThis as typeof globalThis & {
+  __oceanKingDb?: DatabaseHandle;
+  __oceanKingDbLockRelease?: () => void;
+  __oceanKingDbExitHookRegistered?: boolean;
+};
 
 export function getDatabase(): DatabaseHandle {
-  globalDb.__oceanKingDb ??= createDatabase();
+  if (!globalDb.__oceanKingDb) {
+    const dataDir = resolveDataDir();
+    const release = acquireDatabaseInstanceLock(dataDir);
+    try {
+      globalDb.__oceanKingDb = createDatabase(dataDir);
+      globalDb.__oceanKingDbLockRelease = release;
+      if (!globalDb.__oceanKingDbExitHookRegistered) {
+        process.once("exit", () => globalDb.__oceanKingDbLockRelease?.());
+        globalDb.__oceanKingDbExitHookRegistered = true;
+      }
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
   return globalDb.__oceanKingDb;
 }
 
 export function resetDatabaseForTests(): void {
   globalDb.__oceanKingDb?.raw.close();
+  globalDb.__oceanKingDbLockRelease?.();
   delete globalDb.__oceanKingDb;
+  delete globalDb.__oceanKingDbLockRelease;
 }

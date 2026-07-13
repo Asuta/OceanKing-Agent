@@ -110,7 +110,7 @@ function publishRoomMessagePreview(args: RunArgs, call: ToolCall): void {
     kind: "room_message_preview", roomId, agentId: args.agent.id,
     messageKey: extractPartialJsonStringField(call.arguments, "messageKey") || call.id,
     content, messageKind: kind,
-  });
+  }, args.repository.getVersion().revision);
 }
 
 async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExecution[], timeline: TimelineEvent[], effects: TurnEffect[]) {
@@ -134,7 +134,7 @@ async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExe
     const tool: ToolExecution = { id: call.id || createId("tool"), turnId: args.turnId, name: call.name, input: parsed, outputText, structuredResult: structured, status: error ? "error" : "completed", durationMs: Date.now() - started, error, createdAt: nowIso() };
     tools.push(tool); addTimeline("tool_finished", { id: tool.id, name: tool.name, status: tool.status, durationMs: tool.durationMs, error });
     outputs.push({ callId: call.id, name: call.name, text: outputText, error: Boolean(error) });
-    publishWorkspaceEvent("turn.preview", args.turnId, { kind: "tool", tool });
+    publishWorkspaceEvent("turn.preview", args.turnId, { kind: "tool", tool }, args.repository.getVersion().revision);
   }
   return outputs;
 }
@@ -328,7 +328,7 @@ async function runChatCompletions(args: RunArgs): Promise<ModelTurnResult> {
       const choices = Array.isArray(event.choices) ? event.choices as Array<Record<string, unknown>> : [];
       const delta = choices[0]?.delta as Record<string, unknown> | undefined;
       if (typeof delta?.reasoning_content === "string") { sawReasoningContent = true; reasoningContent += delta.reasoning_content; reasoningCharacters += delta.reasoning_content.length; }
-      if (typeof delta?.content === "string") { content += delta.content; assistantContent += delta.content; addTimeline("assistant_delta", { delta: delta.content }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: delta.content }); }
+      if (typeof delta?.content === "string") { content += delta.content; assistantContent += delta.content; addTimeline("assistant_delta", { delta: delta.content }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: delta.content }, args.repository.getVersion().revision); }
       const chunks = Array.isArray(delta?.tool_calls) ? delta.tool_calls as Array<Record<string, unknown>> : [];
       for (const chunk of chunks) {
         const index = Number(chunk.index ?? 0); const current = callMap.get(index) ?? { id: "", name: "", arguments: "" }; const fn = chunk.function as Record<string, unknown> | undefined;
@@ -408,7 +408,7 @@ async function runResponses(args: RunArgs): Promise<ModelTurnResult> {
       const type = String(event.type ?? ""); const responseObject = event.response as Record<string, unknown> | undefined;
       if (typeof responseObject?.id === "string") previousResponseId = responseObject.id;
       if (responseObject?.usage) usage = responseObject.usage;
-      if (type === "response.output_text.delta" && typeof event.delta === "string") { stepContent += event.delta; assistantContent += event.delta; addTimeline("assistant_delta", { delta: event.delta }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: event.delta }); }
+      if (type === "response.output_text.delta" && typeof event.delta === "string") { stepContent += event.delta; assistantContent += event.delta; addTimeline("assistant_delta", { delta: event.delta }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: event.delta }, args.repository.getVersion().revision); }
       if (type === "response.output_item.added") {
         const item = event.item as Record<string, unknown> | undefined;
         if (item?.type === "function_call") {
@@ -456,7 +456,7 @@ async function runMock(args: RunArgs): Promise<ModelTurnResult> {
   const latestExternal = args.packet.messages.toReversed().find((message) => message.source !== "agent_emit");
   const latest = latestExternal ?? args.packet.messages.at(-1);
   const assistantContent = `我已在私有执行区分析消息 #${latest?.seq ?? "?"}。`;
-  addTimeline("assistant_delta", { delta: assistantContent }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: assistantContent });
+  addTimeline("assistant_delta", { delta: assistantContent }); publishWorkspaceEvent("turn.preview", args.turnId, { kind: "assistant_delta", delta: assistantContent }, args.repository.getVersion().revision);
   if (latest?.content.trim().startsWith("/private")) {
     addTimeline("turn_finished", { reason: "private-only fixture" });
     return { assistantContent, sessionMessages: [{ role: "user", content: packetText(args.packet) }, { role: "assistant", content: assistantContent }], tools, timeline, effects, modelMeta: { format: "mock", fixture: "private-only" } };
@@ -476,7 +476,7 @@ export async function runAgentModel(args: RunArgs): Promise<ModelTurnResult> {
   if (format === "responses") return runResponses(args);
   try { return await runResponses(args); } catch (error) {
     if (args.signal.aborted || !(error instanceof ResponsesUnsupportedError)) throw error;
-    publishWorkspaceEvent("turn.preview", args.turnId, { kind: "compatibility_fallback", error: error instanceof Error ? error.message : String(error) });
+    publishWorkspaceEvent("turn.preview", args.turnId, { kind: "compatibility_fallback", error: error instanceof Error ? error.message : String(error) }, args.repository.getVersion().revision);
     return runChatCompletions(args);
   }
 }
