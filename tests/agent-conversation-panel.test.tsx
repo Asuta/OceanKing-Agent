@@ -39,7 +39,15 @@ describe("Agent 全局底层对话面板", () => {
     expect(await screen.findByText("请检查记录")).toBeTruthy();
     expect(screen.getByText("更早的输入")).toBeTruthy();
     expect(screen.getByText("先读取历史")).toBeTruthy();
+    const toolReturn = screen.getByRole("group", { name: "工具返回 call_one" }) as HTMLDetailsElement;
+    const toolReturnToggle = toolReturn.querySelector("summary");
+    expect(toolReturn.open).toBe(false);
+    expect(toolReturnToggle).toBeTruthy();
+    fireEvent.click(toolReturnToggle!);
+    expect(toolReturn.open).toBe(true);
     expect(screen.getByText("模型收到的工具返回")).toBeTruthy();
+    fireEvent.click(toolReturnToggle!);
+    expect(toolReturn.open).toBe(false);
     expect(screen.getByText("先调查，再回答")).toBeTruthy();
     expect(screen.queryByRole("combobox", { name: "选择 Agent Turn" })).toBeNull();
     expect([...container.querySelectorAll("[data-turn-id]")].map((element) => element.getAttribute("data-turn-id"))).toEqual(["turn_older", "turn_one"]);

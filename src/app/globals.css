@@ -258,16 +258,23 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .agent-turn-error { display: flex; align-items: flex-start; gap: 7px; padding: 8px 9px; border: 1px solid rgba(255, 107, 117, .2); border-radius: 8px; background: rgba(255, 107, 117, .06); color: var(--danger); font-size: 9px; line-height: 1.5; }
 .agent-input-list, .agent-conversation-list { display: grid; gap: 8px; }
 .agent-input-list article, .agent-conversation-message { overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-deep); }
-.agent-input-list article > header, .agent-conversation-message > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; border-bottom: 1px solid var(--line); color: var(--text-soft); font-size: 8px; }
-.agent-input-list article > header small, .agent-conversation-message > header small { overflow: hidden; color: var(--muted); font: 8px ui-monospace, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
-.agent-input-list article > pre, .agent-conversation-message > pre, .agent-reasoning pre, .agent-command pre, .agent-raw-details pre { max-height: 280px; overflow: auto; margin: 0; padding: 9px; color: var(--text-soft); font: 9px/1.55 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+.agent-input-list article > header, .agent-conversation-message > header, .agent-tool-return > summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; border-bottom: 1px solid var(--line); color: var(--text-soft); font-size: 8px; }
+.agent-input-list article > header small, .agent-conversation-message > header small, .agent-tool-return > summary small { overflow: hidden; color: var(--muted); font: 8px ui-monospace, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.agent-input-list article > pre, .agent-conversation-message > pre, .agent-tool-return > pre, .agent-reasoning pre, .agent-command pre, .agent-raw-details pre { max-height: 280px; overflow: auto; margin: 0; padding: 9px; color: var(--text-soft); font: 9px/1.55 ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 .agent-input-list article > small { display: block; padding: 0 9px 8px; color: var(--muted); font-size: 8px; }
 .agent-raw-details { margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-soft); }
 .agent-raw-details summary { padding: 8px 9px; color: var(--text-soft); font-size: 8px; cursor: pointer; }
 .agent-raw-details[open] summary { border-bottom: 1px solid var(--line); }
 .agent-conversation-message.assistant-message { background: var(--panel-soft); }
 .agent-conversation-message.tool-message { border-color: color-mix(in srgb, var(--warning) 25%, var(--line)); }
+.agent-tool-return > summary { cursor: pointer; list-style: none; }
+.agent-tool-return > summary::-webkit-details-marker { display: none; }
+.agent-tool-return > summary svg { flex: 0 0 auto; transition: transform .16s ease; }
+.agent-tool-return > summary span { margin-right: auto; font-weight: 700; }
+.agent-tool-return:not([open]) > summary { border-bottom-color: transparent; }
+.agent-tool-return[open] > summary svg { transform: rotate(90deg); }
 .agent-conversation-message > .tool-row { margin: 8px; }
+.agent-tool-return > .tool-row { margin: 8px; }
 .agent-reasoning, .agent-answer { display: grid; gap: 6px; padding: 9px; border-bottom: 1px solid var(--line); }
 .agent-reasoning label, .agent-answer label { color: var(--muted); font-size: 8px; font-weight: 650; }
 .agent-reasoning pre { max-height: 360px; padding: 0; color: var(--text-soft); }
@@ -280,7 +287,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .agent-command small { color: var(--muted); font: 7px ui-monospace, Consolas, monospace; }
 .agent-command pre { border-top: 1px solid var(--line); }
 .agent-empty-value { margin: 0; padding: 9px; color: var(--muted); font-size: 9px; }
-.agent-timeline .agent-input-list article > pre, .agent-timeline .agent-conversation-message > pre, .agent-timeline .agent-reasoning pre, .agent-timeline .agent-command pre, .agent-timeline .agent-raw-details pre, .agent-timeline .tool-detail pre { max-height: none; overflow: visible; }
+.agent-timeline .agent-input-list article > pre, .agent-timeline .agent-conversation-message > pre, .agent-timeline .agent-tool-return > pre, .agent-timeline .agent-reasoning pre, .agent-timeline .agent-command pre, .agent-timeline .agent-raw-details pre, .agent-timeline .tool-detail pre { max-height: none; overflow: visible; }
 .console-reopen { position: fixed; z-index: 4; top: 21px; right: 18px; width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel); color: var(--text-soft); cursor: pointer; box-shadow: var(--shadow); }
 
 .toast { position: fixed; z-index: 50; right: 22px; bottom: 22px; max-width: 430px; display: flex; align-items: center; gap: 12px; padding: 11px 12px 11px 15px; border: 1px solid rgba(255, 107, 117, .24); border-radius: 10px; background: var(--panel-raised); color: #ffb8bd; box-shadow: var(--shadow); font-size: 10px; }

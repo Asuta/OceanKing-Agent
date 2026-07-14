@@ -26,9 +26,11 @@ function ConversationMessage({ message, index, execution, executionOpen, onToggl
     <pre>{message.content}</pre>
   </article>;
   if (message.role === "tool") return <article className="agent-conversation-message tool-message">
-    <header><span>工具返回</span><small>{message.tool_call_id}</small></header>
-    <pre>{message.content}</pre>
-    {execution ? <ToolExecutionRecord tool={execution} open={executionOpen} onToggle={onToggleExecution} /> : null}
+    <details className="agent-tool-return" aria-label={`工具返回 ${message.tool_call_id}`}>
+      <summary><ChevronRight size={14} /><span>工具返回</span><small>{message.tool_call_id}</small></summary>
+      <pre>{message.content}</pre>
+      {execution ? <ToolExecutionRecord tool={execution} open={executionOpen} onToggle={onToggleExecution} /> : null}
+    </details>
   </article>;
   return <article className="agent-conversation-message assistant-message">
     <header><span>Agent 回复</span><small>#{index + 1} · assistant</small></header>
