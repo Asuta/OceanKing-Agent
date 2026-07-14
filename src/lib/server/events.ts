@@ -41,6 +41,10 @@ export function eventsAfterId(eventId: number): WorkspaceEvent[] {
   return history.filter((event) => event.id > eventId);
 }
 
+export function getWorkspaceEventCursor(): number {
+  return globalEvents.__oceanKingEventCursor ?? 0;
+}
+
 export function resetWorkspaceEventHistory(): void {
   history.length = 0;
 }

@@ -5,6 +5,23 @@ import { Bot, CheckCircle2, ChevronDown, ChevronRight, CircleDashed, Code2, EyeO
 import type { AgentConversationHistory, AgentConversationTurn, AgentSessionMessage, AgentTurn, ToolExecution } from "@/lib/domain/types";
 import { Markdown } from "@/components/workspace/markdown";
 
+const scrollFollowThreshold = 48;
+
+function isAtConversationBottom(element: HTMLDivElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= scrollFollowThreshold;
+}
+
+function unpersistedPreview(persisted: string, preview: string | undefined): string {
+  if (!preview) return "";
+  if (preview.startsWith(persisted)) return preview.slice(persisted.length);
+  if (persisted.endsWith(preview)) return "";
+  const maxOverlap = Math.min(persisted.length, preview.length);
+  for (let length = maxOverlap; length > 0; length -= 1) {
+    if (persisted.endsWith(preview.slice(0, length))) return preview.slice(length);
+  }
+  return preview;
+}
+
 function prettyJson(value: unknown): string {
   if (typeof value !== "string") return JSON.stringify(value, null, 2);
   try { return JSON.stringify(JSON.parse(value), null, 2); } catch { return value; }
@@ -44,11 +61,12 @@ function ConversationMessage({ message, index, execution, executionOpen, onToggl
   </article>;
 }
 
-function TimelineTurn({ turn, expandedTools, toggleTool }: { turn: AgentConversationTurn; expandedTools: Record<string, boolean>; toggleTool: (toolId: string) => void }) {
+function TimelineTurn({ turn, livePreview, expandedTools, toggleTool }: { turn: AgentConversationTurn; livePreview?: string; expandedTools: Record<string, boolean>; toggleTool: (toolId: string) => void }) {
   const toolById = new Map(turn.tools.map((tool) => [tool.id, tool]));
   const linkedToolIds = new Set(turn.messages.flatMap((message) => message.role === "tool" ? [message.tool_call_id] : []));
   const unlinkedTools = turn.tools.filter((tool) => !linkedToolIds.has(tool.id));
   const source = turn.userEnvelope.type === "cron_packet" ? `Cron · ${turn.roomTitle}` : turn.roomTitle;
+  const liveOutput = turn.status === "running" ? unpersistedPreview(turn.assistantContent, livePreview) : "";
   return <section className="agent-timeline-turn" data-turn-id={turn.id}>
     <header className="agent-turn-marker">
       <span className={`turn-status ${turn.status}`}>{statusIcon(turn.status)}{turn.status}</span>
@@ -66,16 +84,20 @@ function TimelineTurn({ turn, expandedTools, toggleTool }: { turn: AgentConversa
     <div className="agent-conversation-list">{turn.messages.map((message, index) => {
       const execution = message.role === "tool" ? toolById.get(message.tool_call_id) : undefined;
       return <ConversationMessage key={`${turn.id}-${index}`} message={message} index={index} execution={execution} executionOpen={Boolean(execution && expandedTools[execution.id])} onToggleExecution={() => { if (execution) toggleTool(execution.id); }} />;
-    })}</div>
+    })}{liveOutput ? <article className="agent-conversation-message assistant-message agent-live-message" aria-live="polite" aria-label="Agent 实时输出">
+      <header><span>Agent 实时输出</span><small>生成中</small></header>
+      <div className="agent-answer"><Markdown>{liveOutput}</Markdown><span className="stream-cursor" aria-hidden="true" /></div>
+    </article> : null}</div>
     {unlinkedTools.length ? <><div className="agent-timeline-stage"><Wrench size={14} /><span>未关联到模型消息的工具执行</span></div><div className="tool-list">{unlinkedTools.map((tool) => <ToolExecutionRecord key={tool.id} tool={tool} open={Boolean(expandedTools[tool.id])} onToggle={() => toggleTool(tool.id)} />)}</div></> : null}
     {turn.error ? <div className="agent-turn-error"><TriangleAlert size={13} /><span>{turn.error}</span></div> : null}
   </section>;
 }
 
-export function AgentConversationPanel({ agentId, historyVersion }: { agentId: string; historyVersion: string }) {
+export function AgentConversationPanel({ agentId, historyVersion, previews = {} }: { agentId: string; historyVersion: string; previews?: Record<string, string> }) {
   const [loadResult, setLoadResult] = useState<{ agentId: string; historyVersion: string; history: AgentConversationHistory | null; error: string | null } | null>(null);
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
   const panelRef = useRef<HTMLDivElement>(null);
+  const followLatestRef = useRef(true);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -103,16 +125,23 @@ export function AgentConversationPanel({ agentId, historyVersion }: { agentId: s
   const toolCount = useMemo(() => history?.turns.reduce((count, turn) => count + turn.tools.length, 0) ?? 0, [history]);
   const latestTurn = timelineTurns.at(-1);
   const latestTurnId = latestTurn?.id;
-  const latestTurnUpdatedAt = latestTurn?.updatedAt;
+  const livePreviewLength = useMemo(() => timelineTurns.reduce((length, turn) => length + (turn.status === "running" ? previews[turn.id]?.length ?? 0 : 0), 0), [previews, timelineTurns]);
+
+  useEffect(() => { followLatestRef.current = true; }, [agentId]);
 
   useEffect(() => {
     const panel = panelRef.current;
-    if (panel && latestTurnId) panel.scrollTop = panel.scrollHeight;
-  }, [agentId, latestTurnId, latestTurnUpdatedAt]);
+    if (!panel || !latestTurnId || !followLatestRef.current) return;
+    const scrollToLatest = () => { if (followLatestRef.current) panel.scrollTop = panel.scrollHeight; };
+    scrollToLatest();
+    const frame = typeof window.requestAnimationFrame === "function" ? window.requestAnimationFrame(scrollToLatest) : 0;
+    const settleTimer = window.setTimeout(scrollToLatest, 80);
+    return () => { if (frame) window.cancelAnimationFrame(frame); window.clearTimeout(settleTimer); };
+  }, [agentId, history, latestTurnId, livePreviewLength]);
 
   const toggleTool = (toolId: string) => setExpandedTools((current) => ({ ...current, [toolId]: !current[toolId] }));
 
-  return <div className="console-panel agent-conversation-panel" ref={panelRef}>
+  return <div className="console-panel agent-conversation-panel" ref={panelRef} onScroll={(event) => { followLatestRef.current = isAtConversationBottom(event.currentTarget); }}>
     <header className="console-header"><div><span className="console-icon"><Bot size={16} /></span><div><h2>{history?.agent.label ?? "Agent 对话"}</h2><p>全局底层对话 · 跨房间 / Cron / 任务</p></div></div><span className="private-label"><EyeOff size={12} />PRIVATE</span></header>
     <div className="console-tabs agent-timeline-tabs"><span>连续时间线 · {history?.turns.length ?? 0} 轮</span><small>{toolCount} 次工具执行</small></div>
     {loading && !history ? <div className="console-empty" aria-live="polite"><CircleDashed className="spin" size={27} /><strong>正在读取底层对话</strong><p>正在汇总这个 Agent 在所有房间和任务中的输入、回复与命令。</p></div> : null}
@@ -121,7 +150,7 @@ export function AgentConversationPanel({ agentId, historyVersion }: { agentId: s
     {history && timelineTurns.length ? <>
       <div className="agent-history-summary"><span><strong>{timelineTurns.length}</strong> 轮次</span><span><strong>{roomCount}</strong> 房间</span><span><strong>{toolCount}</strong> 工具执行</span>{loading ? <CircleDashed className="spin" size={12} aria-label="正在刷新" /> : null}</div>
       {error ? <div className="agent-refresh-error" role="status"><TriangleAlert size={12} />{error}</div> : null}
-      <div className="agent-timeline" aria-label="Agent 连续底层对话时间线">{timelineTurns.map((turn) => <TimelineTurn key={turn.id} turn={turn} expandedTools={expandedTools} toggleTool={toggleTool} />)}</div>
+      <div className="agent-timeline" aria-label="Agent 连续底层对话时间线">{timelineTurns.map((turn) => <TimelineTurn key={turn.id} turn={turn} livePreview={previews[turn.id]} expandedTools={expandedTools} toggleTool={toggleTool} />)}</div>
     </> : null}
   </div>;
 }

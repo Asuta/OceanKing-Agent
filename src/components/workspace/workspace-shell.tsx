@@ -11,11 +11,12 @@ import { RoomSidebar } from "@/components/workspace/room-sidebar";
 import { SettingsDialog } from "@/components/workspace/settings-dialog";
 import { useWorkspace } from "@/components/workspace/use-workspace";
 
-export function getAgentHistoryVersion(snapshot: WorkspaceSnapshot, agentId: string | null): string {
+export function getAgentHistoryVersion(snapshot: WorkspaceSnapshot, agentId: string | null, checkpoints: Record<string, number> = {}): string {
   if (!agentId) return "";
   const agentUpdatedAt = snapshot.agents.find((agent) => agent.id === agentId)?.updatedAt ?? "";
   let turnCount = 0;
   let latestTurnUpdatedAt = "";
+  let latestCheckpoint = 0;
   const roomTitles: Array<[string, string]> = [];
   for (const room of snapshot.rooms) {
     let hasAgentTurn = false;
@@ -24,15 +25,16 @@ export function getAgentHistoryVersion(snapshot: WorkspaceSnapshot, agentId: str
       hasAgentTurn = true;
       turnCount += 1;
       if (turn.updatedAt > latestTurnUpdatedAt) latestTurnUpdatedAt = turn.updatedAt;
+      latestCheckpoint = Math.max(latestCheckpoint, checkpoints[turn.id] ?? 0);
     }
     if (hasAgentTurn) roomTitles.push([room.id, room.title]);
   }
   roomTitles.sort(([left], [right]) => left.localeCompare(right));
-  return JSON.stringify([agentUpdatedAt, turnCount, latestTurnUpdatedAt, roomTitles]);
+  return JSON.stringify([agentUpdatedAt, turnCount, latestTurnUpdatedAt, latestCheckpoint, roomTitles]);
 }
 
-export function WorkspaceShell({ initialSnapshot }: { initialSnapshot: WorkspaceSnapshot }) {
-  const workspace = useWorkspace(initialSnapshot);
+export function WorkspaceShell({ initialSnapshot, initialEventCursor }: { initialSnapshot: WorkspaceSnapshot; initialEventCursor: number }) {
+  const workspace = useWorkspace(initialSnapshot, initialEventCursor);
   const [activeRoomId, setActiveRoomId] = useState(initialSnapshot.rooms.find((room) => !room.archivedAt)?.id ?? initialSnapshot.rooms[0]?.id ?? "");
   const [activeAgentId, setActiveAgentId] = useState<string | null>(null);
   const [consoleOpen, setConsoleOpen] = useState(true);
@@ -42,7 +44,7 @@ export function WorkspaceShell({ initialSnapshot }: { initialSnapshot: Workspace
   const [navOpen, setNavOpen] = useState(false);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const room = useMemo(() => workspace.snapshot.rooms.find((item) => item.id === activeRoomId) ?? workspace.snapshot.rooms[0], [activeRoomId, workspace.snapshot.rooms]);
-  const activeAgentHistoryVersion = useMemo(() => getAgentHistoryVersion(workspace.snapshot, activeAgentId), [activeAgentId, workspace.snapshot]);
+  const activeAgentHistoryVersion = useMemo(() => getAgentHistoryVersion(workspace.snapshot, activeAgentId, workspace.agentHistoryCheckpoints), [activeAgentId, workspace.agentHistoryCheckpoints, workspace.snapshot]);
 
   useEffect(() => {
     const saved = localStorage.getItem("oceanking-theme"); const next = saved === "light" ? "light" : "dark";
@@ -84,7 +86,7 @@ export function WorkspaceShell({ initialSnapshot }: { initialSnapshot: Workspace
           <button className="icon-button desktop-only" onClick={() => setConsoleOpen(false)} aria-label="关闭 Console"><PanelRightClose size={17} /></button>
           <button className="icon-button mobile-only" onClick={() => setMobileView("room")} aria-label="返回房间"><X size={18} /></button>
         </div>
-        {activeAgentId ? <AgentConversationPanel agentId={activeAgentId} historyVersion={activeAgentHistoryVersion} /> : <ConsolePanel room={room} previews={workspace.previews} />}
+        {activeAgentId ? <AgentConversationPanel agentId={activeAgentId} historyVersion={activeAgentHistoryVersion} previews={workspace.previews} /> : <ConsolePanel room={room} previews={workspace.previews} />}
       </aside> : <button className="console-reopen desktop-only" onClick={() => setConsoleOpen(true)} aria-label="打开 Console"><PanelRightOpen size={18} /></button>}
 
       {workspace.error ? <div className="toast" role="status"><span>{workspace.error}</span><button onClick={() => workspace.setError(null)}><X size={15} /></button></div> : null}

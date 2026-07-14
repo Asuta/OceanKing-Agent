@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { runAgentModel } from "@/lib/server/model-runtime";
+import { eventsAfterId, resetWorkspaceEventHistory } from "@/lib/server/events";
 import { getToolDefinition, listToolDefinitions } from "@/lib/server/tools";
 import { commandBase, packetFor, sendUser, withRepository } from "./helpers";
 
@@ -10,6 +11,24 @@ describe("Agent runtime 与 canonical tools", () => {
       sendUser(repository, "room_harbor", "请处理这个任务"); const packet = packetFor(repository); const agent = repository.getAgent("navigator")!;
       const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_mock", signal: new AbortController().signal });
       expect(result.assistantContent).toContain("私有执行区"); expect(result.effects[0]?.type).toBe("send_message"); expect(result.tools[0]?.name).toBe("send_message_to_room");
+    } finally { if (original) process.env.OPENAI_API_KEY = original; }
+  }));
+
+  it("持久化运行中检查点后发布 Agent 历史刷新事件", async () => withRepository(async (repository) => {
+    const original = process.env.OPENAI_API_KEY; delete process.env.OPENAI_API_KEY;
+    try {
+      sendUser(repository, "room_harbor", "持续更新执行历史");
+      const packet = packetFor(repository); const agent = repository.getAgent("navigator")!;
+      repository.beginTurn({ turnId: "turn_history_live", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+      resetWorkspaceEventHistory();
+
+      await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_history_live", signal: new AbortController().signal });
+
+      expect(eventsAfterId(0)).toContainEqual(expect.objectContaining({
+        type: "turn.preview",
+        entityId: "turn_history_live",
+        payload: { kind: "history_checkpoint" },
+      }));
     } finally { if (original) process.env.OPENAI_API_KEY = original; }
   }));
 

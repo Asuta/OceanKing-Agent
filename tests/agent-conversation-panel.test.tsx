@@ -16,7 +16,7 @@ describe("Agent 全局底层对话面板", () => {
       turns: [{
         id: "turn_one", roomId: "room_one", roomTitle: "测试房间", agentId: "navigator", agentParticipantId: "participant_one",
         userEnvelope: { type: "scheduler_packet", room: { id: "room_one", title: "测试房间" }, targetMessageId: "message_one", cutoffSeq: 1, sender: { id: "human", name: "你" }, messages: [{ id: "message_one", seq: 1, content: "请检查记录", source: "user", kind: "user_input", attachments: [] }], connectedRooms: [], availableAgents: [] },
-        anchorMessageId: "message_one", assistantContent: "检查完成", systemPrompt: "先调查，再回答", emittedMessageIds: [], status: "completed", modelMeta: { format: "chat_completions" }, error: null, createdAt, updatedAt: createdAt, timeline: [],
+        anchorMessageId: "message_one", assistantContent: "检查完成", systemPrompt: "先调查，再回答", emittedMessageIds: [], status: "running", modelMeta: { format: "chat_completions" }, error: null, createdAt, updatedAt: createdAt, timeline: [],
         messages: [
           { role: "user", content: "底层输入正文" },
           { role: "assistant", content: null, reasoning_content: "先读取历史", tool_calls: [{ id: "call_one", type: "function", function: { name: "read_room_history", arguments: "{\"roomId\":\"room_one\"}" } }] },
@@ -34,11 +34,13 @@ describe("Agent 全局底层对话面板", () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify(history), { status: 200, headers: { "content-type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const { container, rerender } = render(<AgentConversationPanel agentId="navigator" historyVersion="navigator-v1" />);
+    const { container, rerender } = render(<AgentConversationPanel agentId="navigator" historyVersion="navigator-v1" previews={{ turn_one: "检查完成正在继续" }} />);
 
     expect(await screen.findByText("请检查记录")).toBeTruthy();
     expect(screen.getByText("更早的输入")).toBeTruthy();
     expect(screen.getByText("先读取历史")).toBeTruthy();
+    expect(screen.getByLabelText("Agent 实时输出")).toBeTruthy();
+    expect(screen.getByText("正在继续")).toBeTruthy();
     const toolReturn = screen.getByRole("group", { name: "工具返回 call_one" }) as HTMLDetailsElement;
     const toolReturnToggle = toolReturn.querySelector("summary");
     expect(toolReturn.open).toBe(false);
@@ -55,15 +57,29 @@ describe("Agent 全局底层对话面板", () => {
     expect(screen.getByText("实际执行完成")).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith("/api/agents/navigator/conversation", expect.objectContaining({ cache: "no-store" }));
 
-    rerender(<AgentConversationPanel agentId="navigator" historyVersion="navigator-v1" />);
+    const panel = container.querySelector(".agent-conversation-panel") as HTMLDivElement;
+    Object.defineProperties(panel, {
+      scrollHeight: { configurable: true, value: 1_000 },
+      clientHeight: { configurable: true, value: 300 },
+    });
+    panel.scrollTop = 700;
+    fireEvent.scroll(panel);
+    rerender(<AgentConversationPanel agentId="navigator" historyVersion="navigator-v1" previews={{ turn_one: "检查完成正在继续更新" }} />);
+    expect(panel.scrollTop).toBe(1_000);
+    panel.scrollTop = 100;
+    fireEvent.scroll(panel);
+    rerender(<AgentConversationPanel agentId="navigator" historyVersion="navigator-v1" previews={{ turn_one: "检查完成正在继续更新更多" }} />);
+    expect(panel.scrollTop).toBe(100);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    rerender(<AgentConversationPanel agentId="navigator" historyVersion="navigator-v2" />);
+    history.turns[0]!.assistantContent = "检查完成正在继续更新更多";
+    rerender(<AgentConversationPanel agentId="navigator" historyVersion="navigator-v2" previews={{ turn_one: "检查完成正在继续更新更多" }} />);
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByLabelText("Agent 实时输出")).toBeNull());
   });
 
   it("无关工作区变更不会改变选中 Agent 的历史版本", () => {
-    const selectedTurn = { agentId: "navigator", updatedAt: "2026-07-13T10:00:00.000Z" };
-    const otherTurn = { agentId: "builder", updatedAt: "2026-07-13T11:00:00.000Z" };
+    const selectedTurn = { id: "turn_selected", agentId: "navigator", updatedAt: "2026-07-13T10:00:00.000Z" };
+    const otherTurn = { id: "turn_other", agentId: "builder", updatedAt: "2026-07-13T11:00:00.000Z" };
     const snapshot = {
       revision: 1,
       agents: [{ id: "navigator", updatedAt: "2026-07-13T09:00:00.000Z" }, { id: "builder", updatedAt: "2026-07-13T09:00:00.000Z" }],
@@ -77,6 +93,8 @@ describe("Agent 全局底层对话面板", () => {
     };
 
     expect(getAgentHistoryVersion(unrelatedChange, "navigator")).toBe(initialVersion);
+    expect(getAgentHistoryVersion(snapshot, "navigator", { turn_other: 20 })).toBe(initialVersion);
+    expect(getAgentHistoryVersion(snapshot, "navigator", { turn_selected: 21 })).not.toBe(initialVersion);
     expect(getAgentHistoryVersion({ ...snapshot, rooms: [{ ...snapshot.rooms[0]!, turns: [{ ...snapshot.rooms[0]!.turns[0]!, updatedAt: "2026-07-13T12:00:00.000Z" }] }] }, "navigator")).not.toBe(initialVersion);
   });
 });

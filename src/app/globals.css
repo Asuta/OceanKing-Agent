@@ -267,6 +267,8 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .agent-raw-details[open] summary { border-bottom: 1px solid var(--line); }
 .agent-conversation-message.assistant-message { background: var(--panel-soft); }
 .agent-conversation-message.tool-message { border-color: color-mix(in srgb, var(--warning) 25%, var(--line)); }
+.agent-live-message .agent-answer { grid-template-columns: minmax(0, 1fr) auto; align-items: end; border-bottom: 0; }
+.agent-live-message .stream-cursor { margin-bottom: 2px; }
 .agent-tool-return > summary { cursor: pointer; list-style: none; }
 .agent-tool-return > summary::-webkit-details-marker { display: none; }
 .agent-tool-return > summary svg { flex: 0 0 auto; transition: transform .16s ease; }

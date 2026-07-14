@@ -364,15 +364,18 @@ export class WorkspaceRepository {
     }); tx();
   }
 
-  checkpointTurn(args: { turnId: string; assistantContent: string; systemPrompt: string; conversationMessages: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[] }): void {
+  checkpointTurn(args: { turnId: string; assistantContent: string; systemPrompt: string; conversationMessages: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[] }): boolean {
+    let persisted = false;
     const tx = this.raw.transaction(() => {
       const turn = this.raw.prepare("SELECT 1 found FROM agent_turns WHERE id=?").get(args.turnId) as Row | undefined;
       if (!turn) return;
       this.persistTurnTrace(args.turnId, args.tools, args.timeline);
       this.raw.prepare("UPDATE agent_turns SET assistant_content=?,system_prompt=?,conversation_json=? WHERE id=?")
         .run(args.assistantContent, args.systemPrompt, JSON.stringify(args.conversationMessages), args.turnId);
+      persisted = true;
     });
     tx();
+    return persisted;
   }
 
   finishTurn(args: { turnId: string; assistantContent: string; systemPrompt?: string; sessionMessages?: AgentSessionMessage[]; auditMessages?: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; contextCompaction?: ContextCompaction; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; triggerRoomIds: string[]; superseded: boolean } {

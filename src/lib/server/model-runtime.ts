@@ -728,7 +728,7 @@ async function runMock(args: RunArgs): Promise<ModelTurnResult> {
 }
 
 function checkpointTurn(args: RunArgs, system: string, assistantContent: string, auditMessages: AgentSessionMessage[], tools: ToolExecution[], timeline: TimelineEvent[]): void {
-  args.repository.checkpointTurn({
+  const persisted = args.repository.checkpointTurn({
     turnId: args.turnId,
     assistantContent,
     systemPrompt: system,
@@ -736,6 +736,7 @@ function checkpointTurn(args: RunArgs, system: string, assistantContent: string,
     tools,
     timeline,
   });
+  if (persisted) publishWorkspaceEvent("turn.preview", args.turnId, { kind: "history_checkpoint" }, args.repository.getVersion().revision);
 }
 
 export async function runAgentModel(args: RunArgs): Promise<ModelTurnResult> {
