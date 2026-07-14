@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsDialog } from "@/components/workspace/settings-dialog";
 import type { WorkspaceSnapshot } from "@/lib/domain/types";
+import { workspaceCommandSchema } from "@/lib/domain/schemas";
 
 afterEach(cleanup);
 
@@ -52,6 +53,25 @@ describe("工作台设置", () => {
     fireEvent.change(screen.getByRole("spinbutton", { name: "上下文压缩阈值（K Token）" }), { target: { value: "1" } });
 
     expect((screen.getByRole("button", { name: "保存全局模型设置" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("最大工具步骤允许设置到 256 且拒绝更大的值", async () => {
+    const sendCommand = vi.fn().mockResolvedValue(true);
+    render(<SettingsDialog snapshot={snapshot} busy={false} sendCommand={sendCommand} onReset={vi.fn()} onClose={vi.fn()} />);
+
+    const maxToolSteps = screen.getByRole("spinbutton", { name: "最大工具步骤" }) as HTMLInputElement;
+    expect(maxToolSteps.max).toBe("256");
+    fireEvent.change(maxToolSteps, { target: { value: "256" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存全局模型设置" }));
+    await waitFor(() => expect(sendCommand).toHaveBeenCalledWith(expect.objectContaining({ maxToolSteps: 256 })));
+
+    const baseCommand = {
+      commandId: crypto.randomUUID(), expectedVersion: 0, type: "update_settings" as const,
+      model: "test-model", availableModels: ["test-model"], apiFormat: "chat_completions" as const,
+      contextTokenThreshold: 100_000, maxRoomRounds: 32, projectContextRoots: [],
+    };
+    expect(workspaceCommandSchema.safeParse({ ...baseCommand, maxToolSteps: 256 }).success).toBe(true);
+    expect(workspaceCommandSchema.safeParse({ ...baseCommand, maxToolSteps: 257 }).success).toBe(false);
   });
 
   it("重置工作台需要二次确认，成功后返回初始房间视图", async () => {
