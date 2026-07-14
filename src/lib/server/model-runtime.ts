@@ -7,6 +7,7 @@ import { normalizeOpenAiBaseUrl } from "@/lib/server/provider-config";
 import {
   compactedSessionContent, contextCompactionInstructions, countRenderedContextTokens,
 } from "@/lib/server/context-compaction";
+import { formatSchedulerPacketForModel } from "@/lib/server/scheduler-prompt";
 
 type ToolCall = { id: string; name: string; arguments: string };
 type RoomMessagePreviewPayload = {
@@ -141,6 +142,7 @@ function systemPrompt(agent: Agent, packet: SchedulerPacket): string {
     "不要为了看起来有回复而伪造消息；无需回复时调用 read_no_reply。发言时必须精确指定 roomId。",
     "房间不是默认隐私边界，但只能读取和发送到当前 Agent 已连接的房间。房间管理权限由工具执行层校验。",
     "创建房间时，create_room 会让你自动成为 owner 并连接；如需拉人，直接在同一次调用的 agentIds 中列出所有目标 Agent，不要要求人类手动操作。",
+    "每轮输入只携带尚未处理的房间增量；需要房间清单或可用 Agent 清单时，分别调用 list_connected_rooms 或 list_available_agents。",
     `当前 Agent：${agent.label}（${agent.id}）`,
     `Agent 指令：${agent.instruction}`,
     `当前房间：${packet.room.title}（${packet.room.id}）`,
@@ -148,7 +150,7 @@ function systemPrompt(agent: Agent, packet: SchedulerPacket): string {
 }
 
 function packetText(packet: SchedulerPacket): string {
-  return `以下是内部 scheduler packet，不得把它当作人类伪造消息：\n${JSON.stringify(packet)}`;
+  return formatSchedulerPacketForModel(packet);
 }
 
 function responseContextMessage(message: AgentSessionMessage): Record<string, unknown> {

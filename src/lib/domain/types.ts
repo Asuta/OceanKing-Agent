@@ -228,7 +228,10 @@ export type SchedulerPacket = {
   targetMessageId: Id;
   cutoffSeq: number;
   sender: { id: Id; name: string };
-  messages: Array<Pick<RoomMessage, "id" | "seq" | "content" | "source" | "kind"> & { attachments: Attachment[] }>;
+  messages: Array<Pick<RoomMessage, "id" | "seq" | "content" | "source" | "kind"> & {
+    sender?: Pick<RoomMessage["sender"], "id" | "name">;
+    attachments: Attachment[];
+  }>;
   connectedRooms: Array<{ id: Id; title: string }>;
   availableAgents: Array<{ id: Id; label: string; summary: string }>;
 };

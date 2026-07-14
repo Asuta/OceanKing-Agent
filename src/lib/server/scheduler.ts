@@ -79,7 +79,7 @@ class RoomScheduler {
           type: targets[0]?.sender.id.startsWith("cron:") ? "cron_packet" : "scheduler_packet",
           room: { id: room.id, title: room.title }, targetMessageId: targets.at(-1)?.id ?? targets[0]!.id, cutoffSeq,
           sender: { id: targets.at(-1)?.sender.id ?? "unknown", name: targets.at(-1)?.sender.name ?? "未知" },
-          messages: targets.map((message) => ({ id: message.id, seq: message.seq, content: message.content, source: message.source, kind: message.kind, attachments: message.attachments })),
+          messages: targets.map((message) => ({ id: message.id, seq: message.seq, sender: { id: message.sender.id, name: message.sender.name }, content: message.content, source: message.source, kind: message.kind, attachments: message.attachments })),
           connectedRooms: connected.map(({ id, title }) => ({ id, title })),
           availableAgents: this.repository.getSnapshot().agents.map(({ id, label, summary }) => ({ id, label, summary })),
         };

@@ -82,6 +82,25 @@ describe("OceanKing 领域仓库", () => {
     expect(room.turns.at(-1)?.emittedMessageIds).toEqual([]);
   }));
 
+  it("完整调度包保留在 Turn 审计中，会话历史只保存精简增量", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "请检查本轮输入");
+    const packet = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_compact_packet", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    repository.finishTurn({ turnId: "turn_compact_packet", assistantContent: "已检查", tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+
+    const sessionInput = repository.getAgentSession("navigator")[0];
+    expect(sessionInput).toMatchObject({ role: "user" });
+    expect(sessionInput?.content).toContain("[内部房间调度增量]");
+    expect(sessionInput?.content).toContain("请检查本轮输入");
+    expect(sessionInput?.content).not.toContain("connectedRooms");
+    expect(sessionInput?.content).not.toContain("availableAgents");
+
+    const turn = repository.getAgentConversation("navigator")!.turns.find((entry) => entry.id === "turn_compact_packet")!;
+    expect(turn.userEnvelope.connectedRooms).toEqual(packet.connectedRooms);
+    expect(turn.userEnvelope.availableAgents).toEqual(packet.availableAgents);
+    expect(turn.messages[0]).toEqual(sessionInput);
+  }));
+
   it("按 Agent 汇总跨房间底层输入、推理、回复与工具命令", async () => withRepository((repository) => {
     sendUser(repository, "room_harbor", "分析港湾任务");
     const firstPacket = packetFor(repository);

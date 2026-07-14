@@ -78,6 +78,9 @@ describe("OpenAI 兼容协议", () => {
     expect(result.assistantContent).toBe("只进入 Console"); expect(result.modelMeta.format).toBe("responses"); expect(result.effects).toEqual([]);
     expect(result.modelMeta.modelCalls).toEqual([expect.objectContaining({ index: 1, format: "responses", purpose: "generation", inputTokens: 10, cachedInputTokens: 6, cacheMissInputTokens: 4, outputTokens: 3, totalTokens: 13, cacheHitRate: 0.6 })]);
     expect(sentBody?.input.some((item) => item.content === "需要跨轮保留")).toBe(true);
+    expect(sentBody?.input.at(-1)?.content).toContain("[内部房间调度增量]");
+    expect(sentBody?.input.at(-1)?.content).not.toContain("connectedRooms");
+    expect(sentBody?.input.at(-1)?.content).not.toContain("availableAgents");
     expect(sentBody?.thinking).toEqual({ type: "disabled" });
   }));
 
@@ -144,6 +147,9 @@ describe("OpenAI 兼容协议", () => {
     await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_full_history", signal: new AbortController().signal });
     expect(sentMessages).toHaveLength(16);
     expect(sentMessages.some((message) => message.content === "完整历史结果 0")).toBe(true);
+    expect(sentMessages.at(-1)?.content).toContain("[内部房间调度增量]");
+    expect(sentMessages.at(-1)?.content).not.toContain("connectedRooms");
+    expect(sentMessages.at(-1)?.content).not.toContain("availableAgents");
   }));
 
   it("上下文超过 Token 阈值时先整体压缩，再持久化压缩上下文并继续请求", async () => withRepository(async (repository) => {

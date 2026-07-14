@@ -25,7 +25,7 @@ export function packetFor(repository: WorkspaceRepository, roomId = "room_harbor
   return {
     type: "scheduler_packet", room: { id: room.id, title: room.title }, targetMessageId: target.id, cutoffSeq: target.seq,
     sender: { id: target.sender.id, name: target.sender.name },
-    messages: [{ id: target.id, seq: target.seq, content: target.content, source: target.source, kind: target.kind, attachments: target.attachments }],
+    messages: [{ id: target.id, seq: target.seq, sender: { id: target.sender.id, name: target.sender.name }, content: target.content, source: target.source, kind: target.kind, attachments: target.attachments }],
     connectedRooms: snapshot.rooms.filter((entry) => entry.participants.some((participant) => participant.agentId === "navigator")).map(({ id, title }) => ({ id, title })),
     availableAgents: snapshot.agents.map(({ id, label, summary }) => ({ id, label, summary })),
   };

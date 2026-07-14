@@ -8,6 +8,7 @@ import type {
 } from "@/lib/domain/types";
 import { getDatabase, type DatabaseHandle } from "@/lib/server/db/client";
 import { compactedSessionContent } from "@/lib/server/context-compaction";
+import { formatSchedulerPacketForModel } from "@/lib/server/scheduler-prompt";
 import { createId, nowIso } from "@/lib/utils/id";
 import { normalizeOpenAiBaseUrl, normalizeRuntimeSettings } from "@/lib/server/provider-config";
 
@@ -390,7 +391,7 @@ export class WorkspaceRepository {
       const packet = parseJson<SchedulerPacket>(turn.user_envelope_json, {} as SchedulerPacket);
       const completedMessages = args.sessionMessages ?? (args.contextCompaction
         ? [{ role: "user" as const, content: compactedSessionContent(args.contextCompaction.summary) }, { role: "assistant" as const, content: args.assistantContent }]
-        : [{ role: "user" as const, content: JSON.stringify(packet) }, { role: "assistant" as const, content: args.assistantContent }]);
+        : [{ role: "user" as const, content: formatSchedulerPacketForModel(packet) }, { role: "assistant" as const, content: args.assistantContent }]);
       this.raw.prepare("UPDATE agent_turns SET assistant_content=?,system_prompt=?,conversation_json=?,emitted_message_ids_json=?,status=?,model_meta_json=?,error=NULL,updated_at=? WHERE id=?")
         .run(args.assistantContent, args.systemPrompt ?? "", JSON.stringify(args.auditMessages ?? completedMessages), JSON.stringify(emittedMessageIds), status, JSON.stringify(args.modelMeta), at, args.turnId);
       const session = this.raw.prepare("SELECT history_json FROM agent_sessions WHERE agent_id=?").get(agentId) as Row;

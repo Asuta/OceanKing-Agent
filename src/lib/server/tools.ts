@@ -123,6 +123,13 @@ const tools: ToolDefinition[] = [
     execute: async (context) => { const result = connectedRooms(context).map((room) => ({ id: room.id, title: room.title, members: room.participants.length, messages: room.messages.length })); return noEffects(JSON.stringify(result), result); },
   },
   {
+    name: "list_available_agents", description: "按需列出可邀请或协作的 Agent 信息卡。", schema: z.object({}), parameters: { type: "object", additionalProperties: false, properties: {} },
+    execute: async (context) => {
+      const result = context.repository.getSnapshot().agents.map(({ id, label, summary }) => ({ id, label, summary, current: id === context.agent.id }));
+      return noEffects(JSON.stringify(result), result);
+    },
+  },
+  {
     name: "read_room_history", description: "按需读取一个已连接房间的近期公开消息。", schema: z.object({ roomId: z.string(), limit: z.number().int().min(1).max(100).default(30) }),
     parameters: { type: "object", additionalProperties: false, required: ["roomId"], properties: { roomId: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: 100 } } },
     execute: async (context, raw) => { const args = z.object({ roomId: z.string(), limit: z.number().int().min(1).max(100).default(30) }).parse(raw); const room = requireConnectedRoom(context, args.roomId); const result = room.messages.slice(-args.limit).map(({ id, seq, sender, content, createdAt }) => ({ id, seq, sender, content, createdAt })); return noEffects(JSON.stringify(result), result); },

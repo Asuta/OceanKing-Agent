@@ -38,8 +38,23 @@ describe("Agent runtime 与 canonical tools", () => {
 
   it("工具注册表包含房间、工作区、基础与 Cron 能力", () => {
     const names = new Set(listToolDefinitions().map((tool) => tool.name));
-    for (const name of ["send_message_to_room", "read_no_reply", "read_room_history", "workspace_read", "workspace_write", "shell", "web_fetch", "create_cron_job"]) expect(names.has(name)).toBe(true);
+    for (const name of ["send_message_to_room", "read_no_reply", "list_available_agents", "read_room_history", "workspace_read", "workspace_write", "shell", "web_fetch", "create_cron_job"]) expect(names.has(name)).toBe(true);
   });
+
+  it("按需返回可协作 Agent 信息卡，不依赖 scheduler packet 携带清单", async () => withRepository(async (repository) => {
+    const packet = packetFor(repository);
+    const agent = repository.getAgent("navigator")!;
+    const result = await getToolDefinition("list_available_agents")!.execute(
+      { agent, roomId: "room_harbor", agentParticipantId: "participant_navigator_harbor", packet, repository, signal: new AbortController().signal },
+      {},
+      "tool_list_agents",
+    );
+
+    expect(result.structured).toEqual([
+      expect.objectContaining({ id: "navigator", label: "领航员", current: true }),
+      expect.objectContaining({ id: "builder", label: "执行者", current: false }),
+    ]);
+  }));
 
   it("创建房间时当前 Agent 自动连接并原子邀请多个 Agent", async () => withRepository(async (repository) => {
     sendUser(repository, "room_harbor", "创建自由讨论房间并邀请执行者");
