@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { Agent, CronJob, SchedulerPacket, ToolExecutionResult, TurnEffect } from "@/lib/domain/types";
 import { readNoReplyToolSchema, sendMessageToolSchema } from "@/lib/domain/schemas";
 import { WorkspaceRepository } from "@/lib/server/repository";
+import { extractWebContent, isSupportedWebContentType, limitWebContentTokens, readLimitedResponseText } from "@/lib/server/web-content";
 import { createId, nowIso } from "@/lib/utils/id";
 
 export type ToolContext = {
@@ -182,9 +183,29 @@ const tools: ToolDefinition[] = [
     execute: async (context, raw) => { const { command } = z.object({ command: z.string().min(1).max(100_000) }).parse(raw); const result = await runShell(command, context.signal); const text = [result.stdout, result.stderr].filter(Boolean).join("\n"); return noEffects(text || `进程退出码 ${result.exitCode}`, result); },
   },
   {
-    name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面文本，拒绝本机与内网地址。", schema: z.object({ url: z.string().url() }),
+    name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面文本；HTML 会提取正文并限制返回长度，拒绝本机、内网与二进制内容。", schema: z.object({ url: z.string().url() }),
     parameters: { type: "object", additionalProperties: false, required: ["url"], properties: { url: { type: "string", format: "uri" } } },
-    execute: async (context, raw) => { const { url: rawUrl } = z.object({ url: z.string().url() }).parse(raw); const url = await assertPublicUrl(rawUrl); const response = await fetch(url, { signal: context.signal, redirect: "follow", headers: { "user-agent": "OceanKing/1.0" } }); const text = (await response.text()).slice(0, 200_000); return noEffects(text, { url: response.url, status: response.status, contentType: response.headers.get("content-type") }); },
+    execute: async (context, raw) => {
+      const { url: rawUrl } = z.object({ url: z.string().url() }).parse(raw);
+      const url = await assertPublicUrl(rawUrl);
+      const response = await fetch(url, { signal: context.signal, redirect: "follow", headers: { "user-agent": "OceanKing/1.0" } });
+      const contentType = response.headers.get("content-type");
+      if (!isSupportedWebContentType(contentType)) throw new Error(`不支持的网页内容类型：${contentType}`);
+      const body = await readLimitedResponseText(response);
+      const extracted = extractWebContent(body.text, contentType, response.url || url.href);
+      const limited = limitWebContentTokens(extracted.text);
+      return noEffects(limited.text, {
+        url: response.url || url.href,
+        status: response.status,
+        contentType,
+        bytes: body.bytes,
+        title: extracted.title,
+        extraction: extracted.extraction,
+        tokens: limited.tokenCount,
+        originalTokens: limited.originalTokenCount,
+        truncated: limited.truncated,
+      });
+    },
   },
   {
     name: "read_project_context", description: "读取设置中显式登记项目根目录内的文本文件。", schema: z.object({ root: z.string(), path: z.string() }),

@@ -234,6 +234,47 @@ describe("OpenAI 兼容协议", () => {
     expectProgressivePreview(previewContents, completeContent);
   }));
 
+  it.each(["chat_completions", "responses"] as const)("%s 的工具续轮只接收 web_fetch 清理后的正文", async (apiFormat) => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const pageUrl = "https://93.184.216.34/reports/tide";
+    const html = `<!doctype html><html><head><title>潮汐报告</title></head><body>
+      <nav>${"无效导航".repeat(200)}</nav><script>window.noise = "无效脚本";</script>
+      <article><h1>潮汐报告</h1><p>${"有效正文：潮汐数据保持稳定。".repeat(30)}</p></article>
+      <footer>${"无效页脚".repeat(200)}</footer></body></html>`;
+    const modelBodies: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input) === pageUrl) return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+      modelBodies.push(requestBody(init));
+      if (modelBodies.length === 1 && apiFormat === "chat_completions") return sse([
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_web_chat", function: { name: "web_fetch", arguments: JSON.stringify({ url: pageUrl }) } }] } }] },
+        "[DONE]",
+      ]);
+      if (modelBodies.length === 1) return sse([
+        { type: "response.output_item.added", item: { id: "item_web", call_id: "call_web_responses", type: "function_call", name: "web_fetch", arguments: "" } },
+        { type: "response.output_item.done", item: { id: "item_web", call_id: "call_web_responses", type: "function_call", name: "web_fetch", arguments: JSON.stringify({ url: pageUrl }) } },
+        { type: "response.completed", response: { id: "resp_web_tool" } },
+        "[DONE]",
+      ]);
+      return apiFormat === "chat_completions"
+        ? sse([{ choices: [{ delta: { content: "已读取精简正文" } }] }, "[DONE]"])
+        : sse([{ type: "response.output_text.delta", delta: "已读取精简正文" }, { type: "response.completed", response: { id: "resp_web_done" } }, "[DONE]"]);
+    }));
+
+    sendUser(repository, "room_harbor", "读取网页正文");
+    const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat, maxToolSteps: 1 } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: `turn_web_${apiFormat}`, signal: new AbortController().signal });
+
+    expect(result.tools[0]?.outputText).toContain("有效正文");
+    expect(result.tools[0]?.outputText).not.toMatch(/无效导航|无效脚本|无效页脚/);
+    expect(modelBodies).toHaveLength(2);
+    const continuationText = apiFormat === "chat_completions"
+      ? ((modelBodies[1]?.messages as Array<{ role?: string; content?: string }>).find((message) => message.role === "tool")?.content ?? "")
+      : String((modelBodies[1]?.input as Array<{ type?: string; output?: string }>).find((item) => item.type === "function_call_output")?.output ?? "");
+    expect(continuationText).toContain("有效正文");
+    expect(continuationText).not.toMatch(/无效导航|无效脚本|无效页脚/);
+  }));
+
   it("工具执行后模型续轮失败时仍可从 Turn 审计中还原命令与工具结果", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
     let requestCount = 0;
