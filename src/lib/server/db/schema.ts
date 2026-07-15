@@ -49,6 +49,11 @@ export const schedulerStates = sqliteTable("scheduler_states", {
 export const agentSessions = sqliteTable("agent_sessions", {
   agentId: text("agent_id").primaryKey(), historyJson: text("history_json").notNull(), activeTurnId: text("active_turn_id"), updatedAt: text("updated_at").notNull(),
 });
+export const turnHandoffs = sqliteTable("turn_handoffs", {
+  sourceTurnId: text("source_turn_id").primaryKey(), agentId: text("agent_id").notNull(), sourceRoomId: text("source_room_id").notNull(),
+  sourceParticipantId: text("source_participant_id").notNull(), cutoffSeq: integer("cutoff_seq").notNull(), targetRoomId: text("target_room_id").notNull(),
+  targetTurnId: text("target_turn_id"), deliveryOnly: integer("delivery_only", { mode: "boolean" }).notNull().default(false), createdAt: text("created_at").notNull(),
+});
 export const cronJobs = sqliteTable("cron_jobs", {
   id: text("id").primaryKey(), agentId: text("agent_id").notNull(), roomId: text("room_id").notNull(), name: text("name").notNull(), schedule: text("schedule").notNull(), timezone: text("timezone").notNull(),
   prompt: text("prompt").notNull(), enabled: integer("enabled", { mode: "boolean" }).notNull(), lastRunAt: text("last_run_at"), nextRunAt: text("next_run_at"), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),

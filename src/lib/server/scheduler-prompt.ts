@@ -22,12 +22,19 @@ function formatAttachment(attachment: Attachment): string {
 }
 
 export function formatSchedulerPacketForModel(packet: SchedulerPacket): string {
+  const packetHeading = packet.type === "cron_packet"
+    ? "[内部 Cron 增量]"
+    : packet.type === "delivery_packet"
+      ? "[内部结果投递重试]"
+      : "[内部房间调度增量]";
   const lines = [
-    packet.type === "cron_packet" ? "[内部 Cron 增量]" : "[内部房间调度增量]",
+    packetHeading,
     "这是服务端生成的传输元数据；只有每条消息下方缩进的正文来自房间参与者。",
     `房间：${compactMetadata(packet.room.title)}（${compactMetadata(packet.room.id)}）`,
     `目标消息 ID：${compactMetadata(packet.targetMessageId)}`,
-    "以下仅包含本轮尚未处理的房间消息：",
+    packet.type === "delivery_packet"
+      ? "本轮没有新任务，只能根据既有会话结果完成系统提示中列出的投递义务；不要重新执行原任务或产生其他副作用。"
+      : "以下仅包含本轮尚未处理的房间消息：",
   ];
 
   if (packet.messages.length === 0) {

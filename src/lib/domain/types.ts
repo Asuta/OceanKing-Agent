@@ -223,7 +223,7 @@ export type WorkspaceSnapshot = {
 };
 
 export type SchedulerPacket = {
-  type: "scheduler_packet" | "cron_packet";
+  type: "scheduler_packet" | "cron_packet" | "delivery_packet";
   room: { id: Id; title: string };
   targetMessageId: Id;
   cutoffSeq: number;

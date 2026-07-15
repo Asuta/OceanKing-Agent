@@ -8,6 +8,7 @@ import type {
 } from "@/lib/domain/types";
 import { getDatabase, type DatabaseHandle } from "@/lib/server/db/client";
 import { compactedSessionContent } from "@/lib/server/context-compaction";
+import { buildInterruptedTurnSnapshot } from "@/lib/server/interruption-snapshot";
 import { formatSchedulerPacketForModel } from "@/lib/server/scheduler-prompt";
 import { createId, nowIso } from "@/lib/utils/id";
 import { normalizeOpenAiBaseUrl, normalizeRuntimeSettings } from "@/lib/server/provider-config";
@@ -56,6 +57,13 @@ function normalizeSessionMessage(value: unknown): AgentSessionMessage | null {
     if (toolCalls.length) normalized.tool_calls = toolCalls;
   }
   return normalized;
+}
+
+function hasTerminalRoomDelivery(effects: TurnEffect[], roomId: string, messageId: string): boolean {
+  return effects.some((effect) => {
+    if (effect.type === "send_message") return effect.roomId === roomId && effect.kind !== "progress";
+    return effect.type === "read_no_reply" && effect.roomId === roomId && effect.messageId === messageId;
+  });
 }
 
 export type CommandResult = { snapshot: WorkspaceSnapshot; triggerRoomId?: string; stopRoomId?: string; runCronJobId?: string; refreshCron?: boolean };
@@ -359,6 +367,8 @@ export class WorkspaceRepository {
       this.raw.prepare("INSERT INTO agent_turns(id,room_id,agent_id,agent_participant_id,user_envelope_json,anchor_message_id,assistant_content,emitted_message_ids_json,status,model_meta_json,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'[]','running',NULL,NULL,?,?)")
         .run(args.turnId, args.roomId, args.agentId, args.agentParticipantId, JSON.stringify(args.packet), args.packet.targetMessageId, "", at, at);
       this.raw.prepare("UPDATE agent_sessions SET active_turn_id=?,updated_at=? WHERE agent_id=?").run(args.turnId, at, args.agentId);
+      this.raw.prepare("UPDATE turn_handoffs SET target_turn_id=? WHERE agent_id=? AND target_room_id=? AND (target_turn_id IS NULL OR target_turn_id IN (SELECT id FROM agent_turns WHERE status IN ('error','stopped','continued')))")
+        .run(args.turnId, args.agentId, args.roomId);
       this.raw.prepare("UPDATE scheduler_states SET active_participant_id=?,status='running' WHERE room_id=?").run(args.agentParticipantId, args.roomId);
       this.bump();
     }); tx();
@@ -378,20 +388,36 @@ export class WorkspaceRepository {
     return persisted;
   }
 
-  finishTurn(args: { turnId: string; assistantContent: string; systemPrompt?: string; sessionMessages?: AgentSessionMessage[]; auditMessages?: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; contextCompaction?: ContextCompaction; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; triggerRoomIds: string[]; superseded: boolean } {
+  finishTurn(args: { turnId: string; assistantContent: string; systemPrompt?: string; sessionMessages?: AgentSessionMessage[]; auditMessages?: AgentSessionMessage[]; tools: ToolExecution[]; timeline: TimelineEvent[]; effects: TurnEffect[]; modelMeta: Record<string, unknown>; contextCompaction?: ContextCompaction; cutoffSeq: number; nextParticipantId: string | null; status?: "completed" | "continued" }): { emittedMessageIds: string[]; triggerRoomIds: string[]; continuationRoomIds: string[]; unresolvedRoomIds: string[]; superseded: boolean } {
     const emittedMessageIds: string[] = [];
     const triggerRoomIds = new Set<string>();
+    const continuationRoomIds = new Set<string>();
+    const unresolvedRoomIds = new Set<string>();
     let superseded = false;
     const tx = this.raw.transaction(() => {
       const turn = this.raw.prepare("SELECT * FROM agent_turns WHERE id=?").get(args.turnId) as Row;
       if (!turn) throw new DomainError("Agent turn 不存在");
       const roomId = str(turn.room_id); const agentId = str(turn.agent_id); const participantId = str(turn.agent_participant_id); const at = nowIso();
+      const packet = parseJson<SchedulerPacket>(turn.user_envelope_json, {} as SchedulerPacket);
+      const deliveryOnly = packet.type === "delivery_packet";
+      const currentRoomResolved = deliveryOnly || hasTerminalRoomDelivery(args.effects, roomId, packet.targetMessageId);
+      if (!currentRoomResolved) unresolvedRoomIds.add(roomId);
       this.persistTurnTrace(args.turnId, args.tools, args.timeline);
       for (const effect of args.effects) this.applyEffect(effect, agentId, participantId, emittedMessageIds, triggerRoomIds, at);
       const newer = this.raw.prepare("SELECT 1 found FROM room_messages WHERE room_id=? AND seq>? AND sender_id<>? LIMIT 1").get(roomId, args.cutoffSeq, participantId) as Row | undefined;
       superseded = Boolean(newer);
-      const status = superseded ? "continued" : (args.status ?? "completed");
-      const packet = parseJson<SchedulerPacket>(turn.user_envelope_json, {} as SchedulerPacket);
+      const handoffs = this.settleContinuationHandoffs(args.turnId, args.effects);
+      for (const continuationRoomId of handoffs.roomIds) continuationRoomIds.add(continuationRoomId);
+      for (const unresolvedRoomId of handoffs.unresolvedRoomIds) unresolvedRoomIds.add(unresolvedRoomId);
+      if (!deliveryOnly) {
+        this.advanceParticipantCursor(roomId, participantId, args.cutoffSeq);
+        if (!currentRoomResolved) {
+          this.raw.prepare("INSERT INTO turn_handoffs(source_turn_id,agent_id,source_room_id,source_participant_id,cutoff_seq,target_room_id,target_turn_id,delivery_only,created_at) VALUES(?,?,?,?,?,?,NULL,1,?)")
+            .run(args.turnId, agentId, roomId, participantId, args.cutoffSeq, roomId, at);
+          continuationRoomIds.add(roomId);
+        }
+      }
+      const status = superseded || unresolvedRoomIds.size ? "continued" : (args.status ?? "completed");
       const completedMessages = args.sessionMessages ?? (args.contextCompaction
         ? [{ role: "user" as const, content: compactedSessionContent(args.contextCompaction.summary) }, { role: "assistant" as const, content: args.assistantContent }]
         : [{ role: "user" as const, content: formatSchedulerPacketForModel(packet) }, { role: "assistant" as const, content: args.assistantContent }]);
@@ -400,14 +426,90 @@ export class WorkspaceRepository {
       const session = this.raw.prepare("SELECT history_json FROM agent_sessions WHERE agent_id=?").get(agentId) as Row;
       const history = parseJson<unknown[]>(session.history_json, []).map(normalizeSessionMessage).filter((message): message is AgentSessionMessage => message !== null);
       const nextHistory = args.contextCompaction ? completedMessages : [...history, ...completedMessages];
-      this.raw.prepare("UPDATE agent_sessions SET history_json=?,active_turn_id=NULL,updated_at=? WHERE agent_id=?").run(JSON.stringify(nextHistory), at, agentId);
+      this.raw.prepare("UPDATE agent_sessions SET history_json=?,active_turn_id=CASE WHEN active_turn_id=? THEN NULL ELSE active_turn_id END,updated_at=? WHERE agent_id=?")
+        .run(JSON.stringify(nextHistory), args.turnId, at, agentId);
       const scheduler = this.raw.prepare("SELECT cursor_json,round_count FROM scheduler_states WHERE room_id=?").get(roomId) as Row;
-      const cursors = parseJson<Record<string, number>>(scheduler.cursor_json, {}); cursors[participantId] = args.cutoffSeq;
       this.raw.prepare("UPDATE scheduler_states SET cursor_json=?,next_agent_participant_id=?,active_participant_id=NULL,round_count=?,rerun_requested=? WHERE room_id=?")
-        .run(JSON.stringify(cursors), args.nextParticipantId, num(scheduler.round_count) + 1, superseded ? 1 : 0, roomId);
+        .run(str(scheduler.cursor_json), args.nextParticipantId, num(scheduler.round_count) + 1, superseded ? 1 : 0, roomId);
       this.bump();
     }); tx();
-    return { emittedMessageIds, triggerRoomIds: [...triggerRoomIds], superseded };
+    return { emittedMessageIds, triggerRoomIds: [...triggerRoomIds], continuationRoomIds: [...continuationRoomIds], unresolvedRoomIds: [...unresolvedRoomIds], superseded };
+  }
+
+  private settleContinuationHandoffs(targetTurnId: string, effects: TurnEffect[]): { roomIds: string[]; unresolvedRoomIds: string[] } {
+    const rows = this.raw.prepare("SELECT handoff.source_turn_id,handoff.source_room_id,handoff.source_participant_id,handoff.cutoff_seq,turn.anchor_message_id FROM turn_handoffs handoff JOIN agent_turns turn ON turn.id=handoff.source_turn_id WHERE handoff.target_turn_id=?").all(targetTurnId) as Row[];
+    const roomIds = new Set<string>();
+    const unresolvedRoomIds = new Set<string>();
+    for (const row of rows) {
+      const sourceTurnId = str(row.source_turn_id);
+      const roomId = str(row.source_room_id);
+      roomIds.add(roomId);
+      if (!hasTerminalRoomDelivery(effects, roomId, str(row.anchor_message_id))) {
+        unresolvedRoomIds.add(roomId);
+        this.advanceParticipantCursor(roomId, str(row.source_participant_id), num(row.cutoff_seq));
+        this.raw.prepare("UPDATE turn_handoffs SET target_room_id=source_room_id,target_turn_id=NULL,delivery_only=1 WHERE source_turn_id=?").run(sourceTurnId);
+        continue;
+      }
+      this.advanceParticipantCursor(roomId, str(row.source_participant_id), num(row.cutoff_seq));
+      this.raw.prepare("DELETE FROM turn_handoffs WHERE source_turn_id=?").run(sourceTurnId);
+    }
+    return { roomIds: [...roomIds], unresolvedRoomIds: [...unresolvedRoomIds] };
+  }
+
+  getTurnDeliveryObligations(turnId: string): Array<{ roomId: string; messageId: string }> {
+    const turn = this.raw.prepare("SELECT room_id,anchor_message_id,user_envelope_json FROM agent_turns WHERE id=?").get(turnId) as Row | undefined;
+    if (!turn) return [];
+    const packet = parseJson<SchedulerPacket>(turn.user_envelope_json, {} as SchedulerPacket);
+    const obligations = packet.type === "delivery_packet" ? [] : [{ roomId: str(turn.room_id), messageId: str(turn.anchor_message_id) }];
+    const handoffs = this.raw.prepare("SELECT handoff.source_room_id,turn.anchor_message_id FROM turn_handoffs handoff JOIN agent_turns turn ON turn.id=handoff.source_turn_id WHERE handoff.target_turn_id=?").all(turnId) as Row[];
+    for (const row of handoffs) {
+      const obligation = { roomId: str(row.source_room_id), messageId: str(row.anchor_message_id) };
+      if (!obligations.some((entry) => entry.roomId === obligation.roomId && entry.messageId === obligation.messageId)) obligations.push(obligation);
+    }
+    return obligations;
+  }
+
+  getPendingDeliveryObligations(roomId: string, agentId: string): Array<{ sourceTurnId: string; messageId: string }> {
+    const rows = this.raw.prepare(`SELECT handoff.source_turn_id,source.anchor_message_id
+      FROM turn_handoffs handoff
+      JOIN agent_turns source ON source.id=handoff.source_turn_id
+      LEFT JOIN agent_turns target ON target.id=handoff.target_turn_id
+      WHERE handoff.target_room_id=? AND handoff.agent_id=? AND handoff.delivery_only=1
+        AND (handoff.target_turn_id IS NULL OR target.status IN ('error','stopped','continued'))
+      ORDER BY handoff.created_at`).all(roomId, agentId) as Row[];
+    return rows.map((row) => ({ sourceTurnId: str(row.source_turn_id), messageId: str(row.anchor_message_id) }));
+  }
+
+  failPendingDeliveryObligations(roomId: string, error: string): string[] {
+    const sourceRoomIds = new Set<string>();
+    const tx = this.raw.transaction(() => {
+      const rows = this.raw.prepare(`SELECT handoff.source_turn_id,handoff.source_room_id,handoff.source_participant_id,handoff.cutoff_seq
+        FROM turn_handoffs handoff
+        LEFT JOIN agent_turns target ON target.id=handoff.target_turn_id
+        WHERE handoff.target_room_id=? AND handoff.delivery_only=1
+          AND (handoff.target_turn_id IS NULL OR target.status IN ('error','stopped','continued'))`).all(roomId) as Row[];
+      if (!rows.length) return;
+      const at = nowIso();
+      for (const row of rows) {
+        const sourceTurnId = str(row.source_turn_id);
+        const sourceRoomId = str(row.source_room_id);
+        sourceRoomIds.add(sourceRoomId);
+        this.advanceParticipantCursor(sourceRoomId, str(row.source_participant_id), num(row.cutoff_seq));
+        this.raw.prepare("UPDATE agent_turns SET status='error',error=?,updated_at=? WHERE id=?").run(error, at, sourceTurnId);
+        this.raw.prepare("DELETE FROM turn_handoffs WHERE source_turn_id=?").run(sourceTurnId);
+      }
+      this.bump();
+    });
+    tx();
+    return [...sourceRoomIds];
+  }
+
+  private advanceParticipantCursor(roomId: string, participantId: string, cutoffSeq: number): void {
+    const scheduler = this.raw.prepare("SELECT cursor_json FROM scheduler_states WHERE room_id=?").get(roomId) as Row | undefined;
+    if (!scheduler) return;
+    const cursors = parseJson<Record<string, number>>(scheduler.cursor_json, {});
+    cursors[participantId] = Math.max(cursors[participantId] ?? 0, cutoffSeq);
+    this.raw.prepare("UPDATE scheduler_states SET cursor_json=? WHERE room_id=?").run(JSON.stringify(cursors), roomId);
   }
 
   private persistTurnTrace(turnId: string, tools: ToolExecution[], timeline: TimelineEvent[]): void {
@@ -429,9 +531,11 @@ export class WorkspaceRepository {
       emitted.push(effect.messageId); triggerRooms.add(effect.roomId); return;
     }
     if (effect.type === "read_no_reply") {
+      const membership = this.raw.prepare("SELECT id FROM participants WHERE room_id=? AND agent_id=? AND enabled=1").get(effect.roomId, agentId) as Row | undefined;
+      if (!membership) throw new DomainError("Agent 不能确认未连接房间的消息");
       const message = this.raw.prepare("SELECT id FROM room_messages WHERE id=? AND room_id=?").get(effect.messageId, effect.roomId) as Row | undefined;
       if (!message) throw new DomainError("receipt 目标消息不存在");
-      this.raw.prepare("INSERT OR IGNORE INTO message_receipts(id,message_id,agent_participant_id,created_at) VALUES(?,?,?,?)").run(effect.receiptId, effect.messageId, participantId, at); return;
+      this.raw.prepare("INSERT OR IGNORE INTO message_receipts(id,message_id,agent_participant_id,created_at) VALUES(?,?,?,?)").run(effect.receiptId, effect.messageId, membership.id, at); return;
     }
     if (effect.type === "create_room") {
       const ownerId = createId("participant");
@@ -482,10 +586,118 @@ export class WorkspaceRepository {
       if (!row) return;
       this.raw.prepare("UPDATE agent_turns SET status=?,error=?,model_meta_json=COALESCE(?,model_meta_json),updated_at=? WHERE id=?")
         .run(stopped ? "stopped" : "error", error, modelMeta ? JSON.stringify(modelMeta) : null, at, turnId);
-      this.raw.prepare("UPDATE agent_sessions SET active_turn_id=NULL,updated_at=? WHERE agent_id=?").run(at, row.agent_id);
+      this.raw.prepare("UPDATE agent_sessions SET active_turn_id=NULL,updated_at=? WHERE agent_id=? AND active_turn_id=?").run(at, row.agent_id, turnId);
       this.raw.prepare("UPDATE scheduler_states SET active_participant_id=NULL WHERE room_id=?").run(row.room_id);
       this.bump();
     }); tx();
+  }
+
+  continueInterruptedTurn(turnId: string, reason: string, nextRoomId: string, modelMeta?: Record<string, unknown>): void {
+    const at = nowIso();
+    const tx = this.raw.transaction(() => {
+      const row = this.raw.prepare("SELECT * FROM agent_turns WHERE id=?").get(turnId) as Row | undefined;
+      if (!row || row.status !== "running") return;
+      const toolRows = this.raw.prepare("SELECT * FROM tool_executions WHERE turn_id=? ORDER BY created_at").all(turnId) as Row[];
+      const tools: ToolExecution[] = toolRows.map((tool) => ({
+        id: str(tool.id), turnId: str(tool.turn_id), name: str(tool.name), input: parseJson(tool.input_json, {}), outputText: str(tool.output_text),
+        structuredResult: parseJson(tool.structured_result_json, {}), status: str(tool.status) as ToolExecution["status"], durationMs: num(tool.duration_ms),
+        error: nullableStr(tool.error), createdAt: str(tool.created_at),
+      }));
+      const agentId = str(row.agent_id);
+      const participantId = str(row.agent_participant_id);
+      const packet = parseJson<SchedulerPacket>(row.user_envelope_json, {} as SchedulerPacket);
+      const snapshot = buildInterruptedTurnSnapshot({ packet, assistantContent: str(row.assistant_content), tools, reason });
+      const session = this.raw.prepare("SELECT history_json FROM agent_sessions WHERE agent_id=?").get(agentId) as Row;
+      const history = parseJson<unknown[]>(session.history_json, []).map(normalizeSessionMessage).filter((message): message is AgentSessionMessage => message !== null);
+      const successor = this.raw.prepare("SELECT turn.id FROM agent_sessions session JOIN agent_turns turn ON turn.id=session.active_turn_id WHERE session.agent_id=? AND turn.room_id=? AND turn.status='running' AND turn.id<>?")
+        .get(agentId, nextRoomId, turnId) as Row | undefined;
+      const successorTurnId = successor ? str(successor.id) : null;
+      this.raw.prepare("UPDATE agent_turns SET status='continued',model_meta_json=COALESCE(?,model_meta_json),error=NULL,updated_at=? WHERE id=?")
+        .run(modelMeta ? JSON.stringify(modelMeta) : null, at, turnId);
+      this.raw.prepare("UPDATE agent_sessions SET history_json=?,active_turn_id=CASE WHEN active_turn_id=? THEN NULL ELSE active_turn_id END,updated_at=? WHERE agent_id=?")
+        .run(JSON.stringify([...history, { role: "assistant", content: snapshot } satisfies AgentSessionMessage]), turnId, at, agentId);
+      this.raw.prepare("UPDATE turn_handoffs SET target_room_id=?,target_turn_id=? WHERE target_turn_id=?")
+        .run(nextRoomId, successorTurnId, turnId);
+      if (packet.type !== "delivery_packet" && str(row.room_id) !== nextRoomId) {
+        this.raw.prepare("INSERT INTO turn_handoffs(source_turn_id,agent_id,source_room_id,source_participant_id,cutoff_seq,target_room_id,target_turn_id,delivery_only,created_at) VALUES(?,?,?,?,?,?,?,0,?)")
+          .run(turnId, agentId, row.room_id, participantId, packet.cutoffSeq, nextRoomId, successorTurnId, at);
+      }
+      this.raw.prepare("UPDATE scheduler_states SET active_participant_id=CASE WHEN active_participant_id=? THEN NULL ELSE active_participant_id END WHERE room_id=?")
+        .run(participantId, row.room_id);
+      this.bump();
+    });
+    tx();
+  }
+
+  getPendingHandoffCutoff(roomId: string, participantId: string): number | null {
+    const row = this.raw.prepare("SELECT MAX(cutoff_seq) cutoff_seq FROM turn_handoffs WHERE source_room_id=? AND source_participant_id=? AND target_room_id<>source_room_id").get(roomId, participantId) as Row;
+    return row.cutoff_seq === null || row.cutoff_seq === undefined ? null : num(row.cutoff_seq);
+  }
+
+  hasPendingContinuationHandoffs(roomId: string): boolean {
+    return Boolean(this.raw.prepare("SELECT 1 found FROM turn_handoffs WHERE source_room_id=? LIMIT 1").get(roomId));
+  }
+
+  releaseContinuationHandoffs(targetTurnId: string): string[] {
+    const roomIds: string[] = [];
+    const tx = this.raw.transaction(() => {
+      const rows = this.raw.prepare("SELECT DISTINCT source_room_id FROM turn_handoffs WHERE target_turn_id=?").all(targetTurnId) as Row[];
+      roomIds.push(...rows.map((row) => str(row.source_room_id)));
+      if (!roomIds.length) return;
+      this.raw.prepare("UPDATE turn_handoffs SET target_room_id=source_room_id,target_turn_id=NULL WHERE target_turn_id=?").run(targetTurnId);
+      this.bump();
+    });
+    tx();
+    return roomIds;
+  }
+
+  releaseContinuationHandoffsForTargetRoom(targetRoomId: string): string[] {
+    const roomIds: string[] = [];
+    const tx = this.raw.transaction(() => {
+      const rows = this.raw.prepare("SELECT DISTINCT source_room_id FROM turn_handoffs WHERE target_room_id=?").all(targetRoomId) as Row[];
+      roomIds.push(...rows.map((row) => str(row.source_room_id)));
+      if (!roomIds.length) return;
+      this.raw.prepare("UPDATE turn_handoffs SET target_room_id=source_room_id,target_turn_id=NULL WHERE target_room_id=?").run(targetRoomId);
+      this.bump();
+    });
+    tx();
+    return roomIds;
+  }
+
+  cancelContinuationHandoffsForSourceRoom(sourceRoomId: string): Array<{ agentId: string; targetRoomId: string }> {
+    const targets: Array<{ agentId: string; targetRoomId: string }> = [];
+    const tx = this.raw.transaction(() => {
+      const rows = this.raw.prepare("SELECT agent_id,target_room_id FROM turn_handoffs WHERE source_room_id=?").all(sourceRoomId) as Row[];
+      if (!rows.length) return;
+      const room = this.requireRoom(sourceRoomId);
+      const roomLabel = `${str(room.title)}（${sourceRoomId}）`;
+      const agentIds = new Set(rows.map((row) => str(row.agent_id)));
+      for (const agentId of agentIds) {
+        const session = this.raw.prepare("SELECT history_json FROM agent_sessions WHERE agent_id=?").get(agentId) as Row | undefined;
+        if (!session) continue;
+        const history = parseJson<unknown[]>(session.history_json, []).map(normalizeSessionMessage).filter((message): message is AgentSessionMessage => message !== null);
+        const cancellation: AgentSessionMessage = {
+          role: "user",
+          content: `[任务取消通知]\n用户已停止原房间 ${roomLabel}。取消此前从该房间转交的未完成任务，不要再执行其剩余步骤或产生相关副作用；其他房间自身的新任务不受影响。`,
+        };
+        this.raw.prepare("UPDATE agent_sessions SET history_json=?,updated_at=? WHERE agent_id=?")
+          .run(JSON.stringify([...history, cancellation]), nowIso(), agentId);
+      }
+      const uniqueTargets = new Set<string>();
+      for (const row of rows) {
+        const targetRoomId = str(row.target_room_id);
+        if (targetRoomId === sourceRoomId) continue;
+        const agentId = str(row.agent_id);
+        const key = `${agentId}\u0000${targetRoomId}`;
+        if (uniqueTargets.has(key)) continue;
+        uniqueTargets.add(key);
+        targets.push({ agentId, targetRoomId });
+      }
+      this.raw.prepare("DELETE FROM turn_handoffs WHERE source_room_id=?").run(sourceRoomId);
+      this.bump();
+    });
+    tx();
+    return targets;
   }
 
   stopRoomState(roomId: string, at = nowIso()): void {
@@ -497,13 +709,14 @@ export class WorkspaceRepository {
 
   recoverInterruptedRuns(): string[] {
     const rows = this.raw.prepare("SELECT room_id FROM scheduler_states WHERE status='running' OR active_participant_id IS NOT NULL").all() as Row[];
+    const handoffRows = this.raw.prepare("SELECT DISTINCT target_room_id FROM turn_handoffs").all() as Row[];
     const tx = this.raw.transaction(() => {
       const at = nowIso();
       this.raw.prepare("UPDATE agent_turns SET status='error',error='进程重启：运行已恢复为明确错误状态',updated_at=? WHERE status='running'").run(at);
       this.raw.prepare("UPDATE scheduler_states SET status='idle',active_participant_id=NULL,rerun_requested=1 WHERE status='running' OR active_participant_id IS NOT NULL").run();
       this.raw.prepare("UPDATE agent_sessions SET active_turn_id=NULL,updated_at=? WHERE active_turn_id IS NOT NULL").run(at);
       if (rows.length) this.bump();
-    }); tx(); return rows.map((row) => str(row.room_id));
+    }); tx(); return [...new Set([...rows.map((row) => str(row.room_id)), ...handoffRows.map((row) => str(row.target_room_id))])];
   }
 
   getAgentSession(agentId: string): AgentSessionMessage[] {

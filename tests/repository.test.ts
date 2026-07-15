@@ -3,7 +3,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AgentSessionMessage, TurnEffect } from "@/lib/domain/types";
+import type { AgentSessionMessage, ToolExecution, TurnEffect } from "@/lib/domain/types";
 import { createDatabase } from "@/lib/server/db/client";
 import { VersionConflictError, WorkspaceRepository } from "@/lib/server/repository";
 import { commandBase, packetFor, sendUser, withRepository } from "./helpers";
@@ -250,6 +250,27 @@ describe("OceanKing 领域仓库", () => {
     expect(room.messages.at(-1)?.receipts[0]?.agentParticipantId).toBe("participant_navigator_harbor");
   }));
 
+  it("跨房间 read_no_reply 使用目标房间内的 Agent 成员身份", async () => withRepository((repository) => {
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "跨房间回执", agentId: "navigator" });
+    const receiptRoom = repository.getSnapshot().rooms.find((room) => room.title === "跨房间回执")!;
+    const receiptParticipant = receiptRoom.participants.find((participant) => participant.agentId === "navigator")!;
+    const receiptMessage = sendUser(repository, receiptRoom.id, "这条消息已阅即可").snapshot.rooms.find((room) => room.id === receiptRoom.id)!.messages.at(-1)!;
+    sendUser(repository, "room_harbor", "同时处理当前房间任务");
+    const packet = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_cross_room_receipt", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+
+    repository.finishTurn({
+      turnId: "turn_cross_room_receipt", assistantContent: "已分别处理", tools: [], timeline: [], effects: [
+        { type: "send_message", roomId: "room_harbor", messageId: "msg_cross_receipt_done", messageKey: "cross-receipt-done", content: "当前房间已处理", kind: "answer" },
+        { type: "read_no_reply", roomId: receiptRoom.id, messageId: receiptMessage.id, receiptId: "receipt_cross_room" },
+      ], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: "participant_navigator_harbor",
+    });
+
+    const receipt = repository.raw.prepare("SELECT agent_participant_id FROM message_receipts WHERE id='receipt_cross_room'").get() as { agent_participant_id: string };
+    expect(receipt.agent_participant_id).toBe(receiptParticipant.id);
+    expect(receipt.agent_participant_id).not.toBe("participant_navigator_harbor");
+  }));
+
   it("turn 执行中出现新消息会标记 superseded 且不覆盖新状态", async () => withRepository((repository) => {
     sendUser(repository, "room_harbor", "第一条"); const packet = packetFor(repository);
     repository.beginTurn({ turnId: "turn_superseded", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
@@ -258,6 +279,133 @@ describe("OceanKing 领域仓库", () => {
     expect(result.superseded).toBe(true);
     expect(repository.getRoom("room_harbor")!.messages.at(-1)?.content).toBe("执行期间的新消息");
     expect(repository.getRoom("room_harbor")!.turns.find((turn) => turn.id === "turn_superseded")?.status).toBe("continued");
+  }));
+
+  it("新房间消息打断旧任务时保存续接快照且不清除新 turn", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "先完成旧房间的长期任务");
+    const oldPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_interrupted_old", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: oldPacket });
+    const tools: ToolExecution[] = Array.from({ length: 12 }, (_, index) => ({
+      id: `tool_before_interrupt_${index}`, turnId: "turn_interrupted_old", name: index === 0 ? "shell_command" : `tool_${index}`,
+      input: index === 0 ? { command: "inspect" } : { index }, outputText: index === 0 ? "检查已完成" : `output_${index}`,
+      structuredResult: { ok: true }, status: "completed", durationMs: 12, error: null, createdAt: new Date(Date.now() + index).toISOString(),
+    }));
+    repository.checkpointTurn({
+      turnId: "turn_interrupted_old", assistantContent: "已经完成第一阶段分析", systemPrompt: "system",
+      conversationMessages: [{ role: "user", content: "旧任务" }, { role: "assistant", content: "已经完成第一阶段分析" }],
+      tools, timeline: [],
+    });
+
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "紧急房间", agentId: "navigator" });
+    const nextRoom = repository.getSnapshot().rooms.find((room) => room.title === "紧急房间")!;
+    sendUser(repository, nextRoom.id, "这是需要立刻处理的新消息");
+    const nextPacket = packetFor(repository, nextRoom.id);
+    const nextParticipant = nextRoom.participants.find((participant) => participant.agentId === "navigator")!;
+    repository.beginTurn({ turnId: "turn_interrupted_new", roomId: nextRoom.id, agentId: "navigator", agentParticipantId: nextParticipant.id, packet: nextPacket });
+
+    repository.continueInterruptedTurn("turn_interrupted_old", "新房间任务接管", nextRoom.id, { format: "responses" });
+
+    const oldTurn = repository.getRoom("room_harbor")!.turns.find((turn) => turn.id === "turn_interrupted_old");
+    expect(oldTurn).toMatchObject({ status: "continued", error: null, modelMeta: { format: "responses" } });
+    expect(repository.getRoom("room_harbor")!.scheduler.cursorByParticipantId.participant_navigator_harbor).toBeLessThan(oldPacket.cutoffSeq);
+    const activeSession = repository.raw.prepare("SELECT active_turn_id FROM agent_sessions WHERE agent_id='navigator'").get() as { active_turn_id: string | null };
+    expect(activeSession.active_turn_id).toBe("turn_interrupted_new");
+    const snapshot = repository.getAgentSession("navigator").at(-1);
+    expect(snapshot?.role).toBe("assistant");
+    expect(snapshot?.content).toContain("[被新消息打断的未完成任务快照]");
+    expect(snapshot?.content).toContain("先完成旧房间的长期任务");
+    expect(snapshot?.content).toContain("已经完成第一阶段分析");
+    expect(snapshot?.content).toContain("shell_command");
+    expect(snapshot?.content).toContain("检查已完成");
+    expect(snapshot?.content).toContain("tool_11");
+    expect(snapshot?.content).toContain("output_11");
+    expect(snapshot?.content).toContain("这只是信息更新，不是自动允许放弃当前未完成任务");
+    expect(snapshot?.content).toContain("处理新任务时也要继续处理好原任务");
+    expect(snapshot?.content).toContain("把被打断的房间义务视为活跃义务");
+    expect(snapshot?.content).toContain("结束当前轮之前");
+    expect(snapshot?.content).toContain("不要盲目重复执行");
+
+    const applied = repository.finishTurn({
+      turnId: "turn_interrupted_new", assistantContent: "已完成接管", tools: [], timeline: [], effects: [
+        { type: "send_message", roomId: nextRoom.id, messageId: "msg_new_room_done", messageKey: "new-room-done", content: "新房间任务结果", kind: "answer" },
+        { type: "send_message", roomId: "room_harbor", messageId: "msg_old_room_done", messageKey: "old-room-done", content: "旧房间任务结果", kind: "answer" },
+      ], modelMeta: {},
+      cutoffSeq: nextPacket.cutoffSeq, nextParticipantId: nextParticipant.id,
+    });
+    expect(applied.continuationRoomIds).toEqual(["room_harbor"]);
+    expect(applied.unresolvedRoomIds).toEqual([]);
+    expect(repository.getRoom("room_harbor")!.scheduler.cursorByParticipantId.participant_navigator_harbor).toBe(oldPacket.cutoffSeq);
+    expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs").get() as { count: number }).count).toBe(0);
+  }));
+
+  it("接管 turn 只回复新房间时保留旧房间义务并退回原房间续跑", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "旧房间必须收到自己的结果");
+    const oldPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_delivery_gate_old", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: oldPacket });
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "交付门禁房间", agentId: "navigator" });
+    const nextRoom = repository.getSnapshot().rooms.find((room) => room.title === "交付门禁房间")!;
+    sendUser(repository, nextRoom.id, "新房间也要自己的结果");
+    const nextPacket = packetFor(repository, nextRoom.id);
+    const nextParticipant = nextRoom.participants.find((participant) => participant.agentId === "navigator")!;
+    repository.beginTurn({ turnId: "turn_delivery_gate_new", roomId: nextRoom.id, agentId: "navigator", agentParticipantId: nextParticipant.id, packet: nextPacket });
+    repository.continueInterruptedTurn("turn_delivery_gate_old", "跨房间接管", nextRoom.id);
+
+    const first = repository.finishTurn({
+      turnId: "turn_delivery_gate_new", assistantContent: "只回答了新房间", tools: [], timeline: [],
+      effects: [{ type: "send_message", roomId: nextRoom.id, messageId: "msg_only_new", messageKey: "only-new", content: "新房间结果", kind: "answer" }],
+      modelMeta: {}, cutoffSeq: nextPacket.cutoffSeq, nextParticipantId: nextParticipant.id,
+    });
+
+    expect(first.unresolvedRoomIds).toEqual(["room_harbor"]);
+    expect(repository.getRoom(nextRoom.id)!.scheduler.cursorByParticipantId[nextParticipant.id]).toBe(nextPacket.cutoffSeq);
+    expect(repository.getRoom("room_harbor")!.scheduler.cursorByParticipantId.participant_navigator_harbor).toBe(oldPacket.cutoffSeq);
+    expect(repository.raw.prepare("SELECT target_room_id,target_turn_id,delivery_only FROM turn_handoffs WHERE source_turn_id='turn_delivery_gate_old'").get()).toEqual({ target_room_id: "room_harbor", target_turn_id: null, delivery_only: 1 });
+
+    const deliveryPacket = { ...oldPacket, type: "delivery_packet" as const, messages: [], sender: { id: "scheduler:delivery", name: "结果投递恢复器" } };
+    repository.beginTurn({ turnId: "turn_delivery_gate_retry", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: deliveryPacket });
+    expect(repository.getTurnDeliveryObligations("turn_delivery_gate_retry")).toEqual([{ roomId: "room_harbor", messageId: oldPacket.targetMessageId }]);
+    const retry = repository.finishTurn({
+      turnId: "turn_delivery_gate_retry", assistantContent: "补交旧房间", tools: [], timeline: [],
+      effects: [{ type: "send_message", roomId: "room_harbor", messageId: "msg_old_retry", messageKey: "old-retry", content: "旧房间最终结果", kind: "answer" }],
+      modelMeta: {}, cutoffSeq: oldPacket.cutoffSeq, nextParticipantId: "participant_navigator_harbor",
+    });
+    expect(retry.unresolvedRoomIds).toEqual([]);
+    expect(repository.getRoom("room_harbor")!.scheduler.cursorByParticipantId.participant_navigator_harbor).toBe(oldPacket.cutoffSeq);
+    expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs").get() as { count: number }).count).toBe(0);
+  }));
+
+  it("仅投递重试被跨房间打断时只迁移原义务而不复制任务", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "任务已经执行但尚未公开结果");
+    const packet = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_delivery_source", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    repository.finishTurn({ turnId: "turn_delivery_source", assistantContent: "已有私有结果", tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
+    const deliveryPacket = { ...packet, type: "delivery_packet" as const, messages: [], sender: { id: "scheduler:delivery", name: "结果投递恢复器" } };
+    repository.beginTurn({ turnId: "turn_delivery_interrupted", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: deliveryPacket });
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "投递接管房间", agentId: "navigator" });
+    const takeoverRoom = repository.getSnapshot().rooms.find((room) => room.title === "投递接管房间")!;
+
+    repository.continueInterruptedTurn("turn_delivery_interrupted", "投递轮被新房间消息打断", takeoverRoom.id);
+
+    expect(repository.raw.prepare("SELECT source_turn_id,target_room_id,delivery_only FROM turn_handoffs").all()).toEqual([
+      { source_turn_id: "turn_delivery_source", target_room_id: takeoverRoom.id, delivery_only: 1 },
+    ]);
+    expect(repository.getPendingDeliveryObligations(takeoverRoom.id, "navigator")).toEqual([
+      { sourceTurnId: "turn_delivery_source", messageId: packet.targetMessageId },
+    ]);
+  }));
+
+  it("进程恢复会重新调度尚未被目标 turn 认领的接管任务", async () => withRepository((repository) => {
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "待恢复接管房间", agentId: "navigator" });
+    const targetRoom = repository.getSnapshot().rooms.find((room) => room.title === "待恢复接管房间")!;
+    sendUser(repository, "room_harbor", "崩溃后仍需继续");
+    const packet = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_handoff_before_crash", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    repository.continueInterruptedTurn("turn_handoff_before_crash", "转交后进程退出", targetRoom.id);
+    repository.setScheduler("room_harbor", { status: "idle", active: null });
+
+    expect(repository.recoverInterruptedRuns()).toContain(targetRoom.id);
+    expect((repository.raw.prepare("SELECT target_turn_id FROM turn_handoffs WHERE source_turn_id='turn_handoff_before_crash'").get() as { target_turn_id: string | null }).target_turn_id).toBeNull();
+    expect(repository.getRoom("room_harbor")!.scheduler.cursorByParticipantId.participant_navigator_harbor).toBeLessThan(packet.cutoffSeq);
   }));
 
   it("过期版本写入被拒绝且既有消息不丢失", async () => withRepository((repository) => {
@@ -293,7 +441,7 @@ describe("OceanKing 领域仓库", () => {
     repository.executeCommand({ ...commandBase(repository), type: "add_agent", roomId: "room_harbor", agentId: "builder" });
     sendUser(repository, "room_harbor", "游标测试"); const packet = packetFor(repository);
     repository.beginTurn({ turnId: "turn_cursor", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
-    repository.finishTurn({ turnId: "turn_cursor", assistantContent: "done", tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+    repository.finishTurn({ turnId: "turn_cursor", assistantContent: "done", tools: [], timeline: [], effects: [{ type: "send_message", roomId: "room_harbor", messageId: "msg_cursor_done", messageKey: "cursor-done", content: "游标处理完成", kind: "answer" }], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
     const room = repository.getRoom("room_harbor")!; const builder = room.participants.find((participant) => participant.agentId === "builder")!;
     expect(room.scheduler.cursorByParticipantId.participant_navigator_harbor).toBe(packet.cutoffSeq);
     expect(room.scheduler.cursorByParticipantId[builder.id] ?? 0).toBe(0);

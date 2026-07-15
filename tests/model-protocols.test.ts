@@ -158,14 +158,14 @@ describe("OpenAI 兼容协议", () => {
     repository.beginTurn({ turnId: "turn_before_compaction", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: historicalPacket });
     repository.finishTurn({ turnId: "turn_before_compaction", assistantContent: "旧任务尚未完成", tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: historicalPacket.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
     sendUser(repository, "room_harbor", "请继续完成旧任务"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
-    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, contextTokenThreshold: 8_000 } };
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, contextTokenThreshold: 8_000, maxToolSteps: 0 } };
     repository.beginTurn({ turnId: "turn_compacted", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
     const requestBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
       requestBodies.push(body);
       if (requestBodies.length === 1) return sse([{ choices: [{ delta: { content: "用户要求继续旧任务；关键事实必须保留；当前尚未完成。" } }] }, "[DONE]"]);
-      return sse([{ choices: [{ delta: { content: "基于压缩上下文继续执行" } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_compacted_delivery", function: { name: "send_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", content: "基于压缩上下文继续执行", kind: "answer" }) } }] } }] }, "[DONE]"]);
     }));
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_compacted", signal: new AbortController().signal });
     repository.finishTurn({ turnId: "turn_compacted", assistantContent: result.assistantContent, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
