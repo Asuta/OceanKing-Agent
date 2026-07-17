@@ -536,10 +536,23 @@ describe("OpenAI 兼容协议", () => {
       if (String(input) === pageUrl) return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
       modelBodies.push(requestBody(init));
       if (modelBodies.length === 1 && apiFormat === "chat_completions") return sse([
-        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_web_chat", function: { name: "web_fetch", arguments: JSON.stringify({ url: pageUrl }) } }] } }] },
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_web_progress_chat", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress" }) } }] } }] },
         "[DONE]",
       ]);
       if (modelBodies.length === 1) return sse([
+        { type: "response.output_item.added", item: { id: "item_web_progress", call_id: "call_web_progress_responses", type: "function_call", name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress" }) } },
+        { type: "response.output_item.done", item: { id: "item_web_progress", call_id: "call_web_progress_responses", type: "function_call", name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress" }) } },
+        { type: "response.completed", response: { id: "resp_web_progress" } },
+        "[DONE]",
+      ]);
+      if (modelBodies.length === 2) return apiFormat === "chat_completions"
+        ? sse([{ choices: [{ delta: { content: "我先读取并清理网页正文。" } }] }, "[DONE]"])
+        : sse([{ type: "response.output_text.delta", delta: "我先读取并清理网页正文。" }, { type: "response.completed", response: { id: "resp_web_progress_body" } }, "[DONE]"]);
+      if (modelBodies.length === 3 && apiFormat === "chat_completions") return sse([
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_web_chat", function: { name: "web_fetch", arguments: JSON.stringify({ url: pageUrl }) } }] } }] },
+        "[DONE]",
+      ]);
+      if (modelBodies.length === 3) return sse([
         { type: "response.output_item.added", item: { id: "item_web", call_id: "call_web_responses", type: "function_call", name: "web_fetch", arguments: "" } },
         { type: "response.output_item.done", item: { id: "item_web", call_id: "call_web_responses", type: "function_call", name: "web_fetch", arguments: JSON.stringify({ url: pageUrl }) } },
         { type: "response.completed", response: { id: "resp_web_tool" } },
@@ -555,12 +568,13 @@ describe("OpenAI 兼容协议", () => {
     const agent = { ...base, settings: { ...base.settings, apiFormat, maxToolSteps: 1 } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: `turn_web_${apiFormat}`, signal: new AbortController().signal });
 
-    expect(result.tools[0]?.outputText).toContain("有效正文");
-    expect(result.tools[0]?.outputText).not.toMatch(/无效导航|无效脚本|无效页脚/);
-    expect(modelBodies).toHaveLength(2);
+    const webTool = result.tools.find((tool) => tool.name === "web_fetch");
+    expect(webTool?.outputText).toContain("有效正文");
+    expect(webTool?.outputText).not.toMatch(/无效导航|无效脚本|无效页脚/);
+    expect(modelBodies).toHaveLength(4);
     const continuationText = apiFormat === "chat_completions"
-      ? ((modelBodies[1]?.messages as Array<{ role?: string; content?: string }>).find((message) => message.role === "tool")?.content ?? "")
-      : String((modelBodies[1]?.input as Array<{ type?: string; output?: string }>).find((item) => item.type === "function_call_output")?.output ?? "");
+      ? ((modelBodies[3]?.messages as Array<{ role?: string; content?: string }>).findLast((message) => message.role === "tool")?.content ?? "")
+      : String((modelBodies[3]?.input as Array<{ type?: string; output?: string }>).find((item) => item.type === "function_call_output")?.output ?? "");
     expect(continuationText).toContain("有效正文");
     expect(continuationText).not.toMatch(/无效导航|无效脚本|无效页脚/);
   }));
@@ -570,7 +584,9 @@ describe("OpenAI 兼容协议", () => {
     let requestCount = 0;
     vi.stubGlobal("fetch", vi.fn(async () => {
       requestCount += 1;
-      if (requestCount === 1) return sse([{
+      if (requestCount === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_failure_progress", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress" }) } }] } }] }, "[DONE]"]);
+      if (requestCount === 2) return sse([{ choices: [{ delta: { content: "我先读取历史，再继续检查。" } }] }, "[DONE]"]);
+      if (requestCount === 3) return sse([{
         choices: [{ delta: { content: "我先读取历史。", tool_calls: [{ index: 0, id: "call_before_provider_failure", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor", limit: 1 }) } }] } }],
       }, "[DONE]"]);
       return new Response("provider failed", { status: 500 });
@@ -589,7 +605,7 @@ describe("OpenAI 兼容协议", () => {
       expect.objectContaining({ role: "assistant", content: "我先读取历史。", tool_calls: [expect.objectContaining({ id: "call_before_provider_failure" })] }),
       expect.objectContaining({ role: "tool", tool_call_id: "call_before_provider_failure" }),
     ]));
-    expect(turn.tools[0]).toMatchObject({ id: "call_before_provider_failure", name: "read_room_history", status: "completed" });
+    expect(turn.tools.find((tool) => tool.id === "call_before_provider_failure")).toMatchObject({ id: "call_before_provider_failure", name: "read_room_history", status: "completed" });
   }));
 
   it("DeepSeek 思考模式在工具子轮和后续用户轮次完整回传 reasoning_content", async () => withRepository(async (repository) => {
@@ -658,18 +674,20 @@ describe("OpenAI 兼容协议", () => {
     const bodies: Array<Record<string, unknown>> = []; let call = 0;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>); call += 1;
-      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor", limit: 1 }) } }] } }] }, "[DONE]"]);
-      if (call === 2) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_terminal", function: { name: "send_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", content: "达到上限后的正式结果", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_terminal_progress", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress" }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { content: "我先读取房间历史。" } }] }, "[DONE]"]);
+      if (call === 3) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor", limit: 1 }) } }] } }] }, "[DONE]"]);
+      if (call === 4) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_terminal", function: { name: "send_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", content: "达到上限后的正式结果", kind: "answer" }) } }] } }] }, "[DONE]"]);
       return sse([{ choices: [{ delta: { content: "达到上限后的正式结果" } }] }, "[DONE]"]);
     }));
     sendUser(repository, "room_harbor", "工具上限测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
     const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const, maxToolSteps: 1 } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_terminal_tool", signal: new AbortController().signal });
-    expect(result.tools.map((tool) => tool.name)).toEqual(["read_room_history", "begin_message_to_room"]);
-    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "达到上限后的正式结果" })]);
-    expect((bodies[1]?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "read_no_reply"]);
-    expect(bodies[2]?.tools).toEqual(bodies[1]?.tools);
-    expect(bodies[2]?.tool_choice).toBe("auto");
+    expect(result.tools.map((tool) => tool.name)).toEqual(["begin_message_to_room", "read_room_history", "begin_message_to_room"]);
+    expect(result.effects).toEqual(expect.arrayContaining([expect.objectContaining({ type: "send_message", kind: "progress" }), expect.objectContaining({ type: "send_message", content: "达到上限后的正式结果" })]));
+    expect((bodies[3]?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "read_no_reply"]);
+    expect(bodies[4]?.tools).toEqual(bodies[3]?.tools);
+    expect(bodies[4]?.tool_choice).toBe("auto");
   }));
 
   it("Chat 工具输出让上下文越过阈值时，会在下一次模型请求前整体压缩", async () => withRepository(async (repository) => {
@@ -681,23 +699,28 @@ describe("OpenAI 兼容协议", () => {
       const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content?: string }>; tools?: unknown; tool_choice?: string };
       requestBodies.push(body);
       if (requestBodies.length === 1) return sse([
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_large_progress", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress" }) } }] } }] },
+        "[DONE]",
+      ]);
+      if (requestBodies.length === 2) return sse([{ choices: [{ delta: { content: "我先读取大文件并整理关键事实。" } }] }, "[DONE]"]);
+      if (requestBodies.length === 3) return sse([
         { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_large_read", function: { name: "read_project_context", arguments: JSON.stringify({ root: repository.dataDir, path: fileName }) } }] } }] },
         "[DONE]",
       ]);
-      if (requestBodies.length === 2) return sse([{ choices: [{ delta: { content: "工具返回了大量关键事实，任务仍需继续。" } }] }, "[DONE]"]);
+      if (requestBodies.length === 4) return sse([{ choices: [{ delta: { content: "工具返回了大量关键事实，任务仍需继续。" } }] }, "[DONE]"]);
       return sse([{ choices: [{ delta: { content: "已在压缩后继续处理" } }] }, "[DONE]"]);
     }));
     sendUser(repository, "room_harbor", "读取大文件并继续"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
     const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, contextTokenThreshold: 15_000, projectContextRoots: [repository.dataDir] } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_large_tool_context", signal: new AbortController().signal });
-    expect(result.tools[0]?.outputText.length).toBeGreaterThan(50_000);
-    expect(requestBodies).toHaveLength(3);
-    expect(requestBodies[1]?.messages[0]?.content).toBe(requestBodies[0]?.messages[0]?.content);
-    expect(requestBodies[1]?.messages.at(-2)?.content).toContain("上下文压缩器");
-    expect(requestBodies[1]?.messages.slice(0, requestBodies[0]!.messages.length)).toEqual(requestBodies[0]?.messages);
-    expect(requestBodies[1]?.tools).toEqual(requestBodies[0]?.tools);
-    expect(requestBodies[1]?.tool_choice).toBe("auto");
-    expect(requestBodies[2]?.messages[1]?.content).toContain("工具返回了大量关键事实");
+    expect(result.tools.find((tool) => tool.name === "read_project_context")?.outputText.length).toBeGreaterThan(50_000);
+    expect(requestBodies).toHaveLength(5);
+    expect(requestBodies[3]?.messages[0]?.content).toBe(requestBodies[2]?.messages[0]?.content);
+    expect(requestBodies[3]?.messages.at(-2)?.content).toContain("上下文压缩器");
+    expect(requestBodies[3]?.messages.slice(0, requestBodies[2]!.messages.length)).toEqual(requestBodies[2]?.messages);
+    expect(requestBodies[3]?.tools).toEqual(requestBodies[2]?.tools);
+    expect(requestBodies[3]?.tool_choice).toBe("auto");
+    expect(requestBodies[4]?.messages[1]?.content).toContain("工具返回了大量关键事实");
     expect(result.contextCompaction).toMatchObject({ threshold: 15_000 });
     expect(result.sessionMessages.some((message) => message.role === "tool" && message.tool_call_id === "call_large_read")).toBe(false);
     expect(result.auditMessages).toEqual(expect.arrayContaining([
@@ -770,5 +793,68 @@ describe("OpenAI 兼容协议", () => {
     expect(result.assistantContent).toBe("");
     expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", messageKey: "public-responses-key", content: "Responses 公开正文" })]);
     expectProgressivePreview(previews, "Responses 公开正文");
+  }));
+
+  it("Chat 可在一个任务中多次汇报阶段进度且纯进度不消耗工作工具步数", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_progress_blocked", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor", limit: 1 }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_progress_plan", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress", messageKey: "progress-plan" }) } }] } }] }, "[DONE]"]);
+      if (call === 3) return sse([{ choices: [{ delta: { content: "我先检查房间历史，再核对关键结果。" } }] }, "[DONE]"]);
+      if (call === 4) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_progress_work", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor", limit: 1 }) } }] } }] }, "[DONE]"]);
+      if (call === 5) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_progress_milestone", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress", messageKey: "progress-milestone" }) } }] } }] }, "[DONE]"]);
+      if (call === 6) return sse([{ choices: [{ delta: { content: "历史已经核对完成，正在整理最终结论。" } }] }, "[DONE]"]);
+      if (call === 7) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_progress_answer", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer", messageKey: "progress-answer" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "检查完成，最终结果已经确认。" } }] }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "分阶段检查并持续汇报"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const, maxToolSteps: 1 } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_chat_progress", signal: new AbortController().signal });
+
+    expect(bodies).toHaveLength(8);
+    expect(result.systemPrompt).toContain("在开始实质工作前，必须向对应房间发送一条 kind=progress");
+    expect(result.systemPrompt).toContain("不要发送定时心跳");
+    expect(result.modelMeta).toMatchObject({ toolSteps: 1 });
+    expect(result.tools.map((tool) => tool.name)).toEqual(["begin_message_to_room", "read_room_history", "begin_message_to_room", "begin_message_to_room"]);
+    expect(result.effects).toEqual([
+      expect.objectContaining({ type: "send_message", kind: "progress", messageKey: "progress-plan", content: "我先检查房间历史，再核对关键结果。" }),
+      expect.objectContaining({ type: "send_message", kind: "progress", messageKey: "progress-milestone", content: "历史已经核对完成，正在整理最终结论。" }),
+      expect.objectContaining({ type: "send_message", kind: "answer", messageKey: "progress-answer", content: "检查完成，最终结果已经确认。" }),
+    ]);
+    expect(JSON.stringify(bodies[1]?.messages)).toContain("这些工作工具没有执行：read_room_history");
+    const retryTools = bodies[3]?.tools as Array<{ function: { name: string } }>;
+    expect(retryTools.map((tool) => tool.function.name)).toContain("read_room_history");
+    expect(JSON.stringify(bodies[3]?.messages)).toContain("可以再次发送 kind=progress");
+  }));
+
+  it("Responses 的纯进度消息同样不占用工作工具步数", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const functionCall = (id: string, name: string, args: Record<string, unknown>, responseId: string) => {
+      const item = { id: `item_${id}`, call_id: id, type: "function_call", name, arguments: JSON.stringify(args) };
+      return sse([{ type: "response.output_item.added", item }, { type: "response.output_item.done", item }, { type: "response.completed", response: { id: responseId } }, "[DONE]"]);
+    };
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      call += 1;
+      if (call === 1) return functionCall("call_responses_blocked", "read_room_history", { roomId: "room_harbor", limit: 1 }, "resp_blocked");
+      if (call === 2) return functionCall("call_responses_progress", "begin_message_to_room", { roomId: "room_harbor", kind: "progress", messageKey: "responses-progress" }, "resp_progress_route");
+      if (call === 3) return sse([{ type: "response.output_text.delta", delta: "我先读取历史，再给出正式结论。" }, { type: "response.completed", response: { id: "resp_progress_body" } }, "[DONE]"]);
+      if (call === 4) return functionCall("call_responses_work", "read_room_history", { roomId: "room_harbor", limit: 1 }, "resp_work");
+      if (call === 5) return functionCall("call_responses_answer", "begin_message_to_room", { roomId: "room_harbor", kind: "answer", messageKey: "responses-answer" }, "resp_answer_route");
+      return sse([{ type: "response.output_text.delta", delta: "历史检查完成，这是最终结论。" }, { type: "response.completed", response: { id: "resp_answer_body" } }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "用 Responses 分阶段处理"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const, thinkingMode: "disabled" as const, maxToolSteps: 1 } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses_progress", signal: new AbortController().signal });
+
+    expect(call).toBe(6);
+    expect(result.modelMeta).toMatchObject({ toolSteps: 1 });
+    expect(result.tools.map((tool) => tool.name)).toEqual(["begin_message_to_room", "read_room_history", "begin_message_to_room"]);
+    expect(result.effects).toEqual([
+      expect.objectContaining({ type: "send_message", kind: "progress", messageKey: "responses-progress", content: "我先读取历史，再给出正式结论。" }),
+      expect.objectContaining({ type: "send_message", kind: "answer", messageKey: "responses-answer", content: "历史检查完成，这是最终结论。" }),
+    ]);
   }));
 });

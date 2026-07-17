@@ -103,7 +103,7 @@ async function runShell(command: string, signal: AbortSignal): Promise<{ stdout:
 const tools: ToolDefinition[] = [
   {
     name: "begin_message_to_room",
-    description: "打开一个房间的公开回复通道。调用成功后，下一次 assistant 输出的全部正文会实时显示并正式提交到该房间；一次只打开一个房间。",
+    description: "打开一个房间的公开消息通道。调用成功后，下一次 assistant 输出的全部正文会实时显示并正式提交到该房间；一次只打开一个房间。多阶段或工具任务开始时先用 kind=progress 说明计划，之后仅在有意义的阶段节点继续汇报，完成时再用非 progress 类型提交正式结果；不要发送心跳或思维链。",
     schema: beginMessageToolSchema,
     parameters: { type: "object", additionalProperties: false, required: ["roomId", "kind"], properties: { roomId: { type: "string" }, kind: { type: "string", enum: ["answer", "progress", "warning", "error", "clarification"] }, messageKey: { type: "string" } } },
     execute: async (context, raw, callId) => {

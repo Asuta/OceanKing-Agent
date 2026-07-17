@@ -18,6 +18,7 @@ type ToolCallOutput = { callId: string; name: string; text: string; error: boole
 const terminalToolNames = new Set(["begin_message_to_room", "read_no_reply"]);
 const maxDeliveryRepairAttempts = 2;
 const maxPublicMessageRepairAttempts = 2;
+const maxInitialProgressRepairAttempts = 2;
 class ResponsesUnsupportedError extends Error {}
 type RunArgs = {
   repository: WorkspaceRepository;
@@ -163,10 +164,13 @@ function systemPrompt(args: RunArgs): string {
   return [
     "你运行在 OceanKing 多 Agent 工作台中。",
     "重要契约：普通 assistant 文本默认是私有执行记录，人类在房间里看不到。需要公开表达时，先调用 begin_message_to_room 打开目标房间；工具成功后的下一次 assistant 回复会作为该房间的公开正文实时发送。",
-    "begin_message_to_room 之后的公开正文阶段只输出最终正文，不得夹带构思、解释或工具调用。不要为了看起来有回复而伪造消息；无需回复时调用 read_no_reply。",
+    "begin_message_to_room 之后的公开正文阶段只输出该条消息的完整正文，不得夹带私有构思、路由解释或工具调用。不要为了看起来有回复而伪造消息；无需回复时调用 read_no_reply。",
     "历史记录里可能出现旧工具 send_message_to_room；它已经停用，绝不能继续调用，也不要把公开正文放进任何工具参数。",
     "每个待处理房间都是独立交付义务；一次 begin_message_to_room 后的公开正文，或一次 read_no_reply，只处理它明确指定的那个房间。结束本轮前必须逐一处理下面列出的全部义务。",
     "kind=progress 只表示进度，不会完成该房间义务；任务完成时仍需发送非 progress 的正式消息。read_no_reply 必须精确指向所列 messageId。",
+    "进度汇报规则：对需要调用工具或分阶段完成的任务，在开始实质工作前，必须向对应房间发送一条 kind=progress，简要说明准备怎样处理；短小且可直接回答的任务不必发送进度。",
+    "执行过程中可以多次发送 kind=progress，但只在完成有意义的阶段、得到关键发现、遇到阻塞或执行计划发生变化时发送。进度应是面向房间成员的简洁阶段摘要，不是私有思维链，也不要逐次复述每个工具调用。",
+    "不要发送定时心跳、等待状态、重复内容、没有新信息的进度、敏感信息或完整工具参数。最后仍须向每个相关房间发送 answer、warning、error 或 clarification 等非 progress 正式消息。",
     "房间不是默认隐私边界，但只能读取和发送到当前 Agent 已连接的房间。房间管理权限由工具执行层校验。",
     "创建房间时，create_room 会让你自动成为 owner 并连接；如需拉人，直接在同一次调用的 agentIds 中列出所有目标 Agent，不要要求人类手动操作。",
     "每轮输入只携带尚未处理的房间增量；需要房间清单或可用 Agent 清单时，分别调用 list_connected_rooms 或 list_available_agents。",
@@ -238,6 +242,7 @@ function maxModelStepsForRun(args: RunArgs): number {
       + deliveryObligations * 2
       + maxDeliveryRepairAttempts
       + maxPublicMessageRepairAttempts
+      + maxInitialProgressRepairAttempts
       + 4,
   );
 }
@@ -289,7 +294,47 @@ function publicMessageControl(route: PublicMessageRoute): AgentSessionMessage {
 }
 
 function progressContinuation(route: PublicMessageRoute): AgentSessionMessage {
-  return { role: "user", content: `[系统进度消息已提交]\n房间 ${route.roomId} 已收到进度。继续执行当前任务；最终完成时仍须使用 begin_message_to_room 提交非 progress 的正式结果。` };
+  return {
+    role: "user",
+    content: [
+      "[系统进度消息已提交]",
+      `房间 ${route.roomId} 已收到这条阶段进度。继续执行当前任务。`,
+      "之后完成有意义的阶段、得到关键发现、遇到阻塞或计划变化时，可以再次发送 kind=progress；不要发送定时心跳、重复状态或没有新信息的消息。",
+      "最终完成时仍须使用 begin_message_to_room 提交非 progress 的正式结果。",
+    ].join("\n"),
+  };
+}
+
+function consumesToolStep(calls: ToolCall[], openedRoute: PublicMessageRoute | null): boolean {
+  return !(openedRoute?.kind === "progress" && calls.length === 1 && calls[0]?.name === "begin_message_to_room");
+}
+
+function needsInitialProgress(args: RunArgs, effects: TurnEffect[], calls: ToolCall[]): boolean {
+  if (args.packet.type === "delivery_packet" || calls.every((call) => terminalToolNames.has(call.name))) return false;
+  return !effects.some((effect) => effect.type === "send_message" && effect.roomId === args.packet.room.id && effect.kind === "progress");
+}
+
+function initialProgressRepairMessage(args: RunArgs, calls: ToolCall[]): AgentSessionMessage {
+  const toolNames = [...new Set(calls.filter((call) => !terminalToolNames.has(call.name)).map((call) => call.name))];
+  return {
+    role: "user",
+    content: [
+      "[系统初始进度校验未通过]",
+      `房间 ${args.packet.room.id} 的任务尚未收到开始进度，因此这些工作工具没有执行：${toolNames.join("、")}。`,
+      `现在先调用 begin_message_to_room，roomId 必须是 ${args.packet.room.id}，kind 必须是 progress；在下一次 assistant 正文中简要说明处理计划。`,
+      "进度提交后，再重新调用刚才需要的工作工具。不要把工具结果写进进度消息，因为工具尚未执行。",
+    ].join("\n"),
+  };
+}
+
+function blockedToolOutputs(calls: ToolCall[], roomId: string): ToolCallOutput[] {
+  return calls.map((call) => ({
+    callId: call.id,
+    name: call.name,
+    text: `[系统未执行工具] 房间 ${roomId} 尚未收到初始进度；请先发送 kind=progress，再重试此工具。`,
+    error: true,
+    structured: null,
+  }));
 }
 
 function publicMessageEffect(route: PublicMessageRoute, content: string): Extract<TurnEffect, { type: "send_message" }> {
@@ -527,6 +572,7 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
   let assistantContent = ""; let usage: unknown = null; let toolSteps = 0; let reasoningCharacters = 0;
   let deliveryOnly = args.packet.type === "delivery_packet"; let deliveryRepairAttempts = 0;
   let activePublicRoute: PublicMessageRoute | null = null; let publicMessageRepairAttempts = 0;
+  let initialProgressRepairAttempts = 0;
   let activePublicTools: typeof chatToolDefinitions = [];
   const maxModelSteps = maxModelStepsForRun(args);
   checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -643,7 +689,7 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       activePublicRoute = null; activePublicTools = []; publicMessageRepairAttempts = 0;
       const unresolved = unresolvedDeliveryObligations(args, effects);
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-      if (!unresolved.length) break;
+      if (!unresolved.length && publicRouteForStep.kind !== "progress") break;
       const resolvedObligation = unresolved.length < unresolvedBefore.length;
       const continuationMessage = publicRouteForStep.kind === "progress"
         ? progressContinuation(publicRouteForStep)
@@ -668,13 +714,25 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       }
       break;
     }
-    if (regularToolsAllowed) toolSteps += 1;
+    if (regularToolsAllowed && needsInitialProgress(args, effects, calls)) {
+      if (initialProgressRepairAttempts >= maxInitialProgressRepairAttempts) throw new Error(`模型连续跳过房间 ${args.packet.room.id} 的初始进度汇报`);
+      initialProgressRepairAttempts += 1;
+      for (const output of blockedToolOutputs(calls, args.packet.room.id)) {
+        const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
+        messages.push(toolMessage); sessionMessages.push(toolMessage); auditMessages.push(toolMessage);
+      }
+      const repairMessage = initialProgressRepairMessage(args, calls);
+      messages.push(repairMessage); sessionMessages.push(repairMessage); auditMessages.push(repairMessage);
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
+    }
     const outputs = await executeToolCalls(args, calls, tools, timeline, effects, (output) => {
       const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
       messages.push(toolMessage); sessionMessages.push(toolMessage); auditMessages.push(toolMessage);
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
     });
     const openedRoute = routeFromToolOutputs(outputs);
+    if (regularToolsAllowed && consumesToolStep(calls, openedRoute)) toolSteps += 1;
     if (openedRoute) {
       activePublicRoute = openedRoute; activePublicTools = requestTools; publicMessageRepairAttempts = 0;
       const controlMessage = publicMessageControl(openedRoute);
@@ -717,6 +775,7 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
   const auditMessages = [...sessionMessages];
   let deliveryOnly = args.packet.type === "delivery_packet"; let deliveryRepairAttempts = 0;
   let toolSteps = 0; let activePublicRoute: PublicMessageRoute | null = null; let publicMessageRepairAttempts = 0;
+  let initialProgressRepairAttempts = 0;
   let activePublicTools: typeof responseToolDefinitions = [];
   const maxModelSteps = maxModelStepsForRun(args);
   checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -846,7 +905,7 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       activePublicRoute = null; activePublicTools = []; publicMessageRepairAttempts = 0;
       const unresolved = unresolvedDeliveryObligations(args, effects);
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-      if (!unresolved.length) break;
+      if (!unresolved.length && publicRouteForStep.kind !== "progress") break;
       const resolvedObligation = unresolved.length < unresolvedBefore.length;
       const continuationMessage = publicRouteForStep.kind === "progress"
         ? progressContinuation(publicRouteForStep)
@@ -873,7 +932,23 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       }
       break;
     }
-    if (regularToolsAllowed) toolSteps += 1;
+    if (regularToolsAllowed && needsInitialProgress(args, effects, calls)) {
+      if (initialProgressRepairAttempts >= maxInitialProgressRepairAttempts) throw new Error(`模型连续跳过房间 ${args.packet.room.id} 的初始进度汇报`);
+      initialProgressRepairAttempts += 1;
+      const blockedOutputs = blockedToolOutputs(calls, args.packet.room.id);
+      for (const output of blockedOutputs) {
+        const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
+        sessionMessages.push(toolMessage); auditMessages.push(toolMessage); continuationMessages.push(responseContextMessage(toolMessage));
+      }
+      const repairMessage = initialProgressRepairMessage(args, calls);
+      sessionMessages.push(repairMessage); auditMessages.push(repairMessage); continuationMessages.push(responseContextMessage(repairMessage));
+      input = [
+        ...blockedOutputs.map((output) => ({ type: "function_call_output", call_id: output.callId, output: output.text })),
+        responseContextMessage(repairMessage),
+      ];
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
+    }
     const outputs = await executeToolCalls(args, calls, tools, timeline, effects, (output) => {
       const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
       sessionMessages.push(toolMessage); auditMessages.push(toolMessage); continuationMessages.push(responseContextMessage(toolMessage));
@@ -882,6 +957,7 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
     const outputItems = outputs.map((output) => ({ type: "function_call_output", call_id: output.callId, output: output.text }));
     input = outputItems;
     const openedRoute = routeFromToolOutputs(outputs);
+    if (regularToolsAllowed && consumesToolStep(calls, openedRoute)) toolSteps += 1;
     if (openedRoute) {
       activePublicRoute = openedRoute; activePublicTools = requestTools; publicMessageRepairAttempts = 0;
       const controlMessage = publicMessageControl(openedRoute);
