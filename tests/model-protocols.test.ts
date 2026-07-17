@@ -1,13 +1,32 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { extractPartialJsonStringField, ModelRunError, runAgentModel } from "@/lib/server/model-runtime";
-import { packetFor, sendUser, withRepository } from "./helpers";
+import { maxRoomMessageContentCharacters } from "@/lib/domain/schemas";
+import { countRenderedContextTokens } from "@/lib/server/context-compaction";
+import { ModelRunError, runAgentModel } from "@/lib/server/model-runtime";
+import { commandBase, packetFor, sendUser, withRepository } from "./helpers";
 import { normalizeOpenAiBaseUrl } from "@/lib/server/provider-config";
 import { subscribeWorkspaceEvents } from "@/lib/server/events";
 
 function sse(events: Array<Record<string, unknown> | "[DONE]">): Response {
   return new Response(events.map((event) => `data: ${typeof event === "string" ? event : JSON.stringify(event)}\n\n`).join(""), { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+function gatedSse(
+  first: Array<Record<string, unknown> | "[DONE]">,
+  rest: Array<Record<string, unknown> | "[DONE]">,
+  release: Promise<void>,
+): Response {
+  const encoder = new TextEncoder();
+  const encode = (events: Array<Record<string, unknown> | "[DONE]">) => encoder.encode(events.map((event) => `data: ${typeof event === "string" ? event : JSON.stringify(event)}\n\n`).join(""));
+  return new Response(new ReadableStream({
+    async start(controller) {
+      controller.enqueue(encode(first));
+      await release;
+      controller.enqueue(encode(rest));
+      controller.close();
+    },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
 function requestBody(init?: RequestInit): Record<string, unknown> {
@@ -24,6 +43,15 @@ function expectProgressivePreview(contents: string[], completeContent: string): 
   });
 }
 
+function appendRoomPreview(contents: string[], event: { entityId?: string; payload?: unknown }, turnId: string): string | null {
+  const payload = event.payload as { kind?: string; delta?: string; content?: string } | undefined;
+  if (event.entityId !== turnId || payload?.kind !== "room_message_preview") return null;
+  const content = payload.content ?? `${contents.at(-1) ?? ""}${payload.delta ?? ""}`;
+  if (!content) return null;
+  contents.push(content);
+  return content;
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   delete process.env.OPENAI_API_KEY;
@@ -31,12 +59,6 @@ afterEach(() => {
 });
 
 describe("OpenAI 兼容协议", () => {
-  it("从未完成 JSON 中安全提取已到达的字符串内容", () => {
-    expect(extractPartialJsonStringField('{"content":"第一行\\n第二', "content")).toBe("第一行\n第二");
-    expect(extractPartialJsonStringField('{"content":"等待\\u4e', "content")).toBe("等待");
-    expect(extractPartialJsonStringField('{"roomId":', "roomId")).toBeNull();
-  });
-
   it("接受完整 chat/completions 地址并归一化为兼容 API 根地址", () => {
     expect(normalizeOpenAiBaseUrl("https://api.deepseek.com/v1/chat/completions")).toBe("https://api.deepseek.com/v1");
   });
@@ -152,25 +174,85 @@ describe("OpenAI 兼容协议", () => {
     expect(sentMessages.at(-1)?.content).not.toContain("availableAgents");
   }));
 
+  it("跨用户轮次保持稳定前缀，把动态房间和消息信息放在历史末尾", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const bodies: Array<{ messages: Array<{ role: string; content?: string }> }> = [];
+    let currentMessageId = "";
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content?: string }> });
+      return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: `call_read_${bodies.length}`, function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: currentMessageId }) } }] } }] }, "[DONE]"]);
+    }));
+    const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+
+    sendUser(repository, "room_harbor", "第一轮缓存前缀"); const firstPacket = packetFor(repository); currentMessageId = firstPacket.targetMessageId;
+    repository.beginTurn({ turnId: "turn_cache_prefix_1", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet: firstPacket });
+    const first = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet: firstPacket, turnId: "turn_cache_prefix_1", signal: new AbortController().signal });
+    repository.finishTurn({ turnId: "turn_cache_prefix_1", assistantContent: first.assistantContent, sessionMessages: first.sessionMessages, tools: first.tools, timeline: first.timeline, effects: first.effects, modelMeta: first.modelMeta, cutoffSeq: firstPacket.cutoffSeq, nextParticipantId: null });
+
+    sendUser(repository, "room_harbor", "第二轮缓存前缀"); const secondPacket = packetFor(repository); currentMessageId = secondPacket.targetMessageId;
+    repository.beginTurn({ turnId: "turn_cache_prefix_2", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet: secondPacket });
+    await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet: secondPacket, turnId: "turn_cache_prefix_2", signal: new AbortController().signal });
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]?.messages.slice(0, bodies[0]!.messages.length)).toEqual(bodies[0]?.messages);
+    expect(bodies[0]?.messages[0]?.content).not.toContain(firstPacket.targetMessageId);
+    expect(bodies[1]?.messages[0]?.content).not.toContain(secondPacket.targetMessageId);
+    expect(bodies[0]?.messages.at(-1)?.content).toContain(firstPacket.targetMessageId);
+    expect(bodies[1]?.messages.at(-1)?.content).toContain(secondPacket.targetMessageId);
+  }));
+
+  it("发送新协议请求前把旧公开消息工具转换为普通历史正文", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    sendUser(repository, "room_harbor", "旧协议历史"); const oldPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_legacy_history", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: oldPacket });
+    repository.finishTurn({
+      turnId: "turn_legacy_history", assistantContent: "旧轮私有记录",
+      sessionMessages: [
+        { role: "assistant", content: "旧轮私有记录", tool_calls: [{ id: "legacy_call", type: "function", function: { name: "send_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", content: "不应再次进入模型上下文的旧正文", kind: "answer" }) } }] },
+        { role: "tool", tool_call_id: "legacy_call", content: "旧工具已经提交" },
+      ],
+      tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: oldPacket.cutoffSeq, nextParticipantId: null,
+    });
+    sendUser(repository, "room_harbor", "使用新协议继续"); const packet = packetFor(repository); const requestBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(requestBody(init));
+      return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read_new", function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: packet.targetMessageId }) } }] } }] }, "[DONE]"]);
+    }));
+    const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const } };
+    await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_clean_legacy_history", signal: new AbortController().signal });
+    const renderedMessages = JSON.stringify((requestBodies[0]?.messages as unknown[]).slice(1));
+    expect(renderedMessages).not.toContain("send_message_to_room");
+    expect(renderedMessages).toContain("[历史公开回复到房间 room_harbor]");
+    expect(renderedMessages).toContain("不应再次进入模型上下文的旧正文");
+    expect(renderedMessages).toContain("旧轮私有记录");
+  }));
+
   it("上下文超过 Token 阈值时先整体压缩，再持久化压缩上下文并继续请求", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
     sendUser(repository, "room_harbor", `关键历史：${"必须保留的事实。".repeat(4_000)}`); const historicalPacket = packetFor(repository);
     repository.beginTurn({ turnId: "turn_before_compaction", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: historicalPacket });
-    repository.finishTurn({ turnId: "turn_before_compaction", assistantContent: "旧任务尚未完成", tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: historicalPacket.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
+    repository.finishTurn({
+      turnId: "turn_before_compaction", assistantContent: "旧任务历史记录", tools: [], timeline: [],
+      effects: [{ type: "read_no_reply", roomId: "room_harbor", messageId: historicalPacket.targetMessageId, receiptId: "receipt_before_compaction" }],
+      modelMeta: {}, cutoffSeq: historicalPacket.cutoffSeq, nextParticipantId: null,
+    });
     sendUser(repository, "room_harbor", "请继续完成旧任务"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
     const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, contextTokenThreshold: 8_000, maxToolSteps: 0 } };
     repository.beginTurn({ turnId: "turn_compacted", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
-    const requestBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    const requestBodies: Array<{ messages: Array<{ role: string; content: string }>; tools?: unknown; tool_choice?: string }> = [];
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> };
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }>; tools?: unknown; tool_choice?: string };
       requestBodies.push(body);
       if (requestBodies.length === 1) return sse([{ choices: [{ delta: { content: "用户要求继续旧任务；关键事实必须保留；当前尚未完成。" } }] }, "[DONE]"]);
-      return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_compacted_delivery", function: { name: "send_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", content: "基于压缩上下文继续执行", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_compacted_delivery", function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: packet.targetMessageId }) } }] } }] }, "[DONE]"]);
     }));
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_compacted", signal: new AbortController().signal });
     repository.finishTurn({ turnId: "turn_compacted", assistantContent: result.assistantContent, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
     expect(requestBodies).toHaveLength(2);
-    expect(requestBodies[0]?.messages[0]?.content).toContain("上下文压缩器");
+    expect(requestBodies[0]?.messages[0]?.content).toContain("OceanKing 多 Agent 工作台");
+    expect(requestBodies[0]?.messages.at(-2)?.content).toContain("上下文压缩器");
+    expect(requestBodies[0]?.tool_choice).toBe("auto");
     expect(requestBodies[1]?.messages).toHaveLength(2);
     expect(requestBodies[1]?.messages[1]?.content).toContain("用户要求继续旧任务");
     expect(result.contextCompaction).toMatchObject({ threshold: 8_000, sourceEntries: 3 });
@@ -181,12 +263,9 @@ describe("OpenAI 兼容协议", () => {
     expect(session[0]?.content).not.toContain("必须保留的事实。必须保留的事实。必须保留的事实。");
   }));
 
-  it("Chat Completions 流式 function call 只产生结构化房间 effect", async () => withRepository(async (repository) => {
+  it("把模型误发的旧 send_message 调用升级为新公开正文阶段", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
-    const previewContents: string[] = []; const unsubscribe = subscribeWorkspaceEvents((event) => {
-      const payload = event.payload as { kind?: string; content?: string } | undefined;
-      if (event.entityId === "turn_chat_tool" && payload?.kind === "room_message_preview" && payload.content) previewContents.push(payload.content);
-    });
+    const previewContents: string[] = []; const unsubscribe = subscribeWorkspaceEvents((event) => { appendRoomPreview(previewContents, event, "turn_chat_tool"); });
     let call = 0;
     vi.stubGlobal("fetch", vi.fn(async () => {
       call += 1;
@@ -198,40 +277,251 @@ describe("OpenAI 兼容协议", () => {
         "[DONE]",
       ]);
       return sse([
-        { choices: [{ delta: { content: "工具之后的私有总结" } }] },
+        { choices: [{ delta: { content: "升级后的" } }] },
+        { choices: [{ delta: { content: "普通正文流" } }] },
         { choices: [], usage: { prompt_tokens: 120, prompt_tokens_details: { cached_tokens: 90 }, completion_tokens: 8, total_tokens: 128 } },
         "[DONE]",
       ]);
     }));
     sendUser(repository, "room_harbor", "工具流测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_chat_tool", signal: new AbortController().signal }); unsubscribe();
-    expect(result.assistantContent).toBe("工具之后的私有总结"); expect(result.effects).toHaveLength(1); expect(result.effects[0]).toMatchObject({ type: "send_message", content: "正式工具消息" }); expect(result.tools[0]?.status).toBe("completed");
+    expect(result.assistantContent).toBe(""); expect(result.effects).toHaveLength(1); expect(result.effects[0]).toMatchObject({ type: "send_message", content: "升级后的普通正文流" }); expect(result.tools[0]).toMatchObject({ name: "begin_message_to_room", status: "completed" });
     expect(result.modelMeta.modelCalls).toEqual([
       expect.objectContaining({ index: 1, cachedInputTokens: 80, cacheMissInputTokens: 20, cacheHitRate: 0.8 }),
       expect.objectContaining({ index: 2, cachedInputTokens: 90, cacheMissInputTokens: 30, cacheHitRate: 0.75 }),
     ]);
-    expectProgressivePreview(previewContents, "正式工具消息");
+    expect(previewContents).not.toContain("正式工具消息");
+    expectProgressivePreview(previewContents, "升级后的普通正文流");
   }));
 
-  it("Chat Completions 单块 function call 也逐步发布房间预览", async () => withRepository(async (repository) => {
+  it("单个 provider delta 立即按增量发布，不重发累计正文", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
-    const previewContents: string[] = []; const unsubscribe = subscribeWorkspaceEvents((event) => {
-      const payload = event.payload as { kind?: string; content?: string } | undefined;
-      if (event.entityId === "turn_chat_single_chunk" && payload?.kind === "room_message_preview" && payload.content) previewContents.push(payload.content);
+    const partialContent = "这是一段用于锁定平滑字符步长的较长公开消息内容，仍在继续生成中。";
+    let releaseRest!: () => void;
+    const restGate = new Promise<void>((resolve) => { releaseRest = resolve; });
+    let resolvePartialPreview!: () => void;
+    const partialPreview = new Promise<void>((resolve) => { resolvePartialPreview = resolve; });
+    const previewContents: string[] = []; const previewPayloads: Array<{ delta?: string; content?: string }> = [];
+    const unsubscribe = subscribeWorkspaceEvents((event) => {
+      const payload = event.payload as { kind?: string; delta?: string; content?: string } | undefined;
+      if (event.entityId === "turn_smooth_preview" && payload?.kind === "room_message_preview") previewPayloads.push(payload);
+      const content = appendRoomPreview(previewContents, event, "turn_smooth_preview");
+      if (content === partialContent) resolvePartialPreview();
     });
-    let call = 0; const completeContent = "供应商一次返回的完整公开消息";
+    let call = 0;
     vi.stubGlobal("fetch", vi.fn(async () => {
       call += 1;
       if (call === 1) return sse([
-        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_single_chunk", function: { name: "send_message_to_room", arguments: JSON.stringify({ content: completeContent, kind: "answer", roomId: "room_harbor" }) } }] } }] },
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_smooth_preview", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] },
         "[DONE]",
       ]);
-      return sse([{ choices: [{ delta: { content: "私有总结" } }] }, "[DONE]"]);
+      return gatedSse(
+        [{ choices: [{ delta: { content: partialContent } }] }],
+        ["[DONE]"],
+        restGate,
+      );
     }));
-    sendUser(repository, "room_harbor", "单块工具参数测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const } };
-    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_chat_single_chunk", signal: new AbortController().signal }); unsubscribe();
-    expect(result.effects[0]).toMatchObject({ type: "send_message", content: completeContent });
-    expectProgressivePreview(previewContents, completeContent);
+    sendUser(repository, "room_harbor", "验证平滑预览步长"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const } };
+    repository.beginTurn({ turnId: "turn_smooth_preview", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+    const run = runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_smooth_preview", signal: new AbortController().signal });
+    let timeoutId!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => { timeoutId = setTimeout(() => reject(new Error("长内容预览未按时发布完成")), 1_500); });
+
+    try {
+      await Promise.race([partialPreview, timeout]);
+      expect(previewContents).toEqual([partialContent]);
+      expect(previewPayloads).toEqual([{ kind: "room_message_preview", roomId: "room_harbor", agentId: "navigator", messageKey: "call_smooth_preview", delta: partialContent, messageKind: "answer" }]);
+      expect(previewPayloads[0]?.content).toBeUndefined();
+    } finally {
+      clearTimeout(timeoutId);
+      releaseRest();
+    }
+    const result = await run; unsubscribe();
+    expect(result.effects[0]).toMatchObject({ type: "send_message", content: partialContent });
+  }));
+
+  it("begin_message_to_room 后通过普通 assistant delta 实时公开并在完成后提交", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    let releaseRest!: () => void;
+    const restGate = new Promise<void>((resolve) => { releaseRest = resolve; });
+    let resolveFirstPreview!: (content: string) => void;
+    const firstPreview = new Promise<string>((resolve) => { resolveFirstPreview = resolve; });
+    const previews: string[] = [];
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const unsubscribe = subscribeWorkspaceEvents((event) => {
+      const content = appendRoomPreview(previews, event, "turn_public_chat");
+      if (content && previews.length === 1) resolveFirstPreview(content);
+    });
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_begin_public", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer", messageKey: "public-chat-key" }) } }] } }] },
+        "[DONE]",
+      ]);
+      return gatedSse(
+        [{ choices: [{ delta: { content: "真正" } }] }],
+        [{ choices: [{ delta: { content: "流式正文" } }] }, "[DONE]"],
+        restGate,
+      );
+    }));
+    sendUser(repository, "room_harbor", "使用两阶段公开协议"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    let settled = false;
+    const run = runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_public_chat", signal: new AbortController().signal }).finally(() => { settled = true; });
+    let timeoutId!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => { timeoutId = setTimeout(() => reject(new Error("普通 assistant delta 没有进入房间预览")), 1_500); });
+    try {
+      const first = await Promise.race([firstPreview, timeout]);
+      expect("真正".startsWith(first)).toBe(true);
+      expect(settled).toBe(false);
+    } finally {
+      clearTimeout(timeoutId); releaseRest();
+    }
+    const result = await run; unsubscribe();
+    const firstTools = requestBodies[0]?.tools as Array<{ function: { name: string } }>;
+    expect(firstTools.map((tool) => tool.function.name)).toContain("begin_message_to_room");
+    expect(firstTools.map((tool) => tool.function.name)).not.toContain("send_message_to_room");
+    expect(requestBodies[1]?.tools).toEqual(requestBodies[0]?.tools);
+    expect(requestBodies[1]?.tool_choice).toBe("auto");
+    const firstMessages = requestBodies[0]?.messages as Array<{ role: string; content?: string }>;
+    const publicMessages = requestBodies[1]?.messages as Array<{ role: string; content?: string }>;
+    expect(publicMessages.slice(0, firstMessages.length)).toEqual(firstMessages);
+    expect(countRenderedContextTokens({ instructions: "", messages: publicMessages, tools: requestBodies[1]?.tools }))
+      .toBeGreaterThan(countRenderedContextTokens({ instructions: "", messages: firstMessages, tools: requestBodies[0]?.tools }));
+    expect(publicMessages[0]?.content).toBe(firstMessages[0]?.content);
+    expect(publicMessages.at(-1)?.content).toContain("[系统公开输出阶段]");
+    expect(result.assistantContent).toBe("");
+    expect(result.tools.map((tool) => tool.name)).toEqual(["begin_message_to_room"]);
+    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", roomId: "room_harbor", messageKey: "public-chat-key", content: "真正流式正文", kind: "answer" })]);
+    expectProgressivePreview(previews, "真正流式正文");
+  }));
+
+  it("公开正文为空时保持原路由并只重试正文生成", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const requestBodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_begin_retry", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse(["[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "重试后正式正文" } }] }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "空正文重试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_public_retry", signal: new AbortController().signal });
+    expect(requestBodies).toHaveLength(3);
+    expect(requestBodies[1]?.tools).toEqual(requestBodies[0]?.tools);
+    expect(requestBodies[2]?.tools).toEqual(requestBodies[0]?.tools);
+    expect(requestBodies[1]?.tool_choice).toBe("auto");
+    expect(requestBodies[2]?.tool_choice).toBe("auto");
+    const thirdMessages = requestBodies[2]?.messages as Array<{ role: string; content?: string }>;
+    expect(thirdMessages.at(-1)?.content).toContain("公开正文为空");
+    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "重试后正式正文", messageKey: "call_begin_retry" })]);
+  }));
+
+  it("公开正文阶段保留缓存工具前缀但拒绝模型实际调用工具", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const requestBodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_begin_guard", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_forbidden", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor" }) } }] } }] }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "公开正文工具防线"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    await expect(runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_public_tool_guard", signal: new AbortController().signal }))
+      .rejects.toThrow("公开正文阶段禁止调用工具");
+    expect(requestBodies[1]?.tools).toEqual(requestBodies[0]?.tools);
+    expect(requestBodies[1]?.tool_choice).toBe("auto");
+  }));
+
+  it("公开正文超过统一字符上限时在发布预览和提交前失败", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const previews: string[] = [];
+    const unsubscribe = subscribeWorkspaceEvents((event) => { appendRoomPreview(previews, event, "turn_public_too_long"); });
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      call += 1;
+      if (call === 1) return sse([
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_begin_too_long", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] },
+        "[DONE]",
+      ]);
+      return sse([{ choices: [{ delta: { content: "超".repeat(maxRoomMessageContentCharacters + 1) } }] }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "验证公开正文长度上限"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    await expect(runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_public_too_long", signal: new AbortController().signal }))
+      .rejects.toMatchObject({ name: "ModelRunError", message: expect.stringContaining("字符上限") });
+    unsubscribe();
+    expect(previews).toEqual([]);
+  }));
+
+  it("跨房间交付时逐个打开通道并把正文分别提交到各自房间", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    sendUser(repository, "room_harbor", "旧房间任务"); const oldPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_public_old", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: oldPacket });
+    repository.checkpointTurn({ turnId: "turn_public_old", assistantContent: "旧任务处理中", systemPrompt: "system", conversationMessages: [{ role: "assistant", content: "旧任务处理中" }], tools: [], timeline: [] });
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "公开协议新房间", agentId: "navigator" });
+    const nextRoom = repository.getSnapshot().rooms.find((room) => room.title === "公开协议新房间")!;
+    const nextParticipant = nextRoom.participants.find((participant) => participant.agentId === "navigator")!;
+    sendUser(repository, nextRoom.id, "新房间任务"); const nextPacket = packetFor(repository, nextRoom.id);
+    repository.beginTurn({ turnId: "turn_public_multi", roomId: nextRoom.id, agentId: "navigator", agentParticipantId: nextParticipant.id, packet: nextPacket });
+    repository.continueInterruptedTurn("turn_public_old", "新房间任务接管", nextRoom.id);
+    expect(repository.getTurnDeliveryObligations("turn_public_multi").map((item) => item.roomId).sort()).toEqual(["room_harbor", nextRoom.id].sort());
+
+    const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_begin_new", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: nextRoom.id, kind: "answer", messageKey: "new-room-key" }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { content: "新房间独立结果" } }] }, "[DONE]"]);
+      if (call === 3) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_begin_old", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer", messageKey: "old-room-key" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "旧房间独立结果" } }] }, "[DONE]"]);
+    }));
+    const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: nextParticipant.id, packet: nextPacket, turnId: "turn_public_multi", signal: new AbortController().signal });
+    expect(bodies).toHaveLength(4);
+    expect(bodies[1]?.tools).toEqual(bodies[0]?.tools);
+    expect(bodies[3]?.tools).toEqual(bodies[2]?.tools);
+    expect(bodies[1]?.tool_choice).toBe("auto");
+    expect(bodies[3]?.tool_choice).toBe("auto");
+    const terminalTools = bodies[2]?.tools as Array<{ function: { name: string } }>;
+    expect(terminalTools.map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "read_no_reply"]);
+    expect(result.effects).toEqual([
+      expect.objectContaining({ type: "send_message", roomId: nextRoom.id, messageKey: "new-room-key", content: "新房间独立结果" }),
+      expect.objectContaining({ type: "send_message", roomId: "room_harbor", messageKey: "old-room-key", content: "旧房间独立结果" }),
+    ]);
+  }));
+
+  it("公开正文流被打断时不会生成可提交的正式消息", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    let releaseRest!: () => void;
+    const restGate = new Promise<void>((resolve) => { releaseRest = resolve; });
+    let resolveFirstPreview!: () => void;
+    const firstPreview = new Promise<void>((resolve) => { resolveFirstPreview = resolve; });
+    const unsubscribe = subscribeWorkspaceEvents((event) => {
+      const contents: string[] = [];
+      if (appendRoomPreview(contents, event, "turn_public_abort")) resolveFirstPreview();
+    });
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_begin_abort", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      return gatedSse([{ choices: [{ delta: { content: "只生成了一半" } }] }], ["[DONE]"], restGate);
+    }));
+    sendUser(repository, "room_harbor", "中断公开正文"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const messagesBefore = repository.getRoom("room_harbor")!.messages.length;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    const controller = new AbortController();
+    const run = runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_public_abort", signal: controller.signal });
+    let timeoutId!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => { timeoutId = setTimeout(() => reject(new Error("被打断前没有出现公开预览")), 1_500); });
+    try { await Promise.race([firstPreview, timeout]); controller.abort(); }
+    finally { clearTimeout(timeoutId); releaseRest(); }
+    await expect(run).rejects.toMatchObject({ name: "ModelRunError" });
+    unsubscribe();
+    expect(repository.getRoom("room_harbor")!.messages).toHaveLength(messagesBefore);
   }));
 
   it.each(["chat_completions", "responses"] as const)("%s 的工具续轮只接收 web_fetch 清理后的正文", async (apiFormat) => withRepository(async (repository) => {
@@ -316,7 +606,7 @@ describe("OpenAI 兼容协议", () => {
       ]);
       if (call === 2) return sse([
         { choices: [{ delta: { reasoning_content: "工具已经执行，可以结束" } }] },
-        { choices: [{ delta: { content: "第一轮私有总结" } }] },
+        { choices: [{ delta: { content: "推理工具消息" } }] },
         "[DONE]",
       ]);
       return sse([{ choices: [{ delta: { content: "第二轮私有总结" } }] }, "[DONE]"]);
@@ -330,18 +620,21 @@ describe("OpenAI 兼容协议", () => {
     repository.finishTurn({ turnId: "turn_reasoning_1", assistantContent: firstResult.assistantContent, sessionMessages: firstResult.sessionMessages, tools: firstResult.tools, timeline: firstResult.timeline, effects: firstResult.effects, modelMeta: firstResult.modelMeta, cutoffSeq: firstPacket.cutoffSeq, nextParticipantId: null });
 
     expect(bodies[0]).toMatchObject({ thinking: { type: "enabled" }, reasoning_effort: "max" });
-    expect((bodies[1]?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name).sort()).toEqual(["read_no_reply", "send_message_to_room"]);
+    expect(bodies[1]?.tools).toEqual(bodies[0]?.tools);
+    expect(bodies[1]?.tool_choice).toBe("auto");
     const firstContinuation = bodies[1]?.messages as Array<Record<string, unknown>>;
-    expect(firstContinuation.at(-2)).toMatchObject({ role: "assistant", reasoning_content: "需要先公开工具", tool_calls: [{ id: "call_reasoning" }] });
-    expect(firstContinuation.at(-1)).toMatchObject({ role: "tool", tool_call_id: "call_reasoning" });
+    expect(firstContinuation.at(-3)).toMatchObject({ role: "assistant", reasoning_content: "需要先公开工具", tool_calls: [{ id: "call_reasoning" }] });
+    expect(firstContinuation.at(-2)).toMatchObject({ role: "tool", tool_call_id: "call_reasoning" });
+    expect(firstContinuation.at(-1)).toMatchObject({ role: "user", content: expect.stringContaining("[系统公开输出阶段]") });
 
     sendUser(repository, "room_harbor", "第二轮继续追问");
     const secondPacket = packetFor(repository);
     await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet: secondPacket, turnId: "turn_reasoning_2", signal: new AbortController().signal });
     const secondTurnMessages = bodies[2]?.messages as Array<Record<string, unknown>>;
     expect(secondTurnMessages).toEqual(expect.arrayContaining([
-      expect.objectContaining({ role: "assistant", reasoning_content: "需要先公开工具", tool_calls: [expect.objectContaining({ id: "call_reasoning" })] }),
+      expect.objectContaining({ role: "assistant", reasoning_content: "需要先公开工具", tool_calls: [expect.objectContaining({ id: "call_reasoning", function: expect.objectContaining({ name: "begin_message_to_room" }) })] }),
       expect.objectContaining({ role: "tool", tool_call_id: "call_reasoning" }),
+      expect.objectContaining({ role: "assistant", content: "推理工具消息" }),
     ]));
     expect(firstResult.modelMeta).toMatchObject({ toolSteps: 1, reasoningCharacters: 18 });
   }));
@@ -367,24 +660,25 @@ describe("OpenAI 兼容协议", () => {
       bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>); call += 1;
       if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor", limit: 1 }) } }] } }] }, "[DONE]"]);
       if (call === 2) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_terminal", function: { name: "send_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", content: "达到上限后的正式结果", kind: "answer" }) } }] } }] }, "[DONE]"]);
-      return sse([{ choices: [{ delta: { content: "私有收尾" } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "达到上限后的正式结果" } }] }, "[DONE]"]);
     }));
     sendUser(repository, "room_harbor", "工具上限测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
     const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const, maxToolSteps: 1 } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_terminal_tool", signal: new AbortController().signal });
-    expect(result.tools.map((tool) => tool.name)).toEqual(["read_room_history", "send_message_to_room"]);
+    expect(result.tools.map((tool) => tool.name)).toEqual(["read_room_history", "begin_message_to_room"]);
     expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "达到上限后的正式结果" })]);
-    expect((bodies[1]?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name).sort()).toEqual(["read_no_reply", "send_message_to_room"]);
-    expect(bodies[2]?.tools).toBeUndefined();
+    expect((bodies[1]?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "read_no_reply"]);
+    expect(bodies[2]?.tools).toEqual(bodies[1]?.tools);
+    expect(bodies[2]?.tool_choice).toBe("auto");
   }));
 
   it("Chat 工具输出让上下文越过阈值时，会在下一次模型请求前整体压缩", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
     const fileName = "large-tool-context.txt";
     await fs.writeFile(path.join(repository.dataDir, fileName), Array.from({ length: 3_000 }, (_, index) => `工具关键事实 ${index}：仍需继续处理。`).join("\n"));
-    const requestBodies: Array<{ messages: Array<{ role: string; content?: string }> }> = [];
+    const requestBodies: Array<{ messages: Array<{ role: string; content?: string }>; tools?: unknown; tool_choice?: string }> = [];
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content?: string }> };
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content?: string }>; tools?: unknown; tool_choice?: string };
       requestBodies.push(body);
       if (requestBodies.length === 1) return sse([
         { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_large_read", function: { name: "read_project_context", arguments: JSON.stringify({ root: repository.dataDir, path: fileName }) } }] } }] },
@@ -398,7 +692,11 @@ describe("OpenAI 兼容协议", () => {
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_large_tool_context", signal: new AbortController().signal });
     expect(result.tools[0]?.outputText.length).toBeGreaterThan(50_000);
     expect(requestBodies).toHaveLength(3);
-    expect(requestBodies[1]?.messages[0]?.content).toContain("上下文压缩器");
+    expect(requestBodies[1]?.messages[0]?.content).toBe(requestBodies[0]?.messages[0]?.content);
+    expect(requestBodies[1]?.messages.at(-2)?.content).toContain("上下文压缩器");
+    expect(requestBodies[1]?.messages.slice(0, requestBodies[0]!.messages.length)).toEqual(requestBodies[0]?.messages);
+    expect(requestBodies[1]?.tools).toEqual(requestBodies[0]?.tools);
+    expect(requestBodies[1]?.tool_choice).toBe("auto");
     expect(requestBodies[2]?.messages[1]?.content).toContain("工具返回了大量关键事实");
     expect(result.contextCompaction).toMatchObject({ threshold: 15_000 });
     expect(result.sessionMessages.some((message) => message.role === "tool" && message.tool_call_id === "call_large_read")).toBe(false);
@@ -409,12 +707,9 @@ describe("OpenAI 兼容协议", () => {
     ]));
   }));
 
-  it("Responses function arguments 发布跨片段房间预览", async () => withRepository(async (repository) => {
+  it("把 Responses 误发的旧 send_message 调用升级为新公开正文阶段", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
-    const previewContents: string[] = []; const unsubscribe = subscribeWorkspaceEvents((event) => {
-      const payload = event.payload as { kind?: string; content?: string } | undefined;
-      if (event.entityId === "turn_responses_tool" && payload?.kind === "room_message_preview" && payload.content && previewContents.at(-1) !== payload.content) previewContents.push(payload.content);
-    });
+    const previewContents: string[] = []; const unsubscribe = subscribeWorkspaceEvents((event) => { appendRoomPreview(previewContents, event, "turn_responses_tool"); });
     let call = 0; const fullArguments = JSON.stringify({ roomId: "room_harbor", content: "Responses 流式消息", kind: "answer" });
     vi.stubGlobal("fetch", vi.fn(async () => {
       call += 1;
@@ -425,33 +720,55 @@ describe("OpenAI 兼容协议", () => {
         { type: "response.output_item.done", item: { id: "item_1", call_id: "call_responses", type: "function_call", name: "send_message_to_room", arguments: fullArguments } },
         { type: "response.completed", response: { id: "resp_tools" } }, "[DONE]",
       ]);
-      return sse([{ type: "response.output_text.delta", delta: "私有总结" }, { type: "response.completed", response: { id: "resp_done" } }, "[DONE]"]);
+      return sse([{ type: "response.output_text.delta", delta: "Responses " }, { type: "response.output_text.delta", delta: "升级正文" }, { type: "response.completed", response: { id: "resp_done" } }, "[DONE]"]);
     }));
     sendUser(repository, "room_harbor", "Responses 工具流测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const } };
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses_tool", signal: new AbortController().signal }); unsubscribe();
-    expect(result.effects[0]).toMatchObject({ type: "send_message", content: "Responses 流式消息" });
-    expectProgressivePreview(previewContents, "Responses 流式消息");
+    expect(result.effects[0]).toMatchObject({ type: "send_message", content: "Responses 升级正文" });
+    expect(result.tools[0]).toMatchObject({ name: "begin_message_to_room", status: "completed" });
+    expect(previewContents).not.toContain("Responses 流式消息");
+    expectProgressivePreview(previewContents, "Responses 升级正文");
   }));
 
-  it("Responses 完成事件一次给出完整参数时也逐步发布房间预览", async () => withRepository(async (repository) => {
+  it("Responses 在打开房间后把 output_text.delta 作为公开正文流", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
-    const previewContents: string[] = []; const unsubscribe = subscribeWorkspaceEvents((event) => {
-      const payload = event.payload as { kind?: string; content?: string } | undefined;
-      if (event.entityId === "turn_responses_single_chunk" && payload?.kind === "room_message_preview" && payload.content) previewContents.push(payload.content);
+    let releaseRest!: () => void;
+    const restGate = new Promise<void>((resolve) => { releaseRest = resolve; });
+    let resolveFirstPreview!: () => void;
+    const firstPreview = new Promise<void>((resolve) => { resolveFirstPreview = resolve; });
+    const previews: string[] = []; const bodies: Array<Record<string, unknown>> = [];
+    const unsubscribe = subscribeWorkspaceEvents((event) => {
+      const content = appendRoomPreview(previews, event, "turn_public_responses");
+      if (content && previews.length === 1) resolveFirstPreview();
     });
-    let call = 0; const completeContent = "Responses 一次返回的完整公开消息"; const fullArguments = JSON.stringify({ content: completeContent, kind: "answer", roomId: "room_harbor" });
-    vi.stubGlobal("fetch", vi.fn(async () => {
-      call += 1;
-      if (call === 1) return sse([
-        { type: "response.output_item.added", item: { id: "item_single", call_id: "call_responses_single", type: "function_call", name: "send_message_to_room", arguments: "" } },
-        { type: "response.output_item.done", item: { id: "item_single", call_id: "call_responses_single", type: "function_call", name: "send_message_to_room", arguments: fullArguments } },
-        { type: "response.completed", response: { id: "resp_single" } }, "[DONE]",
-      ]);
-      return sse([{ type: "response.output_text.delta", delta: "私有总结" }, { type: "response.completed", response: { id: "resp_single_done" } }, "[DONE]"]);
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) {
+        const item = { id: "item_begin_public", call_id: "call_begin_responses", type: "function_call", name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer", messageKey: "public-responses-key" }) };
+        return sse([{ type: "response.output_item.added", item }, { type: "response.output_item.done", item }, { type: "response.completed", response: { id: "resp_begin_public" } }, "[DONE]"]);
+      }
+      return gatedSse(
+        [{ type: "response.output_text.delta", delta: "Responses " }],
+        [{ type: "response.output_text.delta", delta: "公开正文" }, { type: "response.completed", response: { id: "resp_public_body" } }, "[DONE]"],
+        restGate,
+      );
     }));
-    sendUser(repository, "room_harbor", "Responses 单块工具参数测试"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const } };
-    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses_single_chunk", signal: new AbortController().signal }); unsubscribe();
-    expect(result.effects[0]).toMatchObject({ type: "send_message", content: completeContent });
-    expectProgressivePreview(previewContents, completeContent);
+    sendUser(repository, "room_harbor", "Responses 两阶段公开协议"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const, thinkingMode: "disabled" as const } };
+    const run = runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_public_responses", signal: new AbortController().signal });
+    let timeoutId!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => { timeoutId = setTimeout(() => reject(new Error("Responses 公开正文没有提前显示")), 1_500); });
+    try { await Promise.race([firstPreview, timeout]); }
+    finally { clearTimeout(timeoutId); releaseRest(); }
+    const result = await run; unsubscribe();
+    expect(bodies[1]?.tools).toEqual(bodies[0]?.tools);
+    expect(bodies[1]?.tool_choice).toBe("auto");
+    expect(bodies[1]?.instructions).toBeUndefined();
+    expect(bodies[1]?.previous_response_id).toBe("resp_begin_public");
+    expect(JSON.stringify(bodies[1]?.input)).toContain("[系统公开输出阶段]");
+    expect(result.assistantContent).toBe("");
+    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", messageKey: "public-responses-key", content: "Responses 公开正文" })]);
+    expectProgressivePreview(previews, "Responses 公开正文");
   }));
 });

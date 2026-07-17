@@ -151,6 +151,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .message-content a { color: var(--accent-strong); }
 .streaming-message .message-content { border-color: color-mix(in srgb, var(--accent) 38%, var(--line)); }
 .streaming-message .message-meta > span { color: var(--accent); }
+.streaming-content { white-space: pre-wrap; overflow-wrap: anywhere; }
 .stream-cursor { display: inline-block; width: 2px; height: 1em; margin-left: 3px; vertical-align: -.12em; border-radius: 2px; background: var(--accent); animation: stream-blink .8s steps(1) infinite; }
 .attachment-list { display: grid; gap: 6px; margin-top: 8px; }
 .attachment-list a { display: grid; grid-template-columns: 18px 1fr auto; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text-soft); font-size: 10px; text-decoration: none; }

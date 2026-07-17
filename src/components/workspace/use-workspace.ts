@@ -36,15 +36,23 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot, initialEventCur
         if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "assistant_delta" && event.payload.delta) {
           setPreviews((current) => ({ ...current, [event.entityId!]: `${current[event.entityId!] ?? ""}${event.payload!.delta}` }));
         }
-        if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "room_message_preview" && event.payload.roomId && event.payload.agentId && event.payload.messageKey && event.payload.content) {
-          const preview: RoomMessagePreview = { turnId: event.entityId, roomId: event.payload.roomId, agentId: event.payload.agentId, messageKey: event.payload.messageKey, content: event.payload.content, kind: event.payload.messageKind ?? "answer" };
-          setRoomPreviews((current) => ({ ...current, [event.entityId!]: preview }));
+        if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "room_message_preview" && event.payload.roomId && event.payload.agentId && event.payload.messageKey && (event.payload.delta || event.payload.content)) {
+          const key = `${event.entityId}:${event.payload.messageKey}`;
+          setRoomPreviews((current) => {
+            const existing = current[key];
+            const content = event.payload!.content ?? `${existing?.content ?? ""}${event.payload!.delta ?? ""}`;
+            const preview: RoomMessagePreview = { turnId: event.entityId!, roomId: event.payload!.roomId!, agentId: event.payload!.agentId!, messageKey: event.payload!.messageKey!, content, kind: event.payload!.messageKind ?? "answer" };
+            return { ...current, [key]: preview };
+          });
         }
         if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "history_checkpoint" && typeof event.id === "number") {
           setAgentHistoryCheckpoints((current) => current[event.entityId!] === event.id ? current : { ...current, [event.entityId!]: event.id! });
         }
-        if (refreshTimer.current) clearTimeout(refreshTimer.current);
-        refreshTimer.current = setTimeout(() => { void refresh(); }, 80);
+        const highFrequencyPreview = event.type === "turn.preview" && (event.payload?.kind === "assistant_delta" || event.payload?.kind === "room_message_preview");
+        if (!highFrequencyPreview) {
+          if (refreshTimer.current) clearTimeout(refreshTimer.current);
+          refreshTimer.current = setTimeout(() => { void refresh(); }, 80);
+        }
       } catch { /* ignore malformed event */ }
     };
     ["workspace.changed", "turn.preview", "scheduler.changed", "cron.changed"].forEach((name) => events.addEventListener(name, onEvent as EventListener));

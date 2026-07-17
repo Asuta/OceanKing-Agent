@@ -24,26 +24,35 @@ async function waitUntil(assertion: () => boolean, timeoutMs = 3_000): Promise<v
   }
 }
 
+const pendingCompletedResponses = new Map<string, Response>();
+
+function responseEvents(events: Array<Record<string, unknown> | "[DONE]">): Response {
+  return new Response(events.map((event) => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n") + "\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
 function completedResponse(content: string, responseId: string, roomIds = ["room_harbor"]): Response {
-  const events = roomIds.flatMap((roomId, index) => {
-    const item = {
-      id: `${responseId}_item_${index}`,
-      call_id: `${responseId}_call_${index}`,
-      type: "function_call",
-      name: "send_message_to_room",
-      arguments: JSON.stringify({ roomId, content, kind: "answer" }),
-    };
-    return [
-      `data: ${JSON.stringify({ type: "response.output_item.added", item })}`,
-      `data: ${JSON.stringify({ type: "response.output_item.done", item })}`,
-    ];
+  let firstResponse: Response | null = null;
+  let previousBodyId: string | null = null;
+  roomIds.forEach((roomId, index) => {
+    const routeId = `${responseId}_route_${index}`;
+    const bodyId = `${responseId}_body_${index}`;
+    const item = { id: `${routeId}_item`, call_id: `${routeId}_call`, type: "function_call", name: "begin_message_to_room", arguments: JSON.stringify({ roomId, kind: "answer" }) };
+    const routeResponse = responseEvents([{ type: "response.output_item.added", item }, { type: "response.output_item.done", item }, { type: "response.completed", response: { id: routeId } }, "[DONE]"]);
+    const bodyResponse = responseEvents([{ type: "response.output_text.delta", delta: content }, { type: "response.completed", response: { id: bodyId } }, "[DONE]"]);
+    if (!firstResponse) firstResponse = routeResponse;
+    else if (previousBodyId) pendingCompletedResponses.set(previousBodyId, routeResponse);
+    pendingCompletedResponses.set(routeId, bodyResponse);
+    previousBodyId = bodyId;
   });
-  events.push(
-    `data: ${JSON.stringify({ type: "response.completed", response: { id: responseId } })}`,
-    "data: [DONE]",
-    "",
-  );
-  return new Response(events.join("\n\n"), { status: 200, headers: { "content-type": "text/event-stream" } });
+  return firstResponse ?? responseEvents(["[DONE]"]);
+}
+
+function takePendingCompletedResponse(init?: RequestInit): Response | null {
+  const body = JSON.parse(String(init?.body ?? "{}")) as { previous_response_id?: string };
+  if (!body.previous_response_id) return null;
+  const response = pendingCompletedResponses.get(body.previous_response_id) ?? null;
+  if (response) pendingCompletedResponses.delete(body.previous_response_id);
+  return response;
 }
 
 function privateResponse(content: string, responseId: string): Response {
@@ -83,6 +92,7 @@ function setMaxRoomRounds(repository: Parameters<typeof commandBase>[0], maxRoom
 afterEach(() => {
   vi.unstubAllGlobals();
   resetCronRunTrackerForTests();
+  pendingCompletedResponses.clear();
   restoreEnvironment("apiKey", "OPENAI_API_KEY");
   restoreEnvironment("baseUrl", "OPENAI_BASE_URL");
   restoreEnvironment("apiFormat", "OPENAI_API_FORMAT");
@@ -98,6 +108,7 @@ describe("房间消息自动打断", () => {
     const requestBodies: Array<Record<string, unknown>> = [];
     let callCount = 0;
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       if (callCount === 1) {
@@ -151,6 +162,7 @@ describe("房间消息自动打断", () => {
     let callCount = 0;
     let secondRoomId = "";
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       if (callCount === 1) {
@@ -203,6 +215,7 @@ describe("房间消息自动打断", () => {
     let takeoverRoomId = "";
     let callCount = 0;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       if (callCount === 1) {
         markFirstStarted();
@@ -250,6 +263,7 @@ describe("房间消息自动打断", () => {
     const requestBodies: Array<Record<string, unknown>> = [];
     let callCount = 0;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       if (callCount === 1) return toolResponse("create_room", { title: "副作用只能执行一次", agentIds: [] }, "response_create_once");
@@ -271,7 +285,7 @@ describe("房间消息自动打断", () => {
       expect(repository.getSnapshot().rooms.filter((room) => room.title === "副作用只能执行一次")).toHaveLength(1);
       expect(repository.getRoom("room_harbor")!.turns.map((turn) => turn.userEnvelope.type)).toEqual(["scheduler_packet", "delivery_packet"]);
       const retryTools = requestBodies[4]?.tools as Array<{ name: string }>;
-      expect(retryTools.map((tool) => tool.name).sort()).toEqual(["read_no_reply", "send_message_to_room"]);
+      expect(retryTools.map((tool) => tool.name).sort()).toEqual(["begin_message_to_room", "read_no_reply"]);
       expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs").get() as { count: number }).count).toBe(0);
     });
   });
@@ -285,6 +299,7 @@ describe("房间消息自动打断", () => {
     const requestBodies: Array<Record<string, unknown>> = [];
     let callCount = 0;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       if (callCount === 1) {
@@ -334,6 +349,7 @@ describe("房间消息自动打断", () => {
     const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
     let callCount = 0;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       if (callCount <= 2) {
         if (callCount === 1) markFirstStarted(); else markSecondStarted();
@@ -377,6 +393,7 @@ describe("房间消息自动打断", () => {
     const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
     let callCount = 0;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       if (callCount === 1) {
         markFirstStarted();
@@ -423,6 +440,7 @@ describe("房间消息自动打断", () => {
     let callCount = 0;
     let takeoverRoomId = "";
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       if (callCount <= 2) {
@@ -478,6 +496,7 @@ describe("房间消息自动打断", () => {
     let callCount = 0;
     let historicalRoomId = "";
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       if (callCount === 1) {
         markActiveStarted();
@@ -528,6 +547,7 @@ describe("房间消息自动打断", () => {
     const takeoverResponse = new Promise<Response>((resolve) => { finishTakeover = resolve; });
     let callCount = 0;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       if (callCount === 1) {
         markCronStarted();
@@ -576,6 +596,7 @@ describe("房间消息自动打断", () => {
     const requestBodies: Array<Record<string, unknown>> = [];
     let callCount = 0;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       if (callCount <= 3) return privateResponse("领航员尚未公开 Cron 结果", `response_cron_private_${callCount}`);
@@ -601,7 +622,7 @@ describe("房间消息自动打断", () => {
       expect(repository.getSnapshot().cronRuns.find((run) => run.id === cron.runId)?.status).toBe("running");
       expect(repository.getRoom("room_harbor")!.turns.at(-1)?.userEnvelope.type).toBe("delivery_packet");
       const retryTools = requestBodies[4]?.tools as Array<{ name: string }>;
-      expect(retryTools.map((tool) => tool.name).sort()).toEqual(["read_no_reply", "send_message_to_room"]);
+      expect(retryTools.map((tool) => tool.name).sort()).toEqual(["begin_message_to_room", "read_no_reply"]);
 
       finishDeliveryRetry(completedResponse("领航员补交 Cron 最终结果", "response_navigator_cron_retry"));
       await waitUntil(() => repository.getSnapshot().cronRuns.find((run) => run.id === cron.runId)?.status === "completed");
@@ -614,7 +635,8 @@ describe("房间消息自动打断", () => {
     process.env.OPENAI_BASE_URL = "https://example.test/v1";
     process.env.OPENAI_API_FORMAT = "responses";
     let callCount = 0;
-    vi.stubGlobal("fetch", vi.fn(async (): Promise<Response> => {
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       if (callCount <= 3) return privateResponse("领航员始终没有公开结果", `response_cron_exhausted_${callCount}`);
       return completedResponse("执行者已完成自己的处理", "response_builder_before_failure");

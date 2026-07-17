@@ -91,7 +91,7 @@ export class WorkspaceRepository {
       const settings = JSON.stringify(this.defaultSettings());
       const insertAgent = this.raw.prepare("INSERT INTO agents(id,label,summary,instruction,skills_json,settings_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)");
       insertAgent.run("navigator", "领航员", "梳理目标、协调房间并公开可靠结论", "你是 OceanKing 领航员。先调查和协调，再通过房间工具明确公开经过整理的结论。普通 assistant 文本对人类不可见。", "[]", settings, at, at);
-      insertAgent.run("builder", "执行者", "执行具体任务并汇报可验证结果", "你是 OceanKing 执行者。聚焦实际执行、工具使用和验证，只通过 send_message_to_room 公开需要人类看到的内容。", "[]", settings, at, at);
+      insertAgent.run("builder", "执行者", "执行具体任务并汇报可验证结果", "你是 OceanKing 执行者。聚焦实际执行、工具使用和验证。需要公开内容时先调用 begin_message_to_room，再在下一次 assistant 回复中输出正文。", "[]", settings, at, at);
       this.raw.prepare("INSERT INTO agent_sessions(agent_id,history_json,active_turn_id,updated_at) VALUES(?,?,NULL,?)").run("navigator", "[]", at);
       this.raw.prepare("INSERT INTO agent_sessions(agent_id,history_json,active_turn_id,updated_at) VALUES(?,?,NULL,?)").run("builder", "[]", at);
 

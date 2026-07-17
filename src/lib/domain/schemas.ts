@@ -28,9 +28,17 @@ export type WorkspaceCommand = z.infer<typeof workspaceCommandSchema>;
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, Extract<keyof T, K>> : never;
 export type WorkspaceCommandDraft = DistributiveOmit<WorkspaceCommand, "commandId" | "expectedVersion">;
 
+export const maxRoomMessageContentCharacters = 100_000;
+
 export const sendMessageToolSchema = z.object({
   roomId: z.string().min(1),
-  content: z.string().min(1).max(100_000),
+  content: z.string().min(1).max(maxRoomMessageContentCharacters),
+  kind: z.enum(["answer", "progress", "warning", "error", "clarification"]).default("answer"),
+  messageKey: z.string().max(200).optional(),
+});
+
+export const beginMessageToolSchema = z.object({
+  roomId: z.string().min(1),
   kind: z.enum(["answer", "progress", "warning", "error", "clarification"]).default("answer"),
   messageKey: z.string().max(200).optional(),
 });

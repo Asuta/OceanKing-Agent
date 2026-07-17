@@ -57,7 +57,7 @@ describe("Agent runtime 与 canonical tools", () => {
 
   it("工具注册表包含房间、工作区、基础与 Cron 能力", () => {
     const names = new Set(listToolDefinitions().map((tool) => tool.name));
-    for (const name of ["send_message_to_room", "read_no_reply", "list_available_agents", "read_room_history", "workspace_read", "workspace_write", "shell", "web_fetch", "create_cron_job"]) expect(names.has(name)).toBe(true);
+    for (const name of ["begin_message_to_room", "send_message_to_room", "read_no_reply", "list_available_agents", "read_room_history", "workspace_read", "workspace_write", "shell", "web_fetch", "create_cron_job"]) expect(names.has(name)).toBe(true);
   });
 
   it("按需返回可协作 Agent 信息卡，不依赖 scheduler packet 携带清单", async () => withRepository(async (repository) => {

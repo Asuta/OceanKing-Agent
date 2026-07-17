@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type { Agent, CronJob, SchedulerPacket, ToolExecutionResult, TurnEffect } from "@/lib/domain/types";
-import { readNoReplyToolSchema, sendMessageToolSchema } from "@/lib/domain/schemas";
+import { beginMessageToolSchema, readNoReplyToolSchema, sendMessageToolSchema } from "@/lib/domain/schemas";
 import { WorkspaceRepository } from "@/lib/server/repository";
 import { extractWebContent, isSupportedWebContentType, limitWebContentTokens, readLimitedResponseText } from "@/lib/server/web-content";
 import { createId, nowIso } from "@/lib/utils/id";
@@ -23,6 +23,7 @@ export type ToolDefinition = {
   description: string;
   schema: z.ZodType;
   parameters: Record<string, unknown>;
+  modelVisible?: boolean;
   execute: (context: ToolContext, args: unknown, toolCallId: string) => Promise<ToolExecutionResult>;
 };
 
@@ -101,7 +102,29 @@ async function runShell(command: string, signal: AbortSignal): Promise<{ stdout:
 
 const tools: ToolDefinition[] = [
   {
-    name: "send_message_to_room", description: "向一个已连接房间提交正式、公开的 Agent 消息。普通 assistant 文本不会公开。", schema: sendMessageToolSchema,
+    name: "begin_message_to_room",
+    description: "打开一个房间的公开回复通道。调用成功后，下一次 assistant 输出的全部正文会实时显示并正式提交到该房间；一次只打开一个房间。",
+    schema: beginMessageToolSchema,
+    parameters: { type: "object", additionalProperties: false, required: ["roomId", "kind"], properties: { roomId: { type: "string" }, kind: { type: "string", enum: ["answer", "progress", "warning", "error", "clarification"] }, messageKey: { type: "string" } } },
+    execute: async (context, raw, callId) => {
+      const args = beginMessageToolSchema.parse(raw); requireConnectedRoom(context, args.roomId);
+      const route = { type: "begin_room_message" as const, roomId: args.roomId, kind: args.kind, messageKey: args.messageKey ?? callId };
+      return {
+        text: [
+          "[系统公开输出阶段]",
+          `目标房间：${args.roomId}`,
+          `消息类型：${args.kind}`,
+          "下一次 assistant 回复的全部 content 会被实时公开到目标房间。",
+          "只输出要给房间成员阅读的完整正文；不要输出构思、前言、路由信息、JSON 或工具调用。正文不能为空。",
+        ].join("\n"),
+        structured: route,
+        effects: [],
+      };
+    },
+  },
+  {
+    name: "send_message_to_room", description: "旧版兼容工具：把完整正文作为工具参数一次性提交。新任务应使用 begin_message_to_room，以获得可靠的普通文本流式输出。", schema: sendMessageToolSchema,
+    modelVisible: false,
     parameters: { type: "object", additionalProperties: false, required: ["roomId", "content", "kind"], properties: { roomId: { type: "string" }, content: { type: "string" }, kind: { type: "string", enum: ["answer", "progress", "warning", "error", "clarification"] }, messageKey: { type: "string" } } },
     execute: async (context, raw, callId) => {
       const args = sendMessageToolSchema.parse(raw); requireConnectedRoom(context, args.roomId);
@@ -229,9 +252,9 @@ export function listToolDefinitions(): ToolDefinition[] { return tools; }
 export function getToolDefinition(name: string): ToolDefinition | undefined { return toolMap.get(name); }
 
 export function toolDefinitionsForChat() {
-  return tools.map((tool) => ({ type: "function", function: { name: tool.name, description: tool.description, parameters: tool.parameters, strict: false } }));
+  return tools.filter((tool) => tool.modelVisible !== false).map((tool) => ({ type: "function", function: { name: tool.name, description: tool.description, parameters: tool.parameters, strict: false } }));
 }
 
 export function toolDefinitionsForResponses() {
-  return tools.map((tool) => ({ type: "function", name: tool.name, description: tool.description, parameters: tool.parameters, strict: false }));
+  return tools.filter((tool) => tool.modelVisible !== false).map((tool) => ({ type: "function", name: tool.name, description: tool.description, parameters: tool.parameters, strict: false }));
 }

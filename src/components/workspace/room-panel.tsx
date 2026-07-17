@@ -106,9 +106,9 @@ export function RoomPanel({ room, agents, previews, busy, sendCommand, onToggleC
           {message.receipts.length ? <div className="receipt-line">已阅不回 · {message.receipts.map((receipt) => room.participants.find((participant) => participant.id === receipt.agentParticipantId)?.displayName ?? "Agent").join("、")}</div> : null}
         </div>
       </article>)}
-      {visiblePreviews.map((preview) => <article key={preview.turnId} className="message from-agent streaming-message" aria-live="polite" aria-label="Agent 正在生成公开回复">
+      {visiblePreviews.map((preview) => <article key={`${preview.turnId}:${preview.messageKey}`} className="message from-agent streaming-message" aria-live="polite" aria-label="Agent 正在生成公开回复">
         <div className="message-avatar"><Bot size={16} /></div>
-        <div className="message-body"><div className="message-meta"><strong>{agents.find((agent) => agent.id === preview.agentId)?.label ?? "Agent"}</strong><span>生成中</span><em>{preview.kind}</em></div><div className="message-content"><Markdown>{preview.content}</Markdown><span className="stream-cursor" aria-hidden="true" /></div></div>
+        <div className="message-body"><div className="message-meta"><strong>{agents.find((agent) => agent.id === preview.agentId)?.label ?? "Agent"}</strong><span>生成中</span><em>{preview.kind}</em></div><div className="message-content streaming-content"><span>{preview.content}</span><span className="stream-cursor" aria-hidden="true" /></div></div>
       </article>)}
       {room.scheduler.status === "running" ? <div className="agent-working"><LoaderCircle className="spin" size={15} /><span>{room.participants.find((participant) => participant.id === room.scheduler.activeParticipantId)?.displayName ?? "Agent"} 正在私有执行区工作</span><small>公开房间不会显示未提交草稿</small></div> : null}
     </div>
