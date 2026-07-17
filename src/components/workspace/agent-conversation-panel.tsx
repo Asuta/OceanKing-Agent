@@ -3,23 +3,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Bot, CheckCircle2, ChevronDown, ChevronRight, CircleDashed, Code2, EyeOff, MessageSquareText, TriangleAlert, Wrench } from "lucide-react";
 import type { AgentConversationHistory, AgentConversationTurn, AgentSessionMessage, AgentTurn, ToolExecution } from "@/lib/domain/types";
+import { unpersistedAssistantPreview } from "@/components/workspace/live-assistant-preview";
 import { Markdown } from "@/components/workspace/markdown";
 
 const scrollFollowThreshold = 48;
 
 function isAtConversationBottom(element: HTMLDivElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= scrollFollowThreshold;
-}
-
-function unpersistedPreview(persisted: string, preview: string | undefined): string {
-  if (!preview) return "";
-  if (preview.startsWith(persisted)) return preview.slice(persisted.length);
-  if (persisted.endsWith(preview)) return "";
-  const maxOverlap = Math.min(persisted.length, preview.length);
-  for (let length = maxOverlap; length > 0; length -= 1) {
-    if (persisted.endsWith(preview.slice(0, length))) return preview.slice(length);
-  }
-  return preview;
 }
 
 function prettyJson(value: unknown): string {
@@ -66,7 +56,7 @@ function TimelineTurn({ turn, livePreview, expandedTools, toggleTool }: { turn: 
   const linkedToolIds = new Set(turn.messages.flatMap((message) => message.role === "tool" ? [message.tool_call_id] : []));
   const unlinkedTools = turn.tools.filter((tool) => !linkedToolIds.has(tool.id));
   const source = turn.userEnvelope.type === "cron_packet" ? `Cron · ${turn.roomTitle}` : turn.roomTitle;
-  const liveOutput = turn.status === "running" ? unpersistedPreview(turn.assistantContent, livePreview) : "";
+  const liveOutput = turn.status === "running" ? unpersistedAssistantPreview(turn.assistantContent, livePreview) : "";
   return <section className="agent-timeline-turn" data-turn-id={turn.id}>
     <header className="agent-turn-marker">
       <span className={`turn-status ${turn.status}`}>{statusIcon(turn.status)}{turn.status}</span>

@@ -28,6 +28,47 @@ const snapshot: WorkspaceSnapshot = {
   },
 };
 
+const runningSnapshot: WorkspaceSnapshot = {
+  ...snapshot,
+  rooms: [{
+    id: "room_live",
+    title: "实时房间",
+    ownerParticipantId: null,
+    participants: [],
+    messages: [],
+    turns: [{
+      id: "turn_live",
+      roomId: "room_live",
+      agentId: "navigator",
+      agentParticipantId: "participant_navigator",
+      userEnvelope: {
+        type: "scheduler_packet",
+        room: { id: "room_live", title: "实时房间" },
+        targetMessageId: "message_live",
+        cutoffSeq: 1,
+        sender: { id: "human", name: "你" },
+        messages: [{ id: "message_live", seq: 1, content: "继续检查", source: "user", kind: "user_input", attachments: [] }],
+        connectedRooms: [],
+        availableAgents: [],
+      },
+      anchorMessageId: "message_live",
+      assistantContent: "先检查配置",
+      tools: [],
+      emittedMessageIds: [],
+      timeline: [],
+      status: "running",
+      modelMeta: null,
+      error: null,
+      createdAt: "2026-07-17T10:00:00.000Z",
+      updatedAt: "2026-07-17T10:00:00.000Z",
+    }],
+    scheduler: { roomId: "room_live", status: "running", nextAgentParticipantId: null, activeParticipantId: "participant_navigator", roundCount: 0, cursorByParticipantId: {}, receiptRevisionByParticipantId: {}, rerunRequested: false },
+    archivedAt: null,
+    createdAt: "2026-07-17T10:00:00.000Z",
+    updatedAt: "2026-07-17T10:00:00.000Z",
+  }],
+};
+
 class FakeEventSource {
   static latest: FakeEventSource | null = null;
   readonly listeners = new Map<string, Set<EventListener>>();
@@ -48,14 +89,15 @@ class FakeEventSource {
   }
 }
 
-function WorkspaceProbe() {
-  const workspace = useWorkspace(snapshot, 99);
+function WorkspaceProbe({ initialSnapshot = snapshot }: { initialSnapshot?: WorkspaceSnapshot }) {
+  const workspace = useWorkspace(initialSnapshot, 99);
   const roomPreviews = Object.values(workspace.roomPreviews)
     .map((preview) => `${preview.roomId}:${preview.messageKey}:${preview.content}`)
     .sort()
     .join("|");
   return <>
     <output aria-label="Agent 历史检查点">{workspace.agentHistoryCheckpoints.turn_live ?? 0}</output>
+    <output aria-label="Assistant 实时预览">{workspace.previews.turn_live ?? ""}</output>
     <output aria-label="房间消息预览">{roomPreviews}</output>
   </>;
 }
@@ -77,6 +119,29 @@ describe("工作区实时事件", () => {
     }));
 
     expect(screen.getByLabelText("Agent 历史检查点").textContent).toBe("101");
+  });
+
+  it("从当前快照正文开始累积增量并保留合法重复文字", () => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(runningSnapshot), { status: 200, headers: { "content-type": "application/json" } })));
+    render(<WorkspaceProbe initialSnapshot={runningSnapshot} />);
+
+    act(() => {
+      FakeEventSource.latest?.emit("turn.preview", {
+        id: 151,
+        type: "turn.preview",
+        entityId: "turn_live",
+        payload: { kind: "assistant_delta", delta: "配置仍然有效" },
+      });
+      FakeEventSource.latest?.emit("turn.preview", {
+        id: 152,
+        type: "turn.preview",
+        entityId: "turn_live",
+        payload: { kind: "assistant_delta", delta: "，继续执行" },
+      });
+    });
+
+    expect(screen.getByLabelText("Assistant 实时预览").textContent).toBe("先检查配置配置仍然有效，继续执行");
   });
 
   it("同一 Turn 的多个 send_message 预览按 messageKey 独立保存", () => {

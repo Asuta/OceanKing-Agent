@@ -2,8 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Archive, Bot, Check, ChevronDown, FileText, LoaderCircle, Paperclip, PanelRightOpen, Pencil, Send, Square, UserPlus, X } from "lucide-react";
-import type { Agent, Attachment, Room, RoomMessagePreview } from "@/lib/domain/types";
+import type { Agent, AgentTurn, Attachment, Room, RoomMessagePreview } from "@/lib/domain/types";
 import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
+import { mergedAssistantPreview } from "@/components/workspace/live-assistant-preview";
 import { Markdown } from "@/components/workspace/markdown";
 
 type SendCommand = (draft: WorkspaceCommandDraft) => Promise<boolean>;
@@ -52,7 +53,29 @@ export function RoomTitleEditor({ roomId, title, busy, sendCommand }: { roomId: 
   </form>;
 }
 
-export function RoomPanel({ room, agents, previews, busy, sendCommand, onToggleConsole, consoleOpen }: { room: Room; agents: Agent[]; previews: RoomMessagePreview[]; busy: boolean; sendCommand: SendCommand; onToggleConsole: () => void; consoleOpen: boolean }) {
+function PrivateAssistantStatus({ turn, agentLabel, content }: { turn: AgentTurn; agentLabel: string; content: string }) {
+  const outputRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const element = outputRef.current;
+    if (element) element.scrollTop = element.scrollHeight;
+  }, [content]);
+
+  return <article className="message from-agent private-status-message" aria-live="polite" aria-label={`${agentLabel} 私有执行状态`} data-turn-id={turn.id}>
+    <div className="message-avatar"><LoaderCircle className="spin" size={16} /></div>
+    <div className="message-body">
+      <div className="message-meta"><strong>{agentLabel}</strong><span>私有执行中</span><em>临时状态</em></div>
+      <div className="message-content private-status-content">
+        <div className="private-status-output" ref={outputRef}>
+          {content ? <><Markdown>{content}</Markdown><span className="stream-cursor" aria-hidden="true" /></> : <p className="private-status-empty">正在等待 Assistant 输出…</p>}
+        </div>
+        <small>仅用于展示当前进度，不写入房间历史</small>
+      </div>
+    </div>
+  </article>;
+}
+
+export function RoomPanel({ room, agents, previews, assistantPreviews, busy, sendCommand, onToggleConsole, consoleOpen }: { room: Room; agents: Agent[]; previews: RoomMessagePreview[]; assistantPreviews: Record<string, string>; busy: boolean; sendCommand: SendCommand; onToggleConsole: () => void; consoleOpen: boolean }) {
   const [content, setContent] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -61,7 +84,13 @@ export function RoomPanel({ room, agents, previews, busy, sendCommand, onToggleC
   const followLatestRef = useRef(false);
   const availableAgents = agents.filter((agent) => !room.participants.some((participant) => participant.agentId === agent.id));
   const visiblePreviews = previews.filter((preview) => preview.roomId === room.id && !room.messages.some((message) => message.messageKey === preview.messageKey));
-  const previewLength = visiblePreviews.reduce((total, preview) => total + preview.content.length, 0);
+  const publicPreviewTurnIds = new Set(previews.map((preview) => preview.turnId));
+  const runningTurns = room.turns.filter((turn) => turn.status === "running");
+  const privateStatuses = runningTurns
+    .filter((turn) => !publicPreviewTurnIds.has(turn.id) && turn.emittedMessageIds.length === 0)
+    .map((turn) => ({ turn, content: mergedAssistantPreview(turn.assistantContent, assistantPreviews[turn.id]) }));
+  const previewLength = visiblePreviews.reduce((total, preview) => total + preview.content.length, 0)
+    + privateStatuses.reduce((total, status) => total + status.content.length, 0);
 
   useEffect(() => {
     const element = messageScrollRef.current;
@@ -110,7 +139,8 @@ export function RoomPanel({ room, agents, previews, busy, sendCommand, onToggleC
         <div className="message-avatar"><Bot size={16} /></div>
         <div className="message-body"><div className="message-meta"><strong>{agents.find((agent) => agent.id === preview.agentId)?.label ?? "Agent"}</strong><span>生成中</span><em>{preview.kind}</em></div><div className="message-content streaming-content"><span>{preview.content}</span><span className="stream-cursor" aria-hidden="true" /></div></div>
       </article>)}
-      {room.scheduler.status === "running" ? <div className="agent-working"><LoaderCircle className="spin" size={15} /><span>{room.participants.find((participant) => participant.id === room.scheduler.activeParticipantId)?.displayName ?? "Agent"} 正在私有执行区工作</span><small>公开房间不会显示未提交草稿</small></div> : null}
+      {privateStatuses.map(({ turn, content: privateContent }) => <PrivateAssistantStatus key={turn.id} turn={turn} agentLabel={agents.find((agent) => agent.id === turn.agentId)?.label ?? room.participants.find((participant) => participant.id === turn.agentParticipantId)?.displayName ?? "Agent"} content={privateContent} />)}
+      {room.scheduler.status === "running" && !runningTurns.length ? <div className="agent-working"><LoaderCircle className="spin" size={15} /><span>{room.participants.find((participant) => participant.id === room.scheduler.activeParticipantId)?.displayName ?? "Agent"} 正在私有执行区工作</span><small>正在等待执行状态同步</small></div> : null}
     </div>
 
     <footer className="composer-wrap">

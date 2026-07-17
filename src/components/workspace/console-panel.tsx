@@ -6,6 +6,7 @@ import {
   EyeOff, TerminalSquare, TriangleAlert, Wrench,
 } from "lucide-react";
 import type { ModelCallRecord, Room } from "@/lib/domain/types";
+import { mergedAssistantPreview } from "@/components/workspace/live-assistant-preview";
 import { Markdown } from "@/components/workspace/markdown";
 
 function readModelCalls(modelMeta: Record<string, unknown> | null): ModelCallRecord[] {
@@ -35,7 +36,7 @@ export function ConsolePanel({ room, previews }: { room?: Room; previews: Record
     {!selected ? <div className="console-empty"><CircleDashed size={27} /><strong>等待第一个 Agent Turn</strong><p>发送房间消息后，模型原文、工具调用和诊断信息会出现在这里。</p></div> : <>
       <div className="turn-selector"><span className={`turn-status ${selected.status}`}>{selected.status === "running" ? <CircleDashed className="spin" size={13} /> : selected.status === "error" ? <TriangleAlert size={13} /> : <CheckCircle2 size={13} />}{selected.status}</span><select value={selected.id} onChange={(event) => setSelectedId(event.target.value)}>{turns.map((turn) => <option value={turn.id} key={turn.id}>{turn.agentId} · {new Date(turn.createdAt).toLocaleTimeString("zh-CN")}</option>)}</select><ChevronDown size={13} /></div>
       <div className="turn-context"><div><Bot size={14} /><span>触发 Agent</span><strong>{selected.agentId}</strong></div><div><Clock3 size={14} /><span>锚点</span><strong>{selected.anchorMessageId?.slice(0, 12) ?? "—"}</strong></div></div>
-      <section className="console-section"><div className="console-section-title"><Code2 size={14} /><span>Assistant 原文</span><small>仅 Console</small></div><div className="assistant-draft"><Markdown>{selected.assistantContent || previews[selected.id] || "Agent 尚未产生普通文本。"}</Markdown></div></section>
+      <section className="console-section"><div className="console-section-title"><Code2 size={14} /><span>Assistant 原文</span><small>仅 Console</small></div><div className="assistant-draft"><Markdown>{mergedAssistantPreview(selected.assistantContent, previews[selected.id]) || "Agent 尚未产生普通文本。"}</Markdown></div></section>
       <section className="console-section">
         <div className="console-section-title"><Database size={14} /><span>模型调用与缓存</span><small>{modelCalls.length} 次</small></div>
         {modelCalls.length ? <div className="model-call-list">{modelCalls.map((call) => <article className={`model-call-card ${call.status}`} key={`${call.index}-${call.startedAt}`}>
