@@ -9,6 +9,7 @@ import { CronDrawer } from "@/components/workspace/cron-drawer";
 import { RoomPanel } from "@/components/workspace/room-panel";
 import { RoomSidebar } from "@/components/workspace/room-sidebar";
 import { SettingsDialog } from "@/components/workspace/settings-dialog";
+import { readDocumentTheme, themeStorageKey, type Theme } from "@/lib/theme";
 import { useWorkspace } from "@/components/workspace/use-workspace";
 
 export function getAgentHistoryVersion(snapshot: WorkspaceSnapshot, agentId: string | null, checkpoints: Record<string, number> = {}): string {
@@ -42,18 +43,16 @@ export function WorkspaceShell({ initialSnapshot, initialEventCursor }: { initia
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [cronOpen, setCronOpen] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [theme, setTheme] = useState<Theme>("dark");
   const room = useMemo(() => workspace.snapshot.rooms.find((item) => item.id === activeRoomId) ?? workspace.snapshot.rooms[0], [activeRoomId, workspace.snapshot.rooms]);
   const activeAgentHistoryVersion = useMemo(() => getAgentHistoryVersion(workspace.snapshot, activeAgentId, workspace.agentHistoryCheckpoints), [activeAgentId, workspace.agentHistoryCheckpoints, workspace.snapshot]);
 
   useEffect(() => {
-    const saved = localStorage.getItem("oceanking-theme"); const next = saved === "light" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
-    queueMicrotask(() => setTheme(next));
+    queueMicrotask(() => setTheme(readDocumentTheme()));
   }, []);
 
   const toggleTheme = () => {
-    const next = theme === "dark" ? "light" : "dark"; setTheme(next); document.documentElement.dataset.theme = next; localStorage.setItem("oceanking-theme", next);
+    const next = readDocumentTheme() === "dark" ? "light" : "dark"; setTheme(next); document.documentElement.dataset.theme = next; localStorage.setItem(themeStorageKey, next);
   };
 
   return (

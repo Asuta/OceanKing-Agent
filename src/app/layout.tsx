@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { themeBootstrapScript } from "@/lib/theme";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -10,6 +11,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
   return (
     <html lang="zh-CN" suppressHydrationWarning>
       <head>
+        <script dangerouslySetInnerHTML={{ __html: themeBootstrapScript }} />
         {/* OceanKing 自带完整主题，避免 Dark Reader 在水合前改写 SVG 属性。 */}
         <meta name="darkreader-lock" />
       </head>
