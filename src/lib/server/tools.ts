@@ -24,7 +24,7 @@ export type ToolDefinition = {
   schema: z.ZodType;
   parameters: Record<string, unknown>;
   modelVisible?: boolean;
-  execute: (context: ToolContext, args: unknown, toolCallId: string) => Promise<ToolExecutionResult>;
+  execute: (context: ToolContext, args: unknown, toolCallId: string, invocationKey?: string) => Promise<ToolExecutionResult>;
 };
 
 const noEffects = (text: string, structured: unknown = {}): ToolExecutionResult => ({ text, structured, effects: [] });
@@ -105,10 +105,10 @@ const tools: ToolDefinition[] = [
     name: "begin_message_to_room",
     description: "打开一个房间的公开消息通道。调用成功后，下一次 assistant 输出的全部正文会实时显示并正式提交到该房间；一次只打开一个房间。多阶段或工具任务开始时先用 kind=progress 说明计划，之后仅在有意义的阶段节点继续汇报，完成时再用非 progress 类型提交正式结果；不要发送心跳或思维链。",
     schema: beginMessageToolSchema,
-    parameters: { type: "object", additionalProperties: false, required: ["roomId", "kind"], properties: { roomId: { type: "string" }, kind: { type: "string", enum: ["answer", "progress", "warning", "error", "clarification"] }, messageKey: { type: "string" } } },
-    execute: async (context, raw, callId) => {
+    parameters: { type: "object", additionalProperties: false, required: ["roomId", "kind"], properties: { roomId: { type: "string" }, kind: { type: "string", enum: ["answer", "progress", "warning", "error", "clarification"] } } },
+    execute: async (context, raw, callId, invocationKey) => {
       const args = beginMessageToolSchema.parse(raw); requireConnectedRoom(context, args.roomId);
-      const route = { type: "begin_room_message" as const, roomId: args.roomId, kind: args.kind, messageKey: args.messageKey ?? callId };
+      const route = { type: "begin_room_message" as const, roomId: args.roomId, kind: args.kind, messageKey: invocationKey ?? callId };
       return {
         text: [
           "[系统公开输出阶段]",

@@ -76,7 +76,7 @@ export function WorkspaceShell({ initialSnapshot, initialEventCursor }: { initia
           <strong>{room?.title ?? "OceanKing"}</strong>
           <button className="icon-button" onClick={() => setMobileView("console")} aria-label="打开 Console"><PanelRightOpen size={19} /></button>
         </div>
-        {room ? <RoomPanel room={room} agents={workspace.snapshot.agents} previews={Object.values(workspace.roomPreviews)} assistantPreviews={workspace.previews} busy={workspace.busy} sendCommand={workspace.sendCommand} onToggleConsole={() => setConsoleOpen((value) => !value)} consoleOpen={consoleOpen} /> : <div className="empty-stage">创建一个房间开始协作</div>}
+        {room ? <RoomPanel room={room} agents={workspace.snapshot.agents} previews={Object.values(workspace.roomPreviews)} assistantPreviews={workspace.previews} reasoningPreviews={workspace.reasoningPreviews} busy={workspace.busy} sendCommand={workspace.sendCommand} onToggleConsole={() => setConsoleOpen((value) => !value)} consoleOpen={consoleOpen} /> : <div className="empty-stage">创建一个房间开始协作</div>}
       </section>
 
       {consoleOpen ? <aside className={`console-stage ${mobileView !== "console" ? "mobile-hidden" : ""}`}>

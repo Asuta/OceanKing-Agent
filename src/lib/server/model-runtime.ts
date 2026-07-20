@@ -269,7 +269,6 @@ function upgradeLegacyMessageCall(call: ToolCall): ToolCall {
       argumentsValue = JSON.stringify({
         roomId: args.roomId,
         kind: args.kind,
-        ...(typeof args.messageKey === "string" ? { messageKey: args.messageKey } : {}),
       });
     }
   } catch { /* begin_message_to_room will return the canonical validation error. */ }
@@ -354,10 +353,10 @@ function publishPublicMessageDelta(args: RunArgs, route: PublicMessageRoute, del
   }, args.repository.getVersion().revision);
 }
 
-async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExecution[], timeline: TimelineEvent[], effects: TurnEffect[], onOutput?: (output: ToolCallOutput) => void, options?: { allowHiddenTools?: boolean }): Promise<ToolCallOutput[]> {
+async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExecution[], timeline: TimelineEvent[], effects: TurnEffect[], modelStep: number, onOutput?: (output: ToolCallOutput) => void, options?: { allowHiddenTools?: boolean }): Promise<ToolCallOutput[]> {
   const addTimeline = createTimelineFactory(args.turnId, timeline);
   const outputs: ToolCallOutput[] = [];
-  for (const call of calls) {
+  for (const [callIndex, call] of calls.entries()) {
     if (args.signal.aborted) throw new DOMException("已停止", "AbortError");
     const started = Date.now(); addTimeline("tool_started", { id: call.id, name: call.name, arguments: call.arguments });
     let parsed: unknown = {};
@@ -367,7 +366,8 @@ async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExe
     try {
       if (!definition || (definition.modelVisible === false && !options?.allowHiddenTools)) throw new Error(`未知或已停用工具：${call.name}`);
       const context: ToolContext = { agent: args.agent, roomId: args.packet.room.id, agentParticipantId: args.agentParticipantId, packet: args.packet, repository: args.repository, signal: args.signal };
-      const result = await definition.execute(context, parsed, call.id);
+      const invocationKey = `${args.turnId}:model:${modelStep}:tool:${callIndex}`;
+      const result = await definition.execute(context, parsed, call.id, invocationKey);
       outputText = result.text; structured = result.structured; effects.push(...result.effects);
     } catch (caught) {
       error = caught instanceof Error ? caught.message : String(caught); outputText = `工具执行失败：${error}`; structured = { error };
@@ -623,7 +623,12 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
         if (event.usage) stepUsage = event.usage;
         const choices = Array.isArray(event.choices) ? event.choices as Array<Record<string, unknown>> : [];
         const delta = choices[0]?.delta as Record<string, unknown> | undefined;
-        if (typeof delta?.reasoning_content === "string") { sawReasoningContent = true; reasoningContent += delta.reasoning_content; reasoningCharacters += delta.reasoning_content.length; }
+        if (typeof delta?.reasoning_content === "string") {
+          sawReasoningContent = true;
+          reasoningContent += delta.reasoning_content;
+          reasoningCharacters += delta.reasoning_content.length;
+          if (delta.reasoning_content && args.agent.settings.thinkingMode !== "disabled") publishWorkspaceEvent("turn.preview", args.turnId, { kind: "reasoning_delta", step: modelStep, delta: delta.reasoning_content }, args.repository.getVersion().revision);
+        }
         if (typeof delta?.content === "string") {
           if (publicRouteForStep && content.length + delta.content.length > maxRoomMessageContentCharacters) {
             throw new Error(`公开正文超过 ${maxRoomMessageContentCharacters} 字符上限`);
@@ -726,7 +731,7 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
       continue;
     }
-    const outputs = await executeToolCalls(args, calls, tools, timeline, effects, (output) => {
+    const outputs = await executeToolCalls(args, calls, tools, timeline, effects, modelStep, (output) => {
       const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
       messages.push(toolMessage); sessionMessages.push(toolMessage); auditMessages.push(toolMessage);
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -949,7 +954,7 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
       continue;
     }
-    const outputs = await executeToolCalls(args, calls, tools, timeline, effects, (output) => {
+    const outputs = await executeToolCalls(args, calls, tools, timeline, effects, modelStep, (output) => {
       const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
       sessionMessages.push(toolMessage); auditMessages.push(toolMessage); continuationMessages.push(responseContextMessage(toolMessage));
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -1015,7 +1020,7 @@ async function runMock(args: RunArgs): Promise<ModelTurnResult> {
   const assistantMessage: AgentSessionMessage = { role: "assistant", content: assistantContent, tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } })) };
   sessionMessages.push(assistantMessage); auditMessages.push(assistantMessage);
   checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-  await executeToolCalls(args, calls, tools, timeline, effects, (output) => {
+  await executeToolCalls(args, calls, tools, timeline, effects, 0, (output) => {
     const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
     sessionMessages.push(toolMessage); auditMessages.push(toolMessage);
     checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);

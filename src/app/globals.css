@@ -156,6 +156,14 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .private-status-message .message-avatar { border-style: dashed; }
 .private-status-message .message-meta > span { color: var(--accent); }
 .private-status-content { border-style: dashed; border-color: color-mix(in srgb, var(--accent) 32%, var(--line)); background: color-mix(in srgb, var(--accent-soft) 35%, var(--panel-soft)); }
+.reasoning-preview-list { display: grid; gap: 6px; margin-bottom: 9px; }
+.reasoning-preview-step { overflow: hidden; border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line)); border-radius: 8px; background: color-mix(in srgb, var(--bg-deep) 62%, transparent); }
+.reasoning-preview-toggle { width: 100%; min-height: 31px; display: grid; grid-template-columns: 14px 1fr auto; align-items: center; gap: 6px; padding: 6px 8px; border: 0; border-radius: 0; background: transparent; color: var(--text-soft); text-align: left; }
+.reasoning-preview-toggle:hover { background: var(--accent-soft); }
+.reasoning-preview-toggle strong { font-size: 10px; font-weight: 650; }
+.reasoning-preview-toggle span { color: var(--muted); font-size: 9px; }
+.reasoning-preview-step.streaming .reasoning-preview-toggle span { color: var(--accent); }
+.reasoning-preview-output { max-height: 240px; overflow: auto; margin: 0; padding: 9px 10px; border-top: 1px dashed var(--line); background: transparent; color: var(--text-soft); white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.65 ui-monospace, Consolas, monospace; scrollbar-width: thin; }
 .private-status-output { max-height: 240px; overflow-y: auto; overflow-wrap: anywhere; scrollbar-width: thin; }
 .private-status-output > :first-child { margin-top: 0; }
 .private-status-output > :last-child { margin-bottom: 0; }
@@ -412,6 +420,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   .message-avatar { width: 29px; height: 29px; }
   .message.from-user .message-body { max-width: 94%; }
   .message-content { padding: 10px 12px; font-size: 12px; }
+  .reasoning-preview-output { max-height: 180px; }
   .private-status-output { max-height: 180px; }
   .composer-tools > span { display: none; }
   .composer-tools .send-button { margin-left: auto; }

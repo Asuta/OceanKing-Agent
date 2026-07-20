@@ -3,7 +3,13 @@
 import { startTransition, useCallback, useEffect, useRef, useState } from "react";
 import type { RoomMessagePreview, WorkspaceSnapshot } from "@/lib/domain/types";
 import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
-import { appendAssistantPreview } from "@/components/workspace/live-assistant-preview";
+import {
+  appendAssistantPreview,
+  appendReasoningPreview,
+  completeReasoningPreview,
+  markReasoningAnswerStarted,
+  type ReasoningPreview,
+} from "@/components/workspace/live-assistant-preview";
 
 function persistedAssistantContent(snapshot: WorkspaceSnapshot, turnId: string): string {
   return snapshot.rooms.flatMap((room) => room.turns).find((turn) => turn.id === turnId)?.assistantContent ?? "";
@@ -14,6 +20,7 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot, initialEventCur
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
+  const [reasoningPreviews, setReasoningPreviews] = useState<Record<string, ReasoningPreview>>({});
   const [roomPreviews, setRoomPreviews] = useState<Record<string, RoomMessagePreview>>({});
   const [agentHistoryCheckpoints, setAgentHistoryCheckpoints] = useState<Record<string, number>>({});
   const versionRef = useRef(initialSnapshot.version);
@@ -32,6 +39,7 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot, initialEventCur
     startTransition(() => setSnapshot(next));
     setRoomPreviews((current) => Object.fromEntries(Object.entries(current).filter(([, preview]) => turns.get(preview.turnId) === "running" && !committedKeys.has(preview.messageKey))));
     setPreviews((current) => Object.fromEntries(Object.entries(current).filter(([turnId]) => turns.get(turnId) === "running")));
+    setReasoningPreviews((current) => Object.fromEntries(Object.entries(current).filter(([turnId]) => turns.get(turnId) === "running")));
     setAgentHistoryCheckpoints((current) => Object.fromEntries(Object.entries(current).filter(([turnId]) => turns.has(turnId))));
   }, []);
 
@@ -39,7 +47,13 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot, initialEventCur
     const events = new EventSource(`/api/events?afterId=${initialEventCursor}`);
     const onEvent = (raw: MessageEvent<string>) => {
       try {
-        const event = JSON.parse(raw.data) as { id?: number; type: string; entityId?: string; payload?: { kind?: string; delta?: string; roomId?: string; agentId?: string; messageKey?: string; content?: string; messageKind?: RoomMessagePreview["kind"]; status?: string } };
+        const event = JSON.parse(raw.data) as { id?: number; type: string; entityId?: string; payload?: { kind?: string; step?: number; delta?: string; roomId?: string; agentId?: string; messageKey?: string; content?: string; messageKind?: RoomMessagePreview["kind"]; status?: string } };
+        if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "reasoning_delta" && Number.isInteger(event.payload.step) && event.payload.step! >= 0 && event.payload.delta) {
+          const turnId = event.entityId;
+          const step = event.payload.step!;
+          const delta = event.payload.delta;
+          setReasoningPreviews((current) => ({ ...current, [turnId]: appendReasoningPreview(current[turnId], step, delta) }));
+        }
         if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "assistant_delta" && event.payload.delta) {
           const turnId = event.entityId;
           const delta = event.payload.delta;
@@ -48,6 +62,11 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot, initialEventCur
             ...current,
             [turnId]: appendAssistantPreview(current[turnId], persisted, delta),
           }));
+          setReasoningPreviews((current) => {
+            const previous = current[turnId];
+            const next = markReasoningAnswerStarted(previous);
+            return next !== previous ? { ...current, [turnId]: next } : current;
+          });
         }
         if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "room_message_preview" && event.payload.roomId && event.payload.agentId && event.payload.messageKey && (event.payload.delta || event.payload.content)) {
           const key = `${event.entityId}:${event.payload.messageKey}`;
@@ -57,11 +76,21 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot, initialEventCur
             const preview: RoomMessagePreview = { turnId: event.entityId!, roomId: event.payload!.roomId!, agentId: event.payload!.agentId!, messageKey: event.payload!.messageKey!, content, kind: event.payload!.messageKind ?? "answer" };
             return { ...current, [key]: preview };
           });
+          setReasoningPreviews((current) => {
+            const previous = current[event.entityId!];
+            const next = markReasoningAnswerStarted(previous);
+            return next !== previous ? { ...current, [event.entityId!]: next } : current;
+          });
         }
         if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "history_checkpoint" && typeof event.id === "number") {
+          setReasoningPreviews((current) => {
+            const previous = current[event.entityId!];
+            const next = completeReasoningPreview(previous);
+            return next && next !== previous ? { ...current, [event.entityId!]: next } : current;
+          });
           setAgentHistoryCheckpoints((current) => current[event.entityId!] === event.id ? current : { ...current, [event.entityId!]: event.id! });
         }
-        const highFrequencyPreview = event.type === "turn.preview" && (event.payload?.kind === "assistant_delta" || event.payload?.kind === "room_message_preview");
+        const highFrequencyPreview = event.type === "turn.preview" && (event.payload?.kind === "assistant_delta" || event.payload?.kind === "reasoning_delta" || event.payload?.kind === "room_message_preview");
         if (!highFrequencyPreview) {
           if (refreshTimer.current) clearTimeout(refreshTimer.current);
           refreshTimer.current = setTimeout(() => { void refresh(); }, 80);
@@ -86,12 +115,12 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot, initialEventCur
       const body = await response.json() as { error?: string; snapshot?: WorkspaceSnapshot };
       if (!response.ok) throw new Error(body.error ?? "命令执行失败");
       if (body.snapshot) { setSnapshot(body.snapshot); snapshotRef.current = body.snapshot; versionRef.current = body.snapshot.version; }
-      if (draft.type === "reset_workspace") { setPreviews({}); setRoomPreviews({}); setAgentHistoryCheckpoints({}); }
+      if (draft.type === "reset_workspace") { setPreviews({}); setReasoningPreviews({}); setRoomPreviews({}); setAgentHistoryCheckpoints({}); }
       return true;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught)); return false;
     } finally { setBusy(false); }
   }, []);
 
-  return { snapshot, busy, error, setError, previews, roomPreviews, agentHistoryCheckpoints, refresh, sendCommand };
+  return { snapshot, busy, error, setError, previews, reasoningPreviews, roomPreviews, agentHistoryCheckpoints, refresh, sendCommand };
 }

@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Archive, Bot, Check, ChevronDown, FileText, LoaderCircle, Paperclip, PanelRightOpen, Pencil, Send, Square, UserPlus, X } from "lucide-react";
+import { Archive, Bot, Check, ChevronDown, ChevronRight, FileText, LoaderCircle, Paperclip, PanelRightOpen, Pencil, Send, Square, UserPlus, X } from "lucide-react";
 import type { Agent, AgentTurn, Attachment, Room, RoomMessagePreview } from "@/lib/domain/types";
 import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
-import { mergedAssistantPreview } from "@/components/workspace/live-assistant-preview";
+import { mergedAssistantPreview, type ReasoningPreview, type ReasoningPreviewStep } from "@/components/workspace/live-assistant-preview";
 import { Markdown } from "@/components/workspace/markdown";
 
 type SendCommand = (draft: WorkspaceCommandDraft) => Promise<boolean>;
@@ -53,8 +53,39 @@ export function RoomTitleEditor({ roomId, title, busy, sendCommand }: { roomId: 
   </form>;
 }
 
-function PrivateAssistantStatus({ turn, agentLabel, content }: { turn: AgentTurn; agentLabel: string; content: string }) {
+function ReasoningStepPreview({ turnId, preview, index, latest }: { turnId: string; preview: ReasoningPreviewStep; index: number; latest: boolean }) {
+  const [manualOpen, setManualOpen] = useState<boolean | null>(null);
+  const outputRef = useRef<HTMLPreElement>(null);
+  const automaticOpen = latest && preview.status === "streaming";
+  const open = manualOpen ?? automaticOpen;
+  const outputId = `reasoning-${turnId}-${preview.step}`;
+
+  useEffect(() => {
+    const element = outputRef.current;
+    if (open && element) element.scrollTop = element.scrollHeight;
+  }, [open, preview.content]);
+
+  return <section className={`reasoning-preview-step ${preview.status}`}>
+    <button type="button" className="reasoning-preview-toggle" aria-expanded={open} aria-controls={outputId} onClick={() => setManualOpen(!open)}>
+      {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+      <strong>思考步骤 {index + 1}</strong>
+      <span>{latest && preview.status === "streaming" ? "思考中" : "已完成"}</span>
+    </button>
+    {open ? <pre id={outputId} className="reasoning-preview-output" ref={outputRef}>{preview.content}{latest && preview.status === "streaming" ? <span className="stream-cursor" aria-hidden="true" /> : null}</pre> : null}
+  </section>;
+}
+
+function PrivateAssistantStatus({ turn, agentLabel, content, reasoning }: { turn: AgentTurn; agentLabel: string; content: string; reasoning?: ReasoningPreview }) {
   const outputRef = useRef<HTMLDivElement>(null);
+  const reasoningSteps = reasoning?.steps ?? [];
+  const phase = reasoning?.phase === "thinking" ? "思考中" : reasoning?.phase === "answering" ? "生成回复中" : "私有执行中";
+  const emptyStatus = reasoning?.phase === "thinking"
+    ? "正在思考，尚未生成正文…"
+    : reasoning?.phase === "answering"
+      ? "正在生成正文…"
+      : reasoning?.phase === "working"
+        ? "正在继续执行…"
+        : "正在等待 Assistant 输出…";
 
   useEffect(() => {
     const element = outputRef.current;
@@ -64,10 +95,13 @@ function PrivateAssistantStatus({ turn, agentLabel, content }: { turn: AgentTurn
   return <article className="message from-agent private-status-message" aria-live="polite" aria-label={`${agentLabel} 私有执行状态`} data-turn-id={turn.id}>
     <div className="message-avatar"><LoaderCircle className="spin" size={16} /></div>
     <div className="message-body">
-      <div className="message-meta"><strong>{agentLabel}</strong><span>私有执行中</span><em>临时状态</em></div>
+      <div className="message-meta"><strong>{agentLabel}</strong><span>{phase}</span><em>临时状态</em></div>
       <div className="message-content private-status-content">
+        {reasoningSteps.length ? <div className="reasoning-preview-list" aria-label="实时思考过程">
+          {reasoningSteps.map((preview, index) => <ReasoningStepPreview key={preview.step} turnId={turn.id} preview={preview} index={index} latest={index === reasoningSteps.length - 1} />)}
+        </div> : null}
         <div className="private-status-output" ref={outputRef}>
-          {content ? <><Markdown>{content}</Markdown><span className="stream-cursor" aria-hidden="true" /></> : <p className="private-status-empty">正在等待 Assistant 输出…</p>}
+          {content ? <><Markdown>{content}</Markdown><span className="stream-cursor" aria-hidden="true" /></> : <p className="private-status-empty">{emptyStatus}</p>}
         </div>
         <small>仅用于展示当前进度，不写入房间历史</small>
       </div>
@@ -75,7 +109,7 @@ function PrivateAssistantStatus({ turn, agentLabel, content }: { turn: AgentTurn
   </article>;
 }
 
-export function RoomPanel({ room, agents, previews, assistantPreviews, busy, sendCommand, onToggleConsole, consoleOpen }: { room: Room; agents: Agent[]; previews: RoomMessagePreview[]; assistantPreviews: Record<string, string>; busy: boolean; sendCommand: SendCommand; onToggleConsole: () => void; consoleOpen: boolean }) {
+export function RoomPanel({ room, agents, previews, assistantPreviews, reasoningPreviews, busy, sendCommand, onToggleConsole, consoleOpen }: { room: Room; agents: Agent[]; previews: RoomMessagePreview[]; assistantPreviews: Record<string, string>; reasoningPreviews: Record<string, ReasoningPreview>; busy: boolean; sendCommand: SendCommand; onToggleConsole: () => void; consoleOpen: boolean }) {
   const [content, setContent] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -84,13 +118,11 @@ export function RoomPanel({ room, agents, previews, assistantPreviews, busy, sen
   const followLatestRef = useRef(false);
   const availableAgents = agents.filter((agent) => !room.participants.some((participant) => participant.agentId === agent.id));
   const visiblePreviews = previews.filter((preview) => preview.roomId === room.id && !room.messages.some((message) => message.messageKey === preview.messageKey));
-  const publicPreviewTurnIds = new Set(previews.map((preview) => preview.turnId));
   const runningTurns = room.turns.filter((turn) => turn.status === "running");
   const privateStatuses = runningTurns
-    .filter((turn) => !publicPreviewTurnIds.has(turn.id) && turn.emittedMessageIds.length === 0)
-    .map((turn) => ({ turn, content: mergedAssistantPreview(turn.assistantContent, assistantPreviews[turn.id]) }));
+    .map((turn) => ({ turn, content: mergedAssistantPreview(turn.assistantContent, assistantPreviews[turn.id]), reasoning: reasoningPreviews[turn.id] }));
   const previewLength = visiblePreviews.reduce((total, preview) => total + preview.content.length, 0)
-    + privateStatuses.reduce((total, status) => total + status.content.length, 0);
+    + privateStatuses.reduce((total, status) => total + status.content.length + (status.reasoning?.steps.reduce((length, step) => length + step.content.length, 0) ?? 0), 0);
 
   useEffect(() => {
     const element = messageScrollRef.current;
@@ -139,7 +171,7 @@ export function RoomPanel({ room, agents, previews, assistantPreviews, busy, sen
         <div className="message-avatar"><Bot size={16} /></div>
         <div className="message-body"><div className="message-meta"><strong>{agents.find((agent) => agent.id === preview.agentId)?.label ?? "Agent"}</strong><span>生成中</span><em>{preview.kind}</em></div><div className="message-content streaming-content"><span>{preview.content}</span><span className="stream-cursor" aria-hidden="true" /></div></div>
       </article>)}
-      {privateStatuses.map(({ turn, content: privateContent }) => <PrivateAssistantStatus key={turn.id} turn={turn} agentLabel={agents.find((agent) => agent.id === turn.agentId)?.label ?? room.participants.find((participant) => participant.id === turn.agentParticipantId)?.displayName ?? "Agent"} content={privateContent} />)}
+      {privateStatuses.map(({ turn, content: privateContent, reasoning }) => <PrivateAssistantStatus key={turn.id} turn={turn} agentLabel={agents.find((agent) => agent.id === turn.agentId)?.label ?? room.participants.find((participant) => participant.id === turn.agentParticipantId)?.displayName ?? "Agent"} content={privateContent} reasoning={reasoning} />)}
       {room.scheduler.status === "running" && !runningTurns.length ? <div className="agent-working"><LoaderCircle className="spin" size={15} /><span>{room.participants.find((participant) => participant.id === room.scheduler.activeParticipantId)?.displayName ?? "Agent"} 正在私有执行区工作</span><small>正在等待执行状态同步</small></div> : null}
     </div>
 

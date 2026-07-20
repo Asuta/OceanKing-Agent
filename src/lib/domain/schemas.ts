@@ -40,7 +40,6 @@ export const sendMessageToolSchema = z.object({
 export const beginMessageToolSchema = z.object({
   roomId: z.string().min(1),
   kind: z.enum(["answer", "progress", "warning", "error", "clarification"]).default("answer"),
-  messageKey: z.string().max(200).optional(),
 });
 
 export const readNoReplyToolSchema = z.object({ roomId: z.string(), messageId: z.string() });

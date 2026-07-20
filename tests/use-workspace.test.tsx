@@ -98,6 +98,8 @@ function WorkspaceProbe({ initialSnapshot = snapshot }: { initialSnapshot?: Work
   return <>
     <output aria-label="Agent 历史检查点">{workspace.agentHistoryCheckpoints.turn_live ?? 0}</output>
     <output aria-label="Assistant 实时预览">{workspace.previews.turn_live ?? ""}</output>
+    <output aria-label="Assistant 思考预览">{JSON.stringify(workspace.reasoningPreviews.turn_live?.steps ?? [])}</output>
+    <output aria-label="Assistant 实时阶段">{workspace.reasoningPreviews.turn_live?.phase ?? ""}</output>
     <output aria-label="房间消息预览">{roomPreviews}</output>
   </>;
 }
@@ -142,6 +144,41 @@ describe("工作区实时事件", () => {
     });
 
     expect(screen.getByLabelText("Assistant 实时预览").textContent).toBe("先检查配置配置仍然有效，继续执行");
+    expect(screen.getByLabelText("Assistant 实时阶段").textContent).toBe("answering");
+  });
+
+  it("按模型步骤累积思考增量，并在正文和检查点到达时更新阶段", () => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(runningSnapshot), { status: 200, headers: { "content-type": "application/json" } })));
+    render(<WorkspaceProbe initialSnapshot={runningSnapshot} />);
+
+    act(() => {
+      FakeEventSource.latest?.emit("turn.preview", { id: 161, type: "turn.preview", entityId: "turn_live", payload: { kind: "reasoning_delta", step: 0, delta: "先分析" } });
+      FakeEventSource.latest?.emit("turn.preview", { id: 162, type: "turn.preview", entityId: "turn_live", payload: { kind: "reasoning_delta", step: 0, delta: "上下文" } });
+    });
+    expect(JSON.parse(screen.getByLabelText("Assistant 思考预览").textContent ?? "[]")).toEqual([
+      { step: 0, content: "先分析上下文", status: "streaming" },
+    ]);
+    expect(screen.getByLabelText("Assistant 实时阶段").textContent).toBe("thinking");
+
+    act(() => FakeEventSource.latest?.emit("turn.preview", { id: 163, type: "turn.preview", entityId: "turn_live", payload: { kind: "assistant_delta", delta: "正文" } }));
+    expect(JSON.parse(screen.getByLabelText("Assistant 思考预览").textContent ?? "[]")[0]).toMatchObject({ status: "answer_started" });
+    expect(screen.getByLabelText("Assistant 实时阶段").textContent).toBe("answering");
+
+    act(() => FakeEventSource.latest?.emit("turn.preview", { id: 164, type: "turn.preview", entityId: "turn_live", payload: { kind: "history_checkpoint" } }));
+    expect(JSON.parse(screen.getByLabelText("Assistant 思考预览").textContent ?? "[]")[0]).toMatchObject({ status: "completed" });
+    expect(screen.getByLabelText("Assistant 实时阶段").textContent).toBe("working");
+
+    act(() => FakeEventSource.latest?.emit("turn.preview", { id: 165, type: "turn.preview", entityId: "turn_live", payload: { kind: "reasoning_delta", step: 1, delta: "工具后的思考" } }));
+    expect(JSON.parse(screen.getByLabelText("Assistant 思考预览").textContent ?? "[]")).toEqual([
+      { step: 0, content: "先分析上下文", status: "completed" },
+      { step: 1, content: "工具后的思考", status: "streaming" },
+    ]);
+    expect(screen.getByLabelText("Assistant 实时阶段").textContent).toBe("thinking");
+
+    act(() => FakeEventSource.latest?.emit("turn.preview", { id: 166, type: "turn.preview", entityId: "turn_live", payload: { kind: "room_message_preview", roomId: "room_live", agentId: "navigator", messageKey: "progress_live", delta: "公开进度", messageKind: "progress" } }));
+    expect(JSON.parse(screen.getByLabelText("Assistant 思考预览").textContent ?? "[]")[1]).toMatchObject({ status: "answer_started" });
+    expect(screen.getByLabelText("Assistant 实时阶段").textContent).toBe("answering");
   });
 
   it("同一 Turn 的多个 send_message 预览按 messageKey 独立保存", () => {
@@ -178,10 +215,14 @@ describe("工作区实时事件", () => {
       id: 301, type: "turn.preview", entityId: "turn_stream",
       payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_stream", delta: "流式帧", messageKind: "answer" },
     }));
+    act(() => FakeEventSource.latest?.emit("turn.preview", {
+      id: 302, type: "turn.preview", entityId: "turn_stream",
+      payload: { kind: "reasoning_delta", step: 0, delta: "思考帧" },
+    }));
     await act(async () => { await vi.advanceTimersByTimeAsync(100); });
     expect(fetchMock).not.toHaveBeenCalled();
 
-    act(() => FakeEventSource.latest?.emit("turn.preview", { id: 302, type: "turn.preview", entityId: "turn_stream", payload: { kind: "history_checkpoint" } }));
+    act(() => FakeEventSource.latest?.emit("turn.preview", { id: 303, type: "turn.preview", entityId: "turn_stream", payload: { kind: "history_checkpoint" } }));
     await act(async () => { await vi.advanceTimersByTimeAsync(100); });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });

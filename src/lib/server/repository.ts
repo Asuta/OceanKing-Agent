@@ -112,7 +112,7 @@ export class WorkspaceRepository {
     this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?)").run(agentParticipantId, roomId, "agent", "navigator", str(navigator.label), 1, 1, at);
     this.raw.prepare("INSERT INTO scheduler_states(room_id,status,next_agent_participant_id,active_participant_id,round_count,cursor_json,receipt_revision_json,rerun_requested) VALUES(?,?,?,?,?,?,?,0)").run(roomId, "idle", agentParticipantId, null, 0, JSON.stringify({ [agentParticipantId]: 1 }), "{}");
     this.raw.prepare("INSERT INTO room_messages(id,room_id,seq,sender_id,sender_name,sender_role,source,kind,status,content,final,message_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
-      .run("msg_welcome", roomId, 1, "system", "OceanKing", "system", "system", "system", "completed", "房间是公开协作事实；Agent 的思考与工具过程只会出现在右侧 Console。", 1, null, at);
+      .run("msg_welcome", roomId, 1, "system", "OceanKing", "system", "system", "system", "completed", "房间是公开协作事实；Agent 的思考状态只在执行期间临时展示，工具过程仅出现在右侧 Console。", 1, null, at);
   }
 
   private resetWorkspaceState(at: string): string[] {
