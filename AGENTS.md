@@ -29,6 +29,14 @@ Vitest runs in Node and serializes tests because they share process state. Name 
 
 SQLite is authoritative; SSE and browser state are projections. Public Agent speech must use `send_message_to_room`; its streamed room bubble is temporary until the tool commits. Ordinary assistant output stays private. Never commit `.env.local`, keys, `.oceanking/`, uploads, or databases. Shell tools inherit full host permissions, so preserve loopback binding and Origin validation.
 
+## Global Model Configuration
+
+- The server natively reads `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_MODELS`, and `OPENAI_API_FORMAT` from `process.env`; a repository-root `.env.local` is only one way to populate them.
+- On Windows, share model configuration across Git worktrees by storing these variables as user-scoped environment variables, for example with `[Environment]::SetEnvironmentVariable("OPENAI_API_KEY", "<secret>", "User")`. Do not add a repository-specific loader for `%USERPROFILE%\.oceanking\config.env`; OceanKing does not natively read that file.
+- Restart the terminal or host application and the OceanKing server after changing user-scoped variables. Existing processes retain the environment captured when they started.
+- Never record real keys or private values in this file, Git, shell history, logs, tests, or screenshots.
+- Keep `OCEANKING_DATA_DIR` instance-specific rather than user-global when multiple worktrees may run simultaneously; sharing one SQLite data directory across active backends is unsupported.
+
 ## Commit & Pull Request Guidelines
 
 Use concise Chinese commits matching history, such as `修复房间调度重入问题`. PRs should explain intent, user impact, security implications, and validation. Link issues and include screenshots for UI changes. Separate unrelated refactors.
