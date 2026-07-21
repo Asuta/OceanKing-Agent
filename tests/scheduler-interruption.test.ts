@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentExecutor } from "@/lib/server/agent-executor";
 import { resetCronRunTrackerForTests, trackCronRun } from "@/lib/server/cron-run-tracker";
 import { RoomScheduler } from "@/lib/server/scheduler";
-import { commandBase, sendUser, withRepository } from "./helpers";
+import { commandBase, packetFor, sendUser, withRepository } from "./helpers";
 
 const originalEnvironment = {
   apiKey: process.env.OPENAI_API_KEY,
@@ -99,6 +99,38 @@ afterEach(() => {
 });
 
 describe("房间消息自动打断", () => {
+  it("下一个 Agent 已读不回后终止跨房间 handoff，且不会继续唤醒第三个 Agent", async () => {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_BASE_URL;
+    delete process.env.OPENAI_API_FORMAT;
+
+    await withRepository(async (repository) => {
+      repository.executeCommand({
+        ...commandBase(repository), type: "create_agent", label: "复核者", summary: "验证交接是否已经结束", instruction: "只处理明确交给你的任务。",
+      });
+      const reviewerId = repository.getSnapshot().agents.find((agent) => agent.label === "复核者")!.id;
+      sendUser(repository, "room_harbor", "把任务交给新房间；接收方无需回复时直接结束");
+      const sourcePacket = packetFor(repository);
+      const targetRoomId = "room_receipt_stops_handoff";
+      repository.beginTurn({ turnId: "turn_receipt_stops_source", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: sourcePacket });
+      repository.finishTurn({
+        turnId: "turn_receipt_stops_source", assistantContent: "发起交接", tools: [], timeline: [], effects: [
+          { type: "create_room", roomId: targetRoomId, title: "回执终止交接", invitedAgentIds: ["builder", reviewerId] },
+          { type: "send_message", roomId: targetRoomId, messageId: "msg_receipt_stops_handoff", messageKey: "receipt-stops-handoff", content: "这是一条无需回复的结束通知", kind: "handoff" },
+        ], awaitingRoomId: targetRoomId, modelMeta: {}, cutoffSeq: sourcePacket.cutoffSeq, nextParticipantId: null,
+      });
+
+      const scheduler = new RoomScheduler(repository, new AgentExecutor());
+      scheduler.enqueue(targetRoomId, { interruptActive: true });
+      await waitUntil(() => repository.getRoom(targetRoomId)?.scheduler.status === "idle");
+
+      const targetRoom = repository.getRoom(targetRoomId)!;
+      expect(targetRoom.turns.map((turn) => turn.agentId)).toEqual(["builder"]);
+      expect(targetRoom.messages.at(-1)?.receipts).toHaveLength(1);
+      expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs").get() as { count: number }).count).toBe(0);
+    });
+  });
+
   it("新用户消息中止旧模型流并由下一轮接管全部未处理消息", async () => {
     process.env.OPENAI_API_KEY = "test-key";
     process.env.OPENAI_BASE_URL = "https://example.test/v1";

@@ -371,8 +371,8 @@ describe("OceanKing 领域仓库", () => {
 
     expect(started.continuationRoomIds).toEqual([targetRoomId]);
     expect(repository.getRoom("room_harbor")!.turns.find((turn) => turn.id === "turn_automatic_source")?.status).toBe("continued");
-    expect(repository.raw.prepare("SELECT target_room_id,target_turn_id,delivery_only,awaiting_reply FROM turn_handoffs WHERE source_turn_id='turn_automatic_source'").get()).toEqual({
-      target_room_id: targetRoomId, target_turn_id: null, delivery_only: 0, awaiting_reply: 1,
+    expect(repository.raw.prepare("SELECT target_room_id,target_turn_id,delivery_only,awaiting_reply,awaiting_message_id FROM turn_handoffs WHERE source_turn_id='turn_automatic_source'").get()).toEqual({
+      target_room_id: targetRoomId, target_turn_id: null, delivery_only: 0, awaiting_reply: 1, awaiting_message_id: "msg_automatic_one",
     });
 
     sendUser(repository, targetRoomId, "另一个 Agent 回复了 2");
@@ -390,8 +390,8 @@ describe("OceanKing 领域仓库", () => {
     expect(middle.unresolvedRoomIds).toEqual(["room_harbor"]);
     expect(repository.getRoom(targetRoomId)!.messages.at(-1)).toMatchObject({ content: "3", kind: "handoff" });
     expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs").get() as { count: number }).count).toBe(1);
-    expect(repository.raw.prepare("SELECT target_room_id,target_turn_id,awaiting_reply FROM turn_handoffs WHERE source_turn_id='turn_automatic_source'").get()).toEqual({
-      target_room_id: targetRoomId, target_turn_id: null, awaiting_reply: 1,
+    expect(repository.raw.prepare("SELECT target_room_id,target_turn_id,awaiting_reply,awaiting_message_id FROM turn_handoffs WHERE source_turn_id='turn_automatic_source'").get()).toEqual({
+      target_room_id: targetRoomId, target_turn_id: null, awaiting_reply: 1, awaiting_message_id: "msg_automatic_three",
     });
 
     sendUser(repository, targetRoomId, "游戏已经数到 10");
@@ -422,8 +422,8 @@ describe("OceanKing 领域仓库", () => {
     });
 
     const targetPacket = packetFor(repository, targetRoomId);
-    const navigator = repository.getRoom(targetRoomId)!.participants.find((participant) => participant.agentId === "navigator")!;
-    repository.beginTurn({ turnId: "turn_read_no_reply_target", roomId: targetRoomId, agentId: "navigator", agentParticipantId: navigator.id, packet: targetPacket });
+    const builder = repository.getRoom(targetRoomId)!.participants.find((participant) => participant.agentId === "builder")!;
+    repository.beginTurn({ turnId: "turn_read_no_reply_target", roomId: targetRoomId, agentId: "builder", agentParticipantId: builder.id, packet: targetPacket });
     const applied = repository.finishTurn({
       turnId: "turn_read_no_reply_target", assistantContent: "无需回复", tools: [], timeline: [], effects: [
         { type: "read_no_reply", roomId: targetRoomId, messageId: targetPacket.targetMessageId, receiptId: "receipt_read_no_reply_handoff" },
@@ -663,11 +663,13 @@ describe("OceanKing 领域仓库", () => {
       const columns = (handle.raw.prepare("PRAGMA table_info(turn_handoffs)").all() as Array<{ name: string }>).map((column) => column.name);
       expect(columns).not.toContain("deferred");
       expect(columns).toContain("awaiting_reply");
-      expect(handle.raw.prepare("SELECT target_room_id,target_turn_id,delivery_only,awaiting_reply FROM turn_handoffs WHERE source_turn_id='turn_legacy'").get()).toEqual({
+      expect(columns).toContain("awaiting_message_id");
+      expect(handle.raw.prepare("SELECT target_room_id,target_turn_id,delivery_only,awaiting_reply,awaiting_message_id FROM turn_handoffs WHERE source_turn_id='turn_legacy'").get()).toEqual({
         target_room_id: "room_target",
         target_turn_id: "turn_target",
         delivery_only: 0,
         awaiting_reply: 1,
+        awaiting_message_id: null,
       });
       handle.raw.close();
     } finally { await fs.rm(dir, { recursive: true, force: true }); }

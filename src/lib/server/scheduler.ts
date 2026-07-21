@@ -119,7 +119,7 @@ export class RoomScheduler {
         const cutoffSeq = room.messages.at(-1)?.seq ?? 0;
         const cursor = room.scheduler.cursorByParticipantId[current.id] ?? 0;
         const unseen = room.messages.filter((message) => message.seq > cursor && message.seq <= cutoffSeq && message.sender.id !== current.id);
-        const targets = unseen.filter((message) => message.sender.role === "participant"
+        const targets = unseen.filter((message) => message.sender.role === "participant" && message.receipts.length === 0
           && (message.source !== "agent_emit" || message.kind === "handoff"));
         const pendingDelivery = this.repository.getPendingDeliveryObligations(roomId, current.agentId);
         const handedOffCutoff = this.repository.getPendingHandoffCutoff(roomId, current.id);

@@ -66,6 +66,12 @@ function hasRoomDelivery(effects: TurnEffect[], roomId: string, messageId: strin
   });
 }
 
+function handoffMessageIdForRoom(effects: TurnEffect[], roomId: string): string | null {
+  return effects.findLast((effect): effect is Extract<TurnEffect, { type: "send_message" }> => (
+    effect.type === "send_message" && effect.roomId === roomId && effect.kind === "handoff"
+  ))?.messageId ?? null;
+}
+
 export type CommandResult = { snapshot: WorkspaceSnapshot; triggerRoomId?: string; stopRoomId?: string; runCronJobId?: string; refreshCron?: boolean };
 
 export class WorkspaceRepository {
@@ -402,6 +408,8 @@ export class WorkspaceRepository {
       const packet = parseJson<SchedulerPacket>(turn.user_envelope_json, {} as SchedulerPacket);
       const deliveryOnly = packet.type === "delivery_packet";
       const transfersCurrentTask = Boolean(args.awaitingRoomId && args.awaitingRoomId !== roomId);
+      const transferredHandoffMessageId = transfersCurrentTask ? handoffMessageIdForRoom(args.effects, args.awaitingRoomId!) : null;
+      if (transfersCurrentTask && !transferredHandoffMessageId) throw new DomainError("跨房间 handoff 缺少等待消息锚点");
       const currentRoomResolved = deliveryOnly || hasRoomDelivery(args.effects, roomId, packet.targetMessageId);
       if (!currentRoomResolved || transfersCurrentTask) unresolvedRoomIds.add(roomId);
       this.persistTurnTrace(args.turnId, args.tools, args.timeline);
@@ -415,8 +423,8 @@ export class WorkspaceRepository {
         this.advanceParticipantCursor(roomId, participantId, args.cutoffSeq);
         if (!currentRoomResolved || transfersCurrentTask) {
           const targetRoomId = transfersCurrentTask ? args.awaitingRoomId! : roomId;
-          this.raw.prepare("INSERT INTO turn_handoffs(source_turn_id,agent_id,source_room_id,source_participant_id,cutoff_seq,target_room_id,target_turn_id,delivery_only,awaiting_reply,created_at) VALUES(?,?,?,?,?,?,NULL,?,?,?)")
-            .run(args.turnId, agentId, roomId, participantId, args.cutoffSeq, targetRoomId, transfersCurrentTask ? 0 : 1, transfersCurrentTask ? 1 : 0, at);
+          this.raw.prepare("INSERT INTO turn_handoffs(source_turn_id,agent_id,source_room_id,source_participant_id,cutoff_seq,target_room_id,target_turn_id,delivery_only,awaiting_reply,awaiting_message_id,created_at) VALUES(?,?,?,?,?,?,NULL,?,?,?,?)")
+            .run(args.turnId, agentId, roomId, participantId, args.cutoffSeq, targetRoomId, transfersCurrentTask ? 0 : 1, transfersCurrentTask ? 1 : 0, transferredHandoffMessageId, at);
           continuationRoomIds.add(targetRoomId);
         }
       }
@@ -441,33 +449,22 @@ export class WorkspaceRepository {
 
   private settleContinuationHandoffs(targetTurnId: string, effects: TurnEffect[], awaitingRoomId: string | null): { roomIds: string[]; unresolvedRoomIds: string[] } {
     const rows = this.raw.prepare("SELECT handoff.source_turn_id,handoff.source_room_id,handoff.source_participant_id,handoff.cutoff_seq,handoff.awaiting_reply,turn.anchor_message_id FROM turn_handoffs handoff JOIN agent_turns turn ON turn.id=handoff.source_turn_id WHERE handoff.target_turn_id=?").all(targetTurnId) as Row[];
-    const targetTurn = this.raw.prepare("SELECT room_id,anchor_message_id,user_envelope_json FROM agent_turns WHERE id=?").get(targetTurnId) as Row | undefined;
-    const targetPacket = targetTurn ? parseJson<SchedulerPacket>(targetTurn.user_envelope_json, {} as SchedulerPacket) : null;
-    const targetAnchorIsHandoff = Boolean(targetTurn && targetPacket?.messages.some((message) => message.id === str(targetTurn.anchor_message_id)
-      && message.source === "agent_emit"
-      && message.kind === "handoff"));
-    const currentHandoffReadWithoutReply = Boolean(targetTurn && targetAnchorIsHandoff && effects.some((effect) => effect.type === "read_no_reply"
-      && effect.roomId === str(targetTurn.room_id)
-      && effect.messageId === str(targetTurn.anchor_message_id)));
+    const nextAwaitingMessageId = awaitingRoomId ? handoffMessageIdForRoom(effects, awaitingRoomId) : null;
     const roomIds = new Set<string>();
     const unresolvedRoomIds = new Set<string>();
     for (const row of rows) {
       const sourceTurnId = str(row.source_turn_id);
       const roomId = str(row.source_room_id);
-      if (bool(row.awaiting_reply) && currentHandoffReadWithoutReply) {
-        this.advanceParticipantCursor(roomId, str(row.source_participant_id), num(row.cutoff_seq));
-        this.raw.prepare("DELETE FROM turn_handoffs WHERE source_turn_id=?").run(sourceTurnId);
-        continue;
-      }
       if (!hasRoomDelivery(effects, roomId, str(row.anchor_message_id))) {
         unresolvedRoomIds.add(roomId);
         if (bool(row.awaiting_reply) && awaitingRoomId) {
-          this.raw.prepare("UPDATE turn_handoffs SET target_room_id=?,target_turn_id=NULL WHERE source_turn_id=?").run(awaitingRoomId, sourceTurnId);
+          if (!nextAwaitingMessageId) throw new DomainError("续办 handoff 缺少等待消息锚点");
+          this.raw.prepare("UPDATE turn_handoffs SET target_room_id=?,target_turn_id=NULL,awaiting_message_id=? WHERE source_turn_id=?").run(awaitingRoomId, nextAwaitingMessageId, sourceTurnId);
           roomIds.add(awaitingRoomId);
           continue;
         }
         this.advanceParticipantCursor(roomId, str(row.source_participant_id), num(row.cutoff_seq));
-        this.raw.prepare("UPDATE turn_handoffs SET target_room_id=source_room_id,target_turn_id=NULL,delivery_only=1,awaiting_reply=0 WHERE source_turn_id=?").run(sourceTurnId);
+        this.raw.prepare("UPDATE turn_handoffs SET target_room_id=source_room_id,target_turn_id=NULL,delivery_only=1,awaiting_reply=0,awaiting_message_id=NULL WHERE source_turn_id=?").run(sourceTurnId);
         roomIds.add(roomId);
         continue;
       }
@@ -567,7 +564,13 @@ export class WorkspaceRepository {
       if (!membership) throw new DomainError("Agent 不能确认未连接房间的消息");
       const message = this.raw.prepare("SELECT id FROM room_messages WHERE id=? AND room_id=?").get(effect.messageId, effect.roomId) as Row | undefined;
       if (!message) throw new DomainError("receipt 目标消息不存在");
-      this.raw.prepare("INSERT OR IGNORE INTO message_receipts(id,message_id,agent_participant_id,created_at) VALUES(?,?,?,?)").run(effect.receiptId, effect.messageId, membership.id, at); return;
+      this.raw.prepare("INSERT OR IGNORE INTO message_receipts(id,message_id,agent_participant_id,created_at) VALUES(?,?,?,?)").run(effect.receiptId, effect.messageId, membership.id, at);
+      const awaiting = this.raw.prepare("SELECT source_turn_id,source_room_id,source_participant_id,cutoff_seq FROM turn_handoffs WHERE awaiting_reply=1 AND target_room_id=? AND awaiting_message_id=?").all(effect.roomId, effect.messageId) as Row[];
+      for (const row of awaiting) {
+        this.advanceParticipantCursor(str(row.source_room_id), str(row.source_participant_id), num(row.cutoff_seq));
+        this.raw.prepare("DELETE FROM turn_handoffs WHERE source_turn_id=?").run(str(row.source_turn_id));
+      }
+      return;
     }
     if (effect.type === "create_room") {
       const ownerId = createId("participant");
@@ -652,7 +655,7 @@ export class WorkspaceRepository {
         .run(modelMeta ? JSON.stringify(modelMeta) : null, at, turnId);
       this.raw.prepare("UPDATE agent_sessions SET history_json=?,active_turn_id=CASE WHEN active_turn_id=? THEN NULL ELSE active_turn_id END,updated_at=? WHERE agent_id=?")
         .run(JSON.stringify([...history, { role: "assistant", content: snapshot } satisfies AgentSessionMessage]), turnId, at, agentId);
-      this.raw.prepare("UPDATE turn_handoffs SET target_room_id=?,target_turn_id=? WHERE target_turn_id=?")
+      this.raw.prepare("UPDATE turn_handoffs SET target_room_id=?,target_turn_id=?,awaiting_message_id=NULL WHERE target_turn_id=?")
         .run(nextRoomId, successorTurnId, turnId);
       if (packet.type !== "delivery_packet" && str(row.room_id) !== nextRoomId) {
         this.raw.prepare("INSERT INTO turn_handoffs(source_turn_id,agent_id,source_room_id,source_participant_id,cutoff_seq,target_room_id,target_turn_id,delivery_only,created_at) VALUES(?,?,?,?,?,?,?,0,?)")
@@ -680,7 +683,7 @@ export class WorkspaceRepository {
       const rows = this.raw.prepare("SELECT DISTINCT source_room_id FROM turn_handoffs WHERE target_turn_id=?").all(targetTurnId) as Row[];
       roomIds.push(...rows.map((row) => str(row.source_room_id)));
       if (!roomIds.length) return;
-      this.raw.prepare("UPDATE turn_handoffs SET target_room_id=source_room_id,target_turn_id=NULL,delivery_only=1,awaiting_reply=0 WHERE target_turn_id=?").run(targetTurnId);
+      this.raw.prepare("UPDATE turn_handoffs SET target_room_id=source_room_id,target_turn_id=NULL,delivery_only=1,awaiting_reply=0,awaiting_message_id=NULL WHERE target_turn_id=?").run(targetTurnId);
       this.bump();
     });
     tx();
@@ -693,7 +696,7 @@ export class WorkspaceRepository {
       const rows = this.raw.prepare("SELECT DISTINCT source_room_id FROM turn_handoffs WHERE target_room_id=?").all(targetRoomId) as Row[];
       roomIds.push(...rows.map((row) => str(row.source_room_id)));
       if (!roomIds.length) return;
-      this.raw.prepare("UPDATE turn_handoffs SET target_room_id=source_room_id,target_turn_id=NULL,delivery_only=1,awaiting_reply=0 WHERE target_room_id=?").run(targetRoomId);
+      this.raw.prepare("UPDATE turn_handoffs SET target_room_id=source_room_id,target_turn_id=NULL,delivery_only=1,awaiting_reply=0,awaiting_message_id=NULL WHERE target_room_id=?").run(targetRoomId);
       this.bump();
     });
     tx();
