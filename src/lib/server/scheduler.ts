@@ -6,6 +6,8 @@ import { ModelRunError, runAgentModel } from "@/lib/server/model-runtime";
 import { getRepository, WorkspaceRepository } from "@/lib/server/repository";
 import { createId } from "@/lib/utils/id";
 
+const maxTransientFailureRetries = 2;
+
 function enabledAgents(room: Room): Participant[] {
   return room.participants.filter((participant) => participant.kind === "agent" && participant.enabled && participant.agentId).toSorted((a, b) => a.sortOrder - b.sortOrder);
 }
@@ -18,7 +20,7 @@ function nextParticipant(agents: Participant[], currentId: string): Participant 
 export class RoomScheduler {
   private runningRooms = new Set<string>();
   private stoppedRooms = new Set<string>();
-  private pendingUserInterrupts = new Map<string, Map<string, number>>();
+  private pendingMessageInterrupts = new Map<string, Map<string, number>>();
   private repository: WorkspaceRepository;
   private executor: AgentExecutor;
 
@@ -34,11 +36,11 @@ export class RoomScheduler {
       const agentIds = room?.participants
         .filter((participant) => participant.kind === "agent" && participant.enabled && participant.agentId)
         .map((participant) => participant.agentId!) ?? [];
-      const userSeq = room?.messages.findLast((message) => message.source === "user")?.seq;
-      if (userSeq !== undefined) {
-        const pending = this.pendingUserInterrupts.get(roomId) ?? new Map<string, number>();
-        for (const agentId of agentIds) pending.set(agentId, Math.max(pending.get(agentId) ?? 0, userSeq));
-        this.pendingUserInterrupts.set(roomId, pending);
+      const messageSeq = room?.messages.findLast((message) => message.source === "user" || message.source === "agent_emit")?.seq;
+      if (messageSeq !== undefined) {
+        const pending = this.pendingMessageInterrupts.get(roomId) ?? new Map<string, number>();
+        for (const agentId of agentIds) pending.set(agentId, Math.max(pending.get(agentId) ?? 0, messageSeq));
+        this.pendingMessageInterrupts.set(roomId, pending);
       }
       this.executor.interruptAgentsForNewMessage(roomId, agentIds);
     }
@@ -54,7 +56,7 @@ export class RoomScheduler {
 
   stop(roomId: string): void {
     this.stoppedRooms.add(roomId); this.executor.stopRoom(roomId); this.repository.stopRoomState(roomId);
-    this.pendingUserInterrupts.delete(roomId);
+    this.pendingMessageInterrupts.delete(roomId);
     for (const cancellation of this.repository.cancelContinuationHandoffsForSourceRoom(roomId)) {
       if (this.stoppedRooms.has(cancellation.targetRoomId)) continue;
       this.executor.interruptAgentsForNewMessage(cancellation.targetRoomId, [cancellation.agentId]);
@@ -67,12 +69,12 @@ export class RoomScheduler {
     publishWorkspaceEvent("scheduler.changed", roomId, { status: "idle", stopped: true }, this.repository.getVersion().revision);
   }
 
-  private consumeUserInterrupt(roomId: string, agentId: string, messages: SchedulerPacket["messages"]): boolean {
-    const pending = this.pendingUserInterrupts.get(roomId);
-    const userSeq = pending?.get(agentId);
-    if (userSeq === undefined || !messages.some((message) => message.source === "user" && message.seq >= userSeq)) return false;
+  private consumeMessageInterrupt(roomId: string, agentId: string, messages: SchedulerPacket["messages"]): boolean {
+    const pending = this.pendingMessageInterrupts.get(roomId);
+    const messageSeq = pending?.get(agentId);
+    if (messageSeq === undefined || !messages.some((message) => (message.source === "user" || message.source === "agent_emit") && message.seq >= messageSeq)) return false;
     pending!.delete(agentId);
-    if (!pending!.size) this.pendingUserInterrupts.delete(roomId);
+    if (!pending!.size) this.pendingMessageInterrupts.delete(roomId);
     return true;
   }
 
@@ -89,6 +91,7 @@ export class RoomScheduler {
   private async drain(roomId: string): Promise<void> {
     let idlePasses = 0;
     let roundsConsumed = 0;
+    let transientFailureRetries = 0;
     const maxRounds = this.repository.getSnapshot().settings.maxRoomRounds;
     try {
       publishWorkspaceEvent("scheduler.changed", roomId, { status: "running" }, this.repository.getVersion().revision);
@@ -96,7 +99,7 @@ export class RoomScheduler {
         roundsConsumed = round + 1;
         const room = this.repository.getRoom(roomId);
         if (!room || room.archivedAt) {
-          this.pendingUserInterrupts.delete(roomId);
+          this.pendingMessageInterrupts.delete(roomId);
           for (const fallbackRoomId of this.repository.releaseContinuationHandoffsForTargetRoom(roomId)) {
             if (fallbackRoomId !== roomId && !this.stoppedRooms.has(fallbackRoomId)) this.enqueue(fallbackRoomId);
           }
@@ -104,7 +107,7 @@ export class RoomScheduler {
         }
         const agents = enabledAgents(room);
         if (!agents.length) {
-          this.pendingUserInterrupts.delete(roomId);
+          this.pendingMessageInterrupts.delete(roomId);
           for (const fallbackRoomId of this.repository.releaseContinuationHandoffsForTargetRoom(roomId)) {
             if (fallbackRoomId !== roomId && !this.stoppedRooms.has(fallbackRoomId)) this.enqueue(fallbackRoomId);
           }
@@ -153,7 +156,7 @@ export class RoomScheduler {
           connectedRooms: connected.map(({ id, title }) => ({ id, title })),
           availableAgents: this.repository.getSnapshot().agents.map(({ id, label, summary }) => ({ id, label, summary })),
         };
-        const supersedeActive = this.consumeUserInterrupt(roomId, agent.id, packet.messages);
+        const supersedeActive = this.consumeMessageInterrupt(roomId, agent.id, packet.messages);
         const turnId = createId("turn"); this.repository.beginTurn({ turnId, roomId, agentId: agent.id, agentParticipantId: current.id, packet });
         publishWorkspaceEvent("workspace.changed", turnId, { status: "running", roomId, agentId: agent.id }, this.repository.getVersion().revision);
         try {
@@ -177,10 +180,12 @@ export class RoomScheduler {
               },
             },
           );
+          const messageRoomIds = new Set(applied.messageRoomIds);
           for (const targetRoomId of new Set([...applied.triggerRoomIds, ...applied.continuationRoomIds])) {
-            if (targetRoomId !== roomId && !this.stoppedRooms.has(targetRoomId)) this.enqueue(targetRoomId);
+            if (targetRoomId !== roomId && !this.stoppedRooms.has(targetRoomId)) this.enqueue(targetRoomId, { interruptActive: messageRoomIds.has(targetRoomId) });
           }
-          publishWorkspaceEvent("workspace.changed", turnId, { status: applied.superseded || applied.unresolvedRoomIds.length ? "continued" : "completed", emittedMessageIds: applied.emittedMessageIds, triggerRoomIds: applied.triggerRoomIds, continuationRoomIds: applied.continuationRoomIds, unresolvedRoomIds: applied.unresolvedRoomIds }, this.repository.getVersion().revision);
+          transientFailureRetries = 0;
+          publishWorkspaceEvent("workspace.changed", turnId, { status: applied.superseded || applied.unresolvedRoomIds.length ? "continued" : "completed", emittedMessageIds: applied.emittedMessageIds, triggerRoomIds: applied.triggerRoomIds, messageRoomIds: applied.messageRoomIds, continuationRoomIds: applied.continuationRoomIds, unresolvedRoomIds: applied.unresolvedRoomIds }, this.repository.getVersion().revision);
         } catch (error) {
           if (error instanceof AgentRunSupersededError) {
             publishWorkspaceEvent("workspace.changed", turnId, { status: "continued", interruptedByRoomId: error.nextRoomId }, this.repository.getVersion().revision);
@@ -188,19 +193,25 @@ export class RoomScheduler {
           }
           const originalError = error instanceof ModelRunError ? error.originalError : error;
           const stopped = originalError instanceof DOMException && originalError.name === "AbortError";
+          const retryable = error instanceof ModelRunError && error.retryable;
+          if (retryable) transientFailureRetries += 1;
+          const retriesExhausted = retryable && transientFailureRetries > maxTransientFailureRetries;
+          const terminalFailure = !stopped && (!retryable || retriesExhausted);
           this.repository.failTurn(
             turnId,
             originalError instanceof Error ? originalError.message : String(originalError),
             stopped,
             error instanceof ModelRunError ? error.modelMeta : undefined,
+            terminalFailure,
           );
-          if (stopped || round + 1 >= maxRounds) {
+          if (stopped || terminalFailure || round + 1 >= maxRounds) {
             for (const fallbackRoomId of this.repository.releaseContinuationHandoffs(turnId)) {
               if (fallbackRoomId !== roomId && !this.stoppedRooms.has(fallbackRoomId)) this.enqueue(fallbackRoomId);
             }
           }
           publishWorkspaceEvent("workspace.changed", turnId, { status: stopped ? "stopped" : "error" }, this.repository.getVersion().revision);
-          if (stopped) break;
+          if (stopped || terminalFailure) break;
+          await new Promise((resolve) => setTimeout(resolve, 100 * transientFailureRetries));
         }
       }
     } finally {

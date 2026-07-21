@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS tool_executions (id TEXT PRIMARY KEY, turn_id TEXT NO
 CREATE TABLE IF NOT EXISTS timeline_events (id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES agent_turns(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS scheduler_states (room_id TEXT PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE, status TEXT NOT NULL, next_agent_participant_id TEXT, active_participant_id TEXT, round_count INTEGER NOT NULL, cursor_json TEXT NOT NULL, receipt_revision_json TEXT NOT NULL, rerun_requested INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_sessions (agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE, history_json TEXT NOT NULL, active_turn_id TEXT, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS turn_handoffs (source_turn_id TEXT PRIMARY KEY REFERENCES agent_turns(id) ON DELETE CASCADE, agent_id TEXT NOT NULL, source_room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, source_participant_id TEXT NOT NULL, cutoff_seq INTEGER NOT NULL, target_room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, target_turn_id TEXT REFERENCES agent_turns(id) ON DELETE SET NULL, delivery_only INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS turn_handoffs (source_turn_id TEXT PRIMARY KEY REFERENCES agent_turns(id) ON DELETE CASCADE, agent_id TEXT NOT NULL, source_room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, source_participant_id TEXT NOT NULL, cutoff_seq INTEGER NOT NULL, target_room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, target_turn_id TEXT REFERENCES agent_turns(id) ON DELETE SET NULL, delivery_only INTEGER NOT NULL DEFAULT 0, deferred INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS handoffs_target_turn_idx ON turn_handoffs(target_turn_id);
 CREATE INDEX IF NOT EXISTS handoffs_target_room_idx ON turn_handoffs(agent_id, target_room_id, target_turn_id);
 CREATE TABLE IF NOT EXISTS cron_jobs (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id), room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, name TEXT NOT NULL, schedule TEXT NOT NULL, timezone TEXT NOT NULL, prompt TEXT NOT NULL, enabled INTEGER NOT NULL, last_run_at TEXT, next_run_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -121,6 +121,7 @@ export function createDatabase(explicitDataDir?: string): DatabaseHandle {
   if (!turnColumns.has("conversation_json")) raw.exec("ALTER TABLE agent_turns ADD COLUMN conversation_json TEXT NOT NULL DEFAULT '[]'");
   const handoffColumns = new Set((raw.prepare("PRAGMA table_info(turn_handoffs)").all() as Array<{ name: string }>).map((column) => column.name));
   if (!handoffColumns.has("delivery_only")) raw.exec("ALTER TABLE turn_handoffs ADD COLUMN delivery_only INTEGER NOT NULL DEFAULT 0");
+  if (!handoffColumns.has("deferred")) raw.exec("ALTER TABLE turn_handoffs ADD COLUMN deferred INTEGER NOT NULL DEFAULT 0");
   const environmentDefaults = environmentRuntimeDefaults();
   const defaults = JSON.stringify(environmentDefaults);
   raw.prepare("INSERT OR IGNORE INTO workspace_meta(id,version,revision,settings_json) VALUES(1,0,0,?)").run(defaults);

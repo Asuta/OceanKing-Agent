@@ -29,6 +29,8 @@ Vitest runs in Node and serializes tests because they share process state. Name 
 
 SQLite is authoritative; SSE and browser state are projections. Public Agent speech must use `send_message_to_room`; its streamed room bubble is temporary until the tool commits. Ordinary assistant output stays private. Never commit `.env.local`, keys, `.oceanking/`, uploads, or databases. Shell tools inherit full host permissions, so preserve loopback binding and Origin validation.
 
+New participant messages have uniform preemption semantics: both human messages and committed Agent `send_message_to_room` messages immediately supersede active target-Agent runs, which must preserve an interruption snapshot for takeover. Non-message room events such as invitations remain queued without preemption.
+
 ## Global Model Configuration
 
 - The server natively reads `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_MODELS`, and `OPENAI_API_FORMAT` from `process.env`; a repository-root `.env.local` is only one way to populate them.

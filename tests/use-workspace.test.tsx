@@ -204,6 +204,25 @@ describe("工作区实时事件", () => {
     expect(screen.getByLabelText("房间消息预览").textContent).toBe("room_a:call_a:房间 A 更新|room_b:call_b:房间 B 初稿");
   });
 
+  it("完整预览帧会覆盖已经流出的服务商工具标记", () => {
+    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(snapshot), { status: 200, headers: { "content-type": "application/json" } })));
+    render(<WorkspaceProbe />);
+
+    act(() => {
+      FakeEventSource.latest?.emit("turn.preview", {
+        id: 211, type: "turn.preview", entityId: "turn_sanitized",
+        payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_dsml", delta: "正在创建…<｜｜DSML｜｜tool_calls>", messageKind: "progress" },
+      });
+      FakeEventSource.latest?.emit("turn.preview", {
+        id: 212, type: "turn.preview", entityId: "turn_sanitized",
+        payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_dsml", content: "正在创建…", messageKind: "progress" },
+      });
+    });
+
+    expect(screen.getByLabelText("房间消息预览").textContent).toBe("room_a:call_dsml:正在创建…");
+  });
+
   it("预览帧只更新本地状态而不重新拉取整份工作区", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("EventSource", FakeEventSource);

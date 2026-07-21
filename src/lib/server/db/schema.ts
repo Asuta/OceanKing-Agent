@@ -52,7 +52,8 @@ export const agentSessions = sqliteTable("agent_sessions", {
 export const turnHandoffs = sqliteTable("turn_handoffs", {
   sourceTurnId: text("source_turn_id").primaryKey(), agentId: text("agent_id").notNull(), sourceRoomId: text("source_room_id").notNull(),
   sourceParticipantId: text("source_participant_id").notNull(), cutoffSeq: integer("cutoff_seq").notNull(), targetRoomId: text("target_room_id").notNull(),
-  targetTurnId: text("target_turn_id"), deliveryOnly: integer("delivery_only", { mode: "boolean" }).notNull().default(false), createdAt: text("created_at").notNull(),
+  targetTurnId: text("target_turn_id"), deliveryOnly: integer("delivery_only", { mode: "boolean" }).notNull().default(false),
+  deferred: integer("deferred", { mode: "boolean" }).notNull().default(false), createdAt: text("created_at").notNull(),
 });
 export const cronJobs = sqliteTable("cron_jobs", {
   id: text("id").primaryKey(), agentId: text("agent_id").notNull(), roomId: text("room_id").notNull(), name: text("name").notNull(), schedule: text("schedule").notNull(), timezone: text("timezone").notNull(),

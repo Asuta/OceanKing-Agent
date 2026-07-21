@@ -15,11 +15,19 @@ type ToolCall = { id: string; name: string; arguments: string };
 type PublicMessageKind = "answer" | "progress" | "warning" | "error" | "clarification";
 type PublicMessageRoute = { roomId: string; messageKey: string; kind: PublicMessageKind };
 type ToolCallOutput = { callId: string; name: string; text: string; error: boolean; structured: unknown };
-const terminalToolNames = new Set(["begin_message_to_room", "read_no_reply"]);
+const terminalToolNames = new Set(["begin_message_to_room", "continue_task_in_room", "read_no_reply"]);
 const maxDeliveryRepairAttempts = 2;
 const maxPublicMessageRepairAttempts = 2;
 const maxInitialProgressRepairAttempts = 2;
+const maxTerminalToolRepairAttempts = 2;
+const maxDeferredDecisionAttempts = 2;
 class ResponsesUnsupportedError extends Error {}
+class ModelHttpError extends Error {
+  constructor(readonly status: number, body: string) {
+    super(`模型接口错误 ${status}: ${body}`);
+    this.name = "ModelHttpError";
+  }
+}
 type RunArgs = {
   repository: WorkspaceRepository;
   agent: Agent;
@@ -44,12 +52,16 @@ export type ModelTurnResult = {
 export class ModelRunError extends Error {
   readonly originalError: unknown;
   readonly modelMeta: Record<string, unknown>;
+  readonly retryable: boolean;
 
   constructor(error: unknown, modelMeta: Record<string, unknown>) {
     super(error instanceof Error ? error.message : String(error));
     this.name = "ModelRunError";
     this.originalError = error;
     this.modelMeta = modelMeta;
+    this.retryable = error instanceof ModelHttpError
+      ? error.status === 408 || error.status === 425 || error.status === 429 || error.status >= 500
+      : error instanceof TypeError;
   }
 }
 
@@ -173,6 +185,9 @@ function systemPrompt(args: RunArgs): string {
     "不要发送定时心跳、等待状态、重复内容、没有新信息的进度、敏感信息或完整工具参数。最后仍须向每个相关房间发送 answer、warning、error 或 clarification 等非 progress 正式消息。",
     "房间不是默认隐私边界，但只能读取和发送到当前 Agent 已连接的房间。房间管理权限由工具执行层校验。",
     "创建房间时，create_room 会让你自动成为 owner 并连接；如需拉人，直接在同一次调用的 agentIds 中列出所有目标 Agent，不要要求人类手动操作。",
+    "在新房间启动协作的第一条正式消息必须包含足够独立执行的任务目标、分工、终止条件和当前进度；其他 Agent 看不到来源房间，不要只发送孤立的数字或片段。",
+    "跨房间任务如果必须等待另一个 Agent 的后续消息：先向目标房间发送一条非 progress 正式消息启动协作，再调用 continue_task_in_room 结束当前 Turn。系统会先提交新房间与消息，并在目标房间有新消息后恢复任务；不要在同一 Turn 里轮询等待。",
+    "恢复跨房间续办任务后，继续在当前协作房间推进；完整目标达成时，再向系统列出的来源房间发送最终结果。不要因为本轮暂时结束而提前汇报任务完成。",
     "每轮输入只携带尚未处理的房间增量；需要房间清单或可用 Agent 清单时，分别调用 list_connected_rooms 或 list_available_agents。",
     ...interruptedTurnSystemInstructions,
     `当前 Agent：${args.agent.label}（${args.agent.id}）`,
@@ -182,6 +197,7 @@ function systemPrompt(args: RunArgs): string {
 
 function turnUserContent(args: RunArgs): string {
   const obligations = args.repository.getTurnDeliveryObligations(args.turnId);
+  const deferredTasks = args.repository.getTurnDeferredTasks(args.turnId);
   return [
     formatSchedulerPacketForModel(args.packet),
     "",
@@ -194,6 +210,14 @@ function turnUserContent(args: RunArgs): string {
     ...(obligations.length
       ? obligations.map((obligation) => `- roomId=${obligation.roomId}, messageId=${obligation.messageId}`)
       : ["- 当前没有新增交付义务。"]),
+    ...(deferredTasks.length
+      ? [
+        "",
+        "[系统跨房间续办任务]",
+        "以下来源任务正在当前房间异步推进。本轮不必立刻回来源房间；继续协作，完整目标达成后再向来源房间发送非 progress 最终结果：",
+        ...deferredTasks.map((task) => `- sourceRoomId=${task.roomId}, sourceMessageId=${task.messageId}`),
+      ]
+      : []),
   ].join("\n");
 }
 
@@ -209,15 +233,57 @@ function allDeliveryObligationsResolved(args: RunArgs, effects: TurnEffect[]): b
   return obligations.length > 0 && unresolvedDeliveryObligations(args, effects).length === 0;
 }
 
+function unresolvedDeferredTasks(args: RunArgs, effects: TurnEffect[]): Array<{ roomId: string; messageId: string }> {
+  return args.repository.getTurnDeferredTasks(args.turnId).filter((task) => !effects.some((effect) => {
+    if (effect.type === "send_message") return effect.roomId === task.roomId && effect.kind !== "progress";
+    return effect.type === "read_no_reply" && effect.roomId === task.roomId && effect.messageId === task.messageId;
+  }));
+}
+
+function deferredTaskDecisionMessage(args: RunArgs, tasks: Array<{ roomId: string; messageId: string }>): AgentSessionMessage {
+  return {
+    role: "user",
+    content: [
+      "[系统跨房间续办决策]",
+      `当前房间 ${args.packet.room.id} 的本轮消息已经完成，但以下来源任务仍在续办：`,
+      ...tasks.map((task) => `- sourceRoomId=${task.roomId}, sourceMessageId=${task.messageId}`),
+      "如果完整目标已经达成，现在向每个来源房间发送非 progress 最终结果；如果仍须等待当前房间的未来消息，则调用 continue_task_in_room 并把 roomId 设为当前房间。不要只口头说稍后汇报。",
+    ].join("\n"),
+  };
+}
+
 function deliveryRepairMessage(obligations: Array<{ roomId: string; messageId: string }>): AgentSessionMessage {
   return {
     role: "user",
     content: [
       "[系统交付校验未通过]",
       "下面这些房间仍没有终结动作。现在只处理交付：对每个房间分别调用 begin_message_to_room，然后在下一次 assistant 回复中只输出该房间的完整公开正文；或在确实无需回复时调用精确 messageId 的 read_no_reply。默认私有 assistant 文本和 kind=progress 都不能完成义务。",
+      "若任务已经在另一个房间启动、必须等待未来的 Agent 消息才能完成，则调用 continue_task_in_room 转为异步续办并结束本轮；不要调用历史读取工具轮询等待。",
       ...obligations.map((obligation) => `- roomId=${obligation.roomId}, messageId=${obligation.messageId}`),
     ].join("\n"),
   };
+}
+
+function terminalToolRepairMessage(calls: ToolCall[]): AgentSessionMessage {
+  const names = [...new Set(calls.map((call) => call.name))];
+  return {
+    role: "user",
+    content: [
+      "[系统收尾工具校验未通过]",
+      `这些非终结工具没有执行：${names.join("、")}。`,
+      "当前只允许 begin_message_to_room、read_no_reply 或 continue_task_in_room。若正在等待另一个房间未来的 Agent 消息，请使用 continue_task_in_room，不要轮询。",
+    ].join("\n"),
+  };
+}
+
+function blockedTerminalToolOutputs(calls: ToolCall[]): ToolCallOutput[] {
+  return calls.map((call) => ({
+    callId: call.id,
+    name: call.name,
+    text: "[系统未执行工具] 当前已进入收尾阶段；请选择公开交付、无需回复或跨房间异步续办。",
+    error: true,
+    structured: null,
+  }));
 }
 
 function responseContextMessage(message: AgentSessionMessage): Record<string, unknown> {
@@ -243,8 +309,14 @@ function maxModelStepsForRun(args: RunArgs): number {
       + maxDeliveryRepairAttempts
       + maxPublicMessageRepairAttempts
       + maxInitialProgressRepairAttempts
+      + maxTerminalToolRepairAttempts
+      + maxDeferredDecisionAttempts
       + 4,
   );
+}
+
+function terminalToolAllowed(packet: SchedulerPacket, name: string): boolean {
+  return terminalToolNames.has(name) && !(packet.type === "delivery_packet" && name === "continue_task_in_room");
 }
 
 function publicMessageRoute(value: unknown): PublicMessageRoute | null {
@@ -277,6 +349,17 @@ function upgradeLegacyMessageCall(call: ToolCall): ToolCall {
 
 function publicMessageRetry(route: PublicMessageRoute): AgentSessionMessage {
   return { role: "user", content: `[系统公开消息校验未通过]\n房间 ${route.roomId} 的公开正文为空。现在直接输出完整正文，不要解释或调用工具。` };
+}
+
+function publicMessageToolRetry(route: PublicMessageRoute, calls: ToolCall[]): AgentSessionMessage {
+  return {
+    role: "user",
+    content: `[系统公开消息校验未通过]\n房间 ${route.roomId} 正在等待公开正文，以下工具调用没有执行：${[...new Set(calls.map((call) => call.name))].join("、")}。现在直接输出完整正文，不要解释或调用工具。`,
+  };
+}
+
+function blockedPublicMessageToolOutputs(calls: ToolCall[]): ToolCallOutput[] {
+  return calls.map((call) => ({ callId: call.id, name: call.name, text: "[系统未执行工具] 当前必须先完成已打开房间的公开正文。", error: true, structured: null }));
 }
 
 function publicMessageControl(route: PublicMessageRoute): AgentSessionMessage {
@@ -353,6 +436,28 @@ function publishPublicMessageDelta(args: RunArgs, route: PublicMessageRoute, del
   }, args.repository.getVersion().revision);
 }
 
+function replacePublicMessagePreview(args: RunArgs, route: PublicMessageRoute, content: string): void {
+  if (args.signal.aborted) return;
+  publishWorkspaceEvent("turn.preview", args.turnId, {
+    kind: "room_message_preview",
+    roomId: route.roomId,
+    agentId: args.agent.id,
+    messageKey: route.messageKey,
+    content,
+    messageKind: route.kind,
+  }, args.repository.getVersion().revision);
+}
+
+function stripSerializedToolMarkup(content: string): { content: string; stripped: boolean } {
+  const markers = ["<｜｜DSML｜｜tool_calls>", "<|DSML|tool_calls>"];
+  const markerIndex = markers.reduce((earliest, marker) => {
+    const index = content.indexOf(marker);
+    return index < 0 ? earliest : Math.min(earliest, index);
+  }, content.length);
+  if (markerIndex === content.length) return { content, stripped: false };
+  return { content: content.slice(0, markerIndex).trimEnd(), stripped: true };
+}
+
 async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExecution[], timeline: TimelineEvent[], effects: TurnEffect[], modelStep: number, onOutput?: (output: ToolCallOutput) => void, options?: { allowHiddenTools?: boolean }): Promise<ToolCallOutput[]> {
   const addTimeline = createTimelineFactory(args.turnId, timeline);
   const outputs: ToolCallOutput[] = [];
@@ -365,7 +470,7 @@ async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExe
     let outputText = ""; let structured: unknown = {}; let error: string | null = null;
     try {
       if (!definition || (definition.modelVisible === false && !options?.allowHiddenTools)) throw new Error(`未知或已停用工具：${call.name}`);
-      const context: ToolContext = { agent: args.agent, roomId: args.packet.room.id, agentParticipantId: args.agentParticipantId, packet: args.packet, repository: args.repository, signal: args.signal };
+      const context: ToolContext = { agent: args.agent, roomId: args.packet.room.id, agentParticipantId: args.agentParticipantId, packet: args.packet, repository: args.repository, signal: args.signal, turnId: args.turnId, pendingEffects: effects };
       const invocationKey = `${args.turnId}:model:${modelStep}:tool:${callIndex}`;
       const result = await definition.execute(context, parsed, call.id, invocationKey);
       outputText = result.text; structured = result.structured; effects.push(...result.effects);
@@ -382,7 +487,7 @@ async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExe
 }
 
 async function parseSse(response: Response, onEvent: (event: Record<string, unknown>) => void): Promise<void> {
-  if (!response.ok) throw new Error(`模型接口错误 ${response.status}: ${(await response.text()).slice(0, 2_000)}`);
+  if (!response.ok) throw new ModelHttpError(response.status, (await response.text()).slice(0, 2_000));
   if (!response.body) throw new Error("模型接口未返回流");
   const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
   while (true) {
@@ -573,6 +678,8 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
   let deliveryOnly = args.packet.type === "delivery_packet"; let deliveryRepairAttempts = 0;
   let activePublicRoute: PublicMessageRoute | null = null; let publicMessageRepairAttempts = 0;
   let initialProgressRepairAttempts = 0;
+  let terminalToolRepairAttempts = 0;
+  let deferredDecisionAttempts = 0;
   let activePublicTools: typeof chatToolDefinitions = [];
   const maxModelSteps = maxModelStepsForRun(args);
   checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -585,7 +692,7 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       : regularToolsAllowed
       ? chatToolDefinitions
       : terminalToolsOnly
-        ? chatToolDefinitions.filter((tool) => terminalToolNames.has(tool.function.name))
+        ? chatToolDefinitions.filter((tool) => terminalToolAllowed(args.packet, tool.function.name))
         : [];
     const requestSystemPrompt = turnSystemPrompt;
     messages[0] = { role: "system", content: requestSystemPrompt };
@@ -608,13 +715,13 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
     }
     const body: Record<string, unknown> = { model: args.agent.settings.model, messages, stream: true, stream_options: { include_usage: true } };
+    applyChatThinkingSettings(body, args.agent, baseUrl);
     if (requestTools.length) {
       body.tools = requestTools;
       // DeepSeek does not compile tool schemas into the cached prompt when tool_choice is "none".
       // Public output remains content-only through publicMessageControl and the runtime call check below.
-      body.tool_choice = terminalToolsOnly ? "required" : "auto";
+      body.tool_choice = publicRouteForStep ? "none" : terminalToolsOnly && asRecord(body.thinking)?.type !== "enabled" ? "required" : "auto";
     }
-    applyChatThinkingSettings(body, args.agent, baseUrl);
     const startedAt = nowIso(); const startedMs = Date.now(); let stepUsage: unknown = null;
     let content = ""; let reasoningContent = ""; let sawReasoningContent = false; const callMap = new Map<number, ToolCall>();
     try {
@@ -667,7 +774,14 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       throw error;
     }
     const calls = [...callMap.values()].map(upgradeLegacyMessageCall);
-    if (publicRouteForStep && calls.length) throw new Error("公开正文阶段禁止调用工具");
+    if (publicRouteForStep) {
+      const sanitized = stripSerializedToolMarkup(content);
+      if (sanitized.stripped) {
+        content = sanitized.content;
+        replacePublicMessagePreview(args, publicRouteForStep, content);
+        addTimeline("assistant_delta", { content, visibility: "public", roomId: publicRouteForStep.roomId, sanitizedToolMarkup: true });
+      }
+    }
     const includeReasoning = sawReasoningContent || args.agent.settings.thinkingMode === "enabled" || (args.agent.settings.thinkingMode === "provider_default" && isDeepSeekBaseUrl(baseUrl));
     const assistantMessage: Extract<AgentSessionMessage, { role: "assistant" }> = {
       role: "assistant",
@@ -677,6 +791,18 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
     };
     messages.push(assistantMessage); sessionMessages.push(assistantMessage); auditMessages.push(assistantMessage);
     checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+    if (publicRouteForStep && calls.length) {
+      if (publicMessageRepairAttempts >= maxPublicMessageRepairAttempts) throw new Error("模型在公开正文阶段持续请求调用工具");
+      publicMessageRepairAttempts += 1;
+      for (const output of blockedPublicMessageToolOutputs(calls)) {
+        const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
+        messages.push(toolMessage); sessionMessages.push(toolMessage); auditMessages.push(toolMessage);
+      }
+      const retryMessage = publicMessageToolRetry(publicRouteForStep, calls);
+      messages.push(retryMessage); sessionMessages.push(retryMessage); auditMessages.push(retryMessage);
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
+    }
     if (publicRouteForStep) {
       if (args.signal.aborted) throw new DOMException("公开正文生成已停止", "AbortError");
       if (!content.trim()) {
@@ -694,7 +820,16 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       activePublicRoute = null; activePublicTools = []; publicMessageRepairAttempts = 0;
       const unresolved = unresolvedDeliveryObligations(args, effects);
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-      if (!unresolved.length && publicRouteForStep.kind !== "progress") break;
+      if (!unresolved.length && publicRouteForStep.kind !== "progress") {
+        const deferredTasks = unresolvedDeferredTasks(args, effects);
+        if (!deferredTasks.length) break;
+        if (deferredDecisionAttempts >= maxDeferredDecisionAttempts) throw new Error("跨房间续办任务持续未作出完成或等待决策");
+        deferredDecisionAttempts += 1;
+        const decisionMessage = deferredTaskDecisionMessage(args, deferredTasks);
+        messages.push(decisionMessage); sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage);
+        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+        continue;
+      }
       const resolvedObligation = unresolved.length < unresolvedBefore.length;
       const continuationMessage = publicRouteForStep.kind === "progress"
         ? progressContinuation(publicRouteForStep)
@@ -707,13 +842,34 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       continue;
     }
     if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
-    if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
+    const invalidTerminalCalls = terminalToolsOnly ? calls.filter((call) => !terminalToolAllowed(args.packet, call.name)) : [];
+    if (invalidTerminalCalls.length) {
+      if (terminalToolRepairAttempts >= maxTerminalToolRepairAttempts) throw new Error(`模型在收尾步骤持续请求非终结工具：${invalidTerminalCalls[0]?.name}`);
+      terminalToolRepairAttempts += 1;
+      for (const output of blockedTerminalToolOutputs(calls)) {
+        const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
+        messages.push(toolMessage); sessionMessages.push(toolMessage); auditMessages.push(toolMessage);
+      }
+      const repairMessage = terminalToolRepairMessage(invalidTerminalCalls);
+      messages.push(repairMessage); sessionMessages.push(repairMessage); auditMessages.push(repairMessage);
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
+    }
     if (!calls.length) {
       const unresolved = unresolvedDeliveryObligations(args, effects);
       if (unresolved.length && deliveryRepairAttempts < maxDeliveryRepairAttempts) {
         deliveryOnly = true; deliveryRepairAttempts += 1;
         const repairMessage = deliveryRepairMessage(unresolved);
         messages.push(repairMessage); sessionMessages.push(repairMessage); auditMessages.push(repairMessage);
+        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+        continue;
+      }
+      const deferredTasks = unresolvedDeferredTasks(args, effects);
+      if (deferredTasks.length) {
+        if (deferredDecisionAttempts >= maxDeferredDecisionAttempts) throw new Error("跨房间续办任务持续未作出完成或等待决策");
+        deferredDecisionAttempts += 1;
+        const decisionMessage = deferredTaskDecisionMessage(args, deferredTasks);
+        messages.push(decisionMessage); sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage);
         checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
         continue;
       }
@@ -744,8 +900,20 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       messages.push(controlMessage); auditMessages.push(controlMessage);
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
     }
-    if (allDeliveryObligationsResolved(args, effects) && !sawReasoningContent) break;
     if (openedRoute) continue;
+    if (effects.some((effect) => effect.type === "continue_task_in_room")) break;
+    if (allDeliveryObligationsResolved(args, effects)) {
+      const deferredTasks = unresolvedDeferredTasks(args, effects);
+      if (deferredTasks.length) {
+        if (deferredDecisionAttempts >= maxDeferredDecisionAttempts) throw new Error("跨房间续办任务持续未作出完成或等待决策");
+        deferredDecisionAttempts += 1;
+        const decisionMessage = deferredTaskDecisionMessage(args, deferredTasks);
+        messages.push(decisionMessage); sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage);
+        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+        continue;
+      }
+      if (!sawReasoningContent) break;
+    }
     if (terminalToolsOnly) {
       const unresolved = unresolvedDeliveryObligations(args, effects);
       if (!unresolved.length) break;
@@ -757,6 +925,9 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
     }
   }
   if (activePublicRoute) throw new Error(`房间 ${activePublicRoute.roomId} 的公开消息通道已打开，但未生成正文`);
+  if (unresolvedDeferredTasks(args, effects).length && !effects.some((effect) => effect.type === "continue_task_in_room")) {
+    throw new Error("跨房间续办任务尚未完成，也没有显式等待后续消息");
+  }
   addTimeline("turn_finished", { usage });
   checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
   return { assistantContent, systemPrompt: turnSystemPrompt, sessionMessages, auditMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "chat_completions", model: args.agent.settings.model, usage, modelCalls, toolSteps, reasoningCharacters, context: contextMeta(prepared) } };
@@ -781,6 +952,8 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
   let deliveryOnly = args.packet.type === "delivery_packet"; let deliveryRepairAttempts = 0;
   let toolSteps = 0; let activePublicRoute: PublicMessageRoute | null = null; let publicMessageRepairAttempts = 0;
   let initialProgressRepairAttempts = 0;
+  let terminalToolRepairAttempts = 0;
+  let deferredDecisionAttempts = 0;
   let activePublicTools: typeof responseToolDefinitions = [];
   const maxModelSteps = maxModelStepsForRun(args);
   checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -793,7 +966,7 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       : regularToolsAllowed
       ? responseToolDefinitions
       : terminalToolsOnly
-        ? responseToolDefinitions.filter((tool) => terminalToolNames.has(tool.name))
+        ? responseToolDefinitions.filter((tool) => terminalToolAllowed(args.packet, tool.name))
         : [];
     const requestSystemPrompt = turnSystemPrompt;
     const requestTokens = countRenderedContextTokens({ instructions: requestSystemPrompt, messages: continuationMessages, tools: requestTools });
@@ -814,14 +987,14 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
     }
     const body: Record<string, unknown> = { model: args.agent.settings.model, input, stream: true };
+    applyResponsesThinkingSettings(body, args.agent, baseUrl);
     if (requestTools.length) {
       body.tools = requestTools;
       // Match the route-opening request so provider-side prompt caching keeps a stable prefix.
-      body.tool_choice = terminalToolsOnly ? "required" : "auto";
+      body.tool_choice = publicRouteForStep ? "none" : terminalToolsOnly && asRecord(body.thinking)?.type !== "enabled" ? "required" : "auto";
     }
     if (!previousResponseId) body.instructions = requestSystemPrompt;
     else body.previous_response_id = previousResponseId;
-    applyResponsesThinkingSettings(body, args.agent, baseUrl);
     const startedAt = nowIso(); const startedMs = Date.now(); let stepUsage: unknown = null;
     const callMap = new Map<string, ToolCall>(); let stepContent = "";
     try {
@@ -884,7 +1057,6 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       throw error;
     }
     const calls = [...callMap.values()].map(upgradeLegacyMessageCall);
-    if (publicRouteForStep && calls.length) throw new Error("公开正文阶段禁止调用工具");
     const assistantMessage: Extract<AgentSessionMessage, { role: "assistant" }> = {
       role: "assistant",
       content: stepContent || null,
@@ -892,6 +1064,23 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
     };
     sessionMessages.push(assistantMessage); auditMessages.push(assistantMessage); continuationMessages.push(responseContextMessage(assistantMessage));
     checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+    if (publicRouteForStep && calls.length) {
+      if (publicMessageRepairAttempts >= maxPublicMessageRepairAttempts) throw new Error("模型在公开正文阶段持续请求调用工具");
+      publicMessageRepairAttempts += 1;
+      const blockedOutputs = blockedPublicMessageToolOutputs(calls);
+      for (const output of blockedOutputs) {
+        const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
+        sessionMessages.push(toolMessage); auditMessages.push(toolMessage); continuationMessages.push(responseContextMessage(toolMessage));
+      }
+      const retryMessage = publicMessageToolRetry(publicRouteForStep, calls);
+      sessionMessages.push(retryMessage); auditMessages.push(retryMessage); continuationMessages.push(responseContextMessage(retryMessage));
+      input = [
+        ...blockedOutputs.map((output) => ({ type: "function_call_output", call_id: output.callId, output: output.text })),
+        responseContextMessage(retryMessage),
+      ];
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
+    }
     if (publicRouteForStep) {
       if (args.signal.aborted) throw new DOMException("公开正文生成已停止", "AbortError");
       if (!stepContent.trim()) {
@@ -910,7 +1099,17 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       activePublicRoute = null; activePublicTools = []; publicMessageRepairAttempts = 0;
       const unresolved = unresolvedDeliveryObligations(args, effects);
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-      if (!unresolved.length && publicRouteForStep.kind !== "progress") break;
+      if (!unresolved.length && publicRouteForStep.kind !== "progress") {
+        const deferredTasks = unresolvedDeferredTasks(args, effects);
+        if (!deferredTasks.length) break;
+        if (deferredDecisionAttempts >= maxDeferredDecisionAttempts) throw new Error("跨房间续办任务持续未作出完成或等待决策");
+        deferredDecisionAttempts += 1;
+        const decisionMessage = deferredTaskDecisionMessage(args, deferredTasks);
+        sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage); continuationMessages.push(responseContextMessage(decisionMessage));
+        input = [responseContextMessage(decisionMessage)];
+        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+        continue;
+      }
       const resolvedObligation = unresolved.length < unresolvedBefore.length;
       const continuationMessage = publicRouteForStep.kind === "progress"
         ? progressContinuation(publicRouteForStep)
@@ -924,7 +1123,24 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       continue;
     }
     if (calls.length && !regularToolsAllowed && !terminalToolsOnly) throw new Error(`模型在最大工具步骤 ${args.agent.settings.maxToolSteps} 用尽并完成收尾后仍请求调用工具`);
-    if (terminalToolsOnly && calls.some((call) => !terminalToolNames.has(call.name))) throw new Error(`模型在收尾步骤请求了非终结工具：${calls.find((call) => !terminalToolNames.has(call.name))?.name}`);
+    const invalidTerminalCalls = terminalToolsOnly ? calls.filter((call) => !terminalToolAllowed(args.packet, call.name)) : [];
+    if (invalidTerminalCalls.length) {
+      if (terminalToolRepairAttempts >= maxTerminalToolRepairAttempts) throw new Error(`模型在收尾步骤持续请求非终结工具：${invalidTerminalCalls[0]?.name}`);
+      terminalToolRepairAttempts += 1;
+      const blockedOutputs = blockedTerminalToolOutputs(calls);
+      for (const output of blockedOutputs) {
+        const toolMessage: AgentSessionMessage = { role: "tool", tool_call_id: output.callId, content: output.text };
+        sessionMessages.push(toolMessage); auditMessages.push(toolMessage); continuationMessages.push(responseContextMessage(toolMessage));
+      }
+      const repairMessage = terminalToolRepairMessage(invalidTerminalCalls);
+      sessionMessages.push(repairMessage); auditMessages.push(repairMessage); continuationMessages.push(responseContextMessage(repairMessage));
+      input = [
+        ...blockedOutputs.map((output) => ({ type: "function_call_output", call_id: output.callId, output: output.text })),
+        responseContextMessage(repairMessage),
+      ];
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
+    }
     if (!calls.length) {
       const unresolved = unresolvedDeliveryObligations(args, effects);
       if (unresolved.length && deliveryRepairAttempts < maxDeliveryRepairAttempts) {
@@ -932,6 +1148,16 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
         const repairMessage = deliveryRepairMessage(unresolved);
         sessionMessages.push(repairMessage); auditMessages.push(repairMessage); continuationMessages.push(responseContextMessage(repairMessage));
         input = [responseContextMessage(repairMessage)];
+        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+        continue;
+      }
+      const deferredTasks = unresolvedDeferredTasks(args, effects);
+      if (deferredTasks.length) {
+        if (deferredDecisionAttempts >= maxDeferredDecisionAttempts) throw new Error("跨房间续办任务持续未作出完成或等待决策");
+        deferredDecisionAttempts += 1;
+        const decisionMessage = deferredTaskDecisionMessage(args, deferredTasks);
+        sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage); continuationMessages.push(responseContextMessage(decisionMessage));
+        input = [responseContextMessage(decisionMessage)];
         checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
         continue;
       }
@@ -970,8 +1196,19 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       input = [...outputItems, responseContextMessage(controlMessage)];
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
     }
-    if (allDeliveryObligationsResolved(args, effects)) break;
     if (openedRoute) continue;
+    if (effects.some((effect) => effect.type === "continue_task_in_room")) break;
+    if (allDeliveryObligationsResolved(args, effects)) {
+      const deferredTasks = unresolvedDeferredTasks(args, effects);
+      if (!deferredTasks.length) break;
+      if (deferredDecisionAttempts >= maxDeferredDecisionAttempts) throw new Error("跨房间续办任务持续未作出完成或等待决策");
+      deferredDecisionAttempts += 1;
+      const decisionMessage = deferredTaskDecisionMessage(args, deferredTasks);
+      sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage); continuationMessages.push(responseContextMessage(decisionMessage));
+      input = [responseContextMessage(decisionMessage)];
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
+    }
     if (terminalToolsOnly) {
       const unresolved = unresolvedDeliveryObligations(args, effects);
       if (!unresolved.length) break;
@@ -984,6 +1221,9 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
     }
   }
   if (activePublicRoute) throw new Error(`房间 ${activePublicRoute.roomId} 的公开消息通道已打开，但未生成正文`);
+  if (unresolvedDeferredTasks(args, effects).length && !effects.some((effect) => effect.type === "continue_task_in_room")) {
+    throw new Error("跨房间续办任务尚未完成，也没有显式等待后续消息");
+  }
   addTimeline("turn_finished", { usage, responseId: previousResponseId });
   checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
   return { assistantContent, systemPrompt: turnSystemPrompt, sessionMessages, auditMessages, tools, timeline, effects, contextCompaction: prepared.compaction, modelMeta: { format: "responses", model: args.agent.settings.model, responseId: previousResponseId, usage, modelCalls, toolSteps, context: contextMeta(prepared) } };

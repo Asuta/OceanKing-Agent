@@ -156,6 +156,8 @@ describe("OpenAI 兼容协议", () => {
     expect(turn?.status).toBe("error");
     expect(turn?.modelMeta?.modelCalls).toEqual([
       expect.objectContaining({ index: 1, cachedInputTokens: 75, cacheHitRate: 0.75 }),
+      expect.objectContaining({ index: 2, cachedInputTokens: 75, cacheHitRate: 0.75 }),
+      expect.objectContaining({ index: 3, cachedInputTokens: 75, cacheHitRate: 0.75 }),
     ]);
   }));
 
@@ -392,7 +394,7 @@ describe("OpenAI 兼容协议", () => {
     expect(firstTools.map((tool) => tool.function.name)).toContain("begin_message_to_room");
     expect(firstTools.map((tool) => tool.function.name)).not.toContain("send_message_to_room");
     expect(requestBodies[1]?.tools).toEqual(requestBodies[0]?.tools);
-    expect(requestBodies[1]?.tool_choice).toBe("auto");
+    expect(requestBodies[1]?.tool_choice).toBe("none");
     const firstMessages = requestBodies[0]?.messages as Array<{ role: string; content?: string }>;
     const publicMessages = requestBodies[1]?.messages as Array<{ role: string; content?: string }>;
     expect(publicMessages.slice(0, firstMessages.length)).toEqual(firstMessages);
@@ -421,27 +423,60 @@ describe("OpenAI 兼容协议", () => {
     expect(requestBodies).toHaveLength(3);
     expect(requestBodies[1]?.tools).toEqual(requestBodies[0]?.tools);
     expect(requestBodies[2]?.tools).toEqual(requestBodies[0]?.tools);
-    expect(requestBodies[1]?.tool_choice).toBe("auto");
-    expect(requestBodies[2]?.tool_choice).toBe("auto");
+    expect(requestBodies[1]?.tool_choice).toBe("none");
+    expect(requestBodies[2]?.tool_choice).toBe("none");
     const thirdMessages = requestBodies[2]?.messages as Array<{ role: string; content?: string }>;
     expect(thirdMessages.at(-1)?.content).toContain("公开正文为空");
     expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "重试后正式正文", messageKey: "turn_public_retry:model:0:tool:0" })]);
   }));
 
-  it("公开正文阶段保留缓存工具前缀但拒绝模型实际调用工具", async () => withRepository(async (repository) => {
+  it("公开正文阶段显式禁用工具，并在服务商仍返回工具调用时重试正文", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
     const requestBodies: Array<Record<string, unknown>> = []; let call = 0;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       requestBodies.push(requestBody(init)); call += 1;
       if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_begin_guard", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] }, "[DONE]"]);
-      return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_forbidden", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor" }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_forbidden", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "偏航修复后的公开正文" } }] }, "[DONE]"]);
     }));
     sendUser(repository, "room_harbor", "公开正文工具防线"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
     const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
-    await expect(runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_public_tool_guard", signal: new AbortController().signal }))
-      .rejects.toThrow("公开正文阶段禁止调用工具");
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_public_tool_guard", signal: new AbortController().signal });
+    expect(result.tools.map((tool) => tool.name)).toEqual(["begin_message_to_room"]);
+    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "偏航修复后的公开正文" })]);
     expect(requestBodies[1]?.tools).toEqual(requestBodies[0]?.tools);
-    expect(requestBodies[1]?.tool_choice).toBe("auto");
+    expect(requestBodies[1]?.tool_choice).toBe("none");
+    expect(requestBodies[2]?.tool_choice).toBe("none");
+  }));
+
+  it("公开正文中的 DeepSeek DSML 工具标记不会进入房间消息", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://api.deepseek.com/v1";
+    const previews: string[] = [];
+    const replacements: string[] = [];
+    const unsubscribe = subscribeWorkspaceEvents((event) => {
+      appendRoomPreview(previews, event, "turn_public_dsml");
+      const payload = event.payload as { kind?: string; content?: string } | undefined;
+      if (event.entityId === "turn_public_dsml" && payload?.kind === "room_message_preview" && payload.content !== undefined) replacements.push(payload.content);
+    });
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_begin_dsml", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress" }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([
+        { choices: [{ delta: { content: "正在创建房间…\n\n" } }] },
+        { choices: [{ delta: { content: '<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="create_room">' } }] },
+        "[DONE]",
+      ]);
+      if (call === 3) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_finish_dsml", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "房间创建流程已启动" } }] }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "验证 DSML 清理"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_public_dsml", signal: new AbortController().signal });
+    unsubscribe();
+    expect(result.effects[0]).toMatchObject({ type: "send_message", kind: "progress", content: "正在创建房间…" });
+    expect(result.effects[0]).not.toEqual(expect.objectContaining({ content: expect.stringContaining("DSML") }));
+    expect(replacements).toContain("正在创建房间…");
   }));
 
   it("公开正文超过统一字符上限时在发布预览和提交前失败", async () => withRepository(async (repository) => {
@@ -492,14 +527,201 @@ describe("OpenAI 兼容协议", () => {
     expect(bodies).toHaveLength(4);
     expect(bodies[1]?.tools).toEqual(bodies[0]?.tools);
     expect(bodies[3]?.tools).toEqual(bodies[2]?.tools);
-    expect(bodies[1]?.tool_choice).toBe("auto");
-    expect(bodies[3]?.tool_choice).toBe("auto");
+    expect(bodies[1]?.tool_choice).toBe("none");
+    expect(bodies[3]?.tool_choice).toBe("none");
     const terminalTools = bodies[2]?.tools as Array<{ function: { name: string } }>;
-    expect(terminalTools.map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "read_no_reply"]);
+    expect(terminalTools.map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "continue_task_in_room", "read_no_reply"]);
     expect(result.effects).toEqual([
       expect.objectContaining({ type: "send_message", roomId: nextRoom.id, messageKey: "turn_public_multi:model:0:tool:0", content: "新房间独立结果" }),
       expect.objectContaining({ type: "send_message", roomId: "room_harbor", messageKey: "turn_public_multi:model:2:tool:0", content: "旧房间独立结果" }),
     ]);
+  }));
+
+  it("同一 Turn 创建房间后可立即发言，并在成功时原子提交房间和消息", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    let call = 0; let createdRoomId = "";
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      call += 1;
+      const body = requestBody(init);
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_progress", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress" }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { content: "我先创建新房间并邀请执行者。" } }] }, "[DONE]"]);
+      if (call === 3) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_create", function: { name: "create_room", arguments: JSON.stringify({ title: "数数游戏室", agentIds: ["builder"] }) } }] } }] }, "[DONE]"]);
+      if (call === 4) {
+        createdRoomId = JSON.stringify(body.messages).match(/room_[0-9a-f-]{36}/)?.[0] ?? "";
+        expect(createdRoomId).not.toBe("");
+        return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_new_room", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: createdRoomId, kind: "answer" }) } }] } }] }, "[DONE]"]);
+      }
+      if (call === 5) return sse([{ choices: [{ delta: { content: "1" } }] }, "[DONE]"]);
+      if (call === 6) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_final", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "新房间已经创建并开始数数。" } }] }, "[DONE]"]);
+    }));
+
+    sendUser(repository, "room_harbor", "创建房间并开始数数"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    repository.beginTurn({ turnId: "turn_create_and_send", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_create_and_send", signal: new AbortController().signal });
+    expect(result.tools.find((tool) => tool.id === "call_new_room")).toMatchObject({ status: "completed", error: null });
+
+    const applied = repository.finishTurn({ turnId: "turn_create_and_send", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+    const created = repository.getRoom(createdRoomId)!;
+    expect(created.title).toBe("数数游戏室");
+    expect(created.participants.filter((participant) => participant.kind === "agent").map((participant) => participant.agentId).sort()).toEqual(["builder", "navigator"]);
+    expect(created.messages).toEqual([expect.objectContaining({ content: "1", sender: expect.objectContaining({ name: "领航员" }) })]);
+    expect(applied.triggerRoomIds).toContain(createdRoomId);
+  }));
+
+  it("跨房间任务可结束当前 Turn 等待其他 Agent，且收尾偏航不会回滚新房间", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://api.deepseek.com/v1";
+    const bodies: Array<Record<string, unknown>> = []; let call = 0; let createdRoomId = "";
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = requestBody(init); bodies.push(body); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_deferred_progress", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "progress" }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { content: "我会创建协作房间并开始数数。" } }] }, "[DONE]"]);
+      if (call === 3) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_deferred_create", function: { name: "create_room", arguments: JSON.stringify({ title: "异步数数室", agentIds: ["builder"] }) } }] } }] }, "[DONE]"]);
+      if (call === 4) {
+        createdRoomId = JSON.stringify(body.messages).match(/room_[0-9a-f-]{36}/)?.[0] ?? "";
+        return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_deferred_open", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: createdRoomId, kind: "answer" }) } }] } }] }, "[DONE]"]);
+      }
+      if (call === 5) return sse([{ choices: [{ delta: { content: "1" } }] }, "[DONE]"]);
+      if (call === 6) return sse([{ choices: [{ delta: { content: "等待另一个 Agent 的后续消息。" } }] }, "[DONE]"]);
+      if (call === 7) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_blocked_poll", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: createdRoomId, limit: 10 }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_continue_async", function: { name: "continue_task_in_room", arguments: JSON.stringify({ roomId: createdRoomId }) } }] } }] }, "[DONE]"]);
+    }));
+
+    sendUser(repository, "room_harbor", "创建房间和另一个 Agent 数数，完成后再汇报"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "enabled" as const } };
+    repository.beginTurn({ turnId: "turn_deferred_room", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_deferred_room", signal: new AbortController().signal });
+
+    expect(createdRoomId).not.toBe("");
+    expect(result.tools.some((tool) => tool.name === "read_room_history")).toBe(false);
+    expect(result.effects).toContainEqual({ type: "continue_task_in_room", roomId: createdRoomId });
+    expect((bodies[6]?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "continue_task_in_room", "read_no_reply"]);
+    const applied = repository.finishTurn({ turnId: "turn_deferred_room", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+    expect(repository.getRoom(createdRoomId)?.messages.at(-1)?.content).toBe("1");
+    expect(applied.continuationRoomIds).toContain(createdRoomId);
+    expect(repository.raw.prepare("SELECT target_room_id,deferred FROM turn_handoffs WHERE source_turn_id='turn_deferred_room'").get()).toEqual({ target_room_id: createdRoomId, deferred: 1 });
+  }));
+
+  it("跨房间目标完成后会在同一 Turn 继续向来源房间提交最终汇报", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    sendUser(repository, "room_harbor", "去协作房间完成任务后回来汇报");
+    const sourcePacket = packetFor(repository); const targetRoomId = "room_protocol_deferred";
+    repository.beginTurn({ turnId: "turn_protocol_deferred_source", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: sourcePacket });
+    repository.finishTurn({
+      turnId: "turn_protocol_deferred_source", assistantContent: "启动异步任务", tools: [], timeline: [], effects: [
+        { type: "create_room", roomId: targetRoomId, title: "协议续办房间", invitedAgentIds: ["builder"] },
+        { type: "send_message", roomId: targetRoomId, messageId: "msg_protocol_start", messageKey: "protocol-start", content: "开始协作", kind: "answer" },
+        { type: "continue_task_in_room", roomId: targetRoomId },
+      ], modelMeta: {}, cutoffSeq: sourcePacket.cutoffSeq, nextParticipantId: null,
+    });
+    sendUser(repository, targetRoomId, "协作目标已经完成");
+    const targetRoom = repository.getRoom(targetRoomId)!; const navigator = targetRoom.participants.find((participant) => participant.agentId === "navigator")!;
+    const targetPacket = packetFor(repository, targetRoomId); const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_target_done", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: targetRoomId, kind: "answer" }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { content: "目标房间确认完成" } }] }, "[DONE]"]);
+      if (call === 3) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_source_report", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "跨房间任务已经完成" } }] }, "[DONE]"]);
+    }));
+    const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    repository.beginTurn({ turnId: "turn_protocol_deferred_final", roomId: targetRoomId, agentId: agent.id, agentParticipantId: navigator.id, packet: targetPacket });
+    const result = await runAgentModel({ repository, agent, agentParticipantId: navigator.id, packet: targetPacket, turnId: "turn_protocol_deferred_final", signal: new AbortController().signal });
+
+    expect(JSON.stringify(bodies[2]?.messages)).toContain("[系统跨房间续办决策]");
+    expect(result.effects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "send_message", roomId: targetRoomId, content: "目标房间确认完成" }),
+      expect.objectContaining({ type: "send_message", roomId: "room_harbor", content: "跨房间任务已经完成" }),
+    ]));
+    repository.finishTurn({ turnId: "turn_protocol_deferred_final", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: targetPacket.cutoffSeq, nextParticipantId: navigator.id });
+    expect(repository.getRoom("room_harbor")!.messages.at(-1)?.content).toBe("跨房间任务已经完成");
+    expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs").get() as { count: number }).count).toBe(0);
+  }));
+
+  it("跨房间目标消息即使无需回复，也会先完成来源房间汇报再结束", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    sendUser(repository, "room_harbor", "去协作房间完成任务后回来汇报");
+    const sourcePacket = packetFor(repository); const targetRoomId = "room_deferred_no_reply";
+    repository.beginTurn({ turnId: "turn_deferred_no_reply_source", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: sourcePacket });
+    repository.finishTurn({
+      turnId: "turn_deferred_no_reply_source", assistantContent: "启动异步任务", tools: [], timeline: [], effects: [
+        { type: "create_room", roomId: targetRoomId, title: "无需回复续办房间", invitedAgentIds: ["builder"] },
+        { type: "send_message", roomId: targetRoomId, messageId: "msg_no_reply_start", messageKey: "no-reply-start", content: "开始协作", kind: "answer" },
+        { type: "continue_task_in_room", roomId: targetRoomId },
+      ], modelMeta: {}, cutoffSeq: sourcePacket.cutoffSeq, nextParticipantId: null,
+    });
+    sendUser(repository, targetRoomId, "结果已经完整给出，你无需在这里回复，只需回来源房间汇报");
+    const targetRoom = repository.getRoom(targetRoomId)!; const navigator = targetRoom.participants.find((participant) => participant.agentId === "navigator")!;
+    const targetPacket = packetFor(repository, targetRoomId); const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_deferred_no_reply", function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: targetRoomId, messageId: targetPacket.targetMessageId }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_deferred_source_report", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "无需回复的协作结果已经完成" } }] }, "[DONE]"]);
+    }));
+    const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    repository.beginTurn({ turnId: "turn_deferred_no_reply_final", roomId: targetRoomId, agentId: agent.id, agentParticipantId: navigator.id, packet: targetPacket });
+    const result = await runAgentModel({ repository, agent, agentParticipantId: navigator.id, packet: targetPacket, turnId: "turn_deferred_no_reply_final", signal: new AbortController().signal });
+
+    expect(JSON.stringify(bodies[1]?.messages)).toContain("[系统跨房间续办决策]");
+    expect(result.effects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "read_no_reply", roomId: targetRoomId, messageId: targetPacket.targetMessageId }),
+      expect.objectContaining({ type: "send_message", roomId: "room_harbor", content: "无需回复的协作结果已经完成" }),
+    ]));
+    repository.finishTurn({ turnId: "turn_deferred_no_reply_final", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: targetPacket.cutoffSeq, nextParticipantId: navigator.id });
+    expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs").get() as { count: number }).count).toBe(0);
+  }));
+
+  it("Chat 收尾修复会为混合工具批次中的每个调用返回结果", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [
+        { index: 0, id: "call_mixed_allowed", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } },
+        { index: 1, id: "call_mixed_blocked", function: { name: "read_room_history", arguments: JSON.stringify({ roomId: "room_harbor" }) } },
+      ] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_mixed_retry", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { content: "混合收尾已经修复" } }] }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "验证混合收尾"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const, maxToolSteps: 0 } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_mixed_terminal_chat", signal: new AbortController().signal });
+
+    const repairMessages = bodies[1]?.messages as Array<{ role: string; tool_call_id?: string }>;
+    expect(repairMessages.filter((message) => message.role === "tool").slice(-2).map((message) => message.tool_call_id).sort()).toEqual(["call_mixed_allowed", "call_mixed_blocked"]);
+    expect(result.tools.map((tool) => tool.id)).toEqual(["call_mixed_retry"]);
+    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "混合收尾已经修复" })]);
+  }));
+
+  it("Responses 收尾修复会为混合工具批次中的每个调用返回结果", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    const functionItem = (id: string, name: string, args: Record<string, unknown>) => ({ id: `item_${id}`, call_id: id, type: "function_call", name, arguments: JSON.stringify(args) });
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) {
+        const allowed = functionItem("call_responses_mixed_allowed", "begin_message_to_room", { roomId: "room_harbor", kind: "answer" });
+        const blocked = functionItem("call_responses_mixed_blocked", "read_room_history", { roomId: "room_harbor" });
+        return sse([{ type: "response.output_item.added", item: allowed }, { type: "response.output_item.done", item: allowed }, { type: "response.output_item.added", item: blocked }, { type: "response.output_item.done", item: blocked }, { type: "response.completed", response: { id: "resp_mixed_terminal" } }, "[DONE]"]);
+      }
+      if (call === 2) {
+        const retry = functionItem("call_responses_mixed_retry", "begin_message_to_room", { roomId: "room_harbor", kind: "answer" });
+        return sse([{ type: "response.output_item.added", item: retry }, { type: "response.output_item.done", item: retry }, { type: "response.completed", response: { id: "resp_mixed_retry" } }, "[DONE]"]);
+      }
+      return sse([{ type: "response.output_text.delta", delta: "Responses 混合收尾已经修复" }, { type: "response.completed", response: { id: "resp_mixed_done" } }, "[DONE]"]);
+    }));
+    sendUser(repository, "room_harbor", "验证 Responses 混合收尾"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const, thinkingMode: "disabled" as const, maxToolSteps: 0 } };
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_mixed_terminal_responses", signal: new AbortController().signal });
+
+    const repairInput = bodies[1]?.input as Array<{ type?: string; call_id?: string }>;
+    expect(repairInput.filter((item) => item.type === "function_call_output").map((item) => item.call_id).sort()).toEqual(["call_responses_mixed_allowed", "call_responses_mixed_blocked"]);
+    expect(result.tools.map((tool) => tool.id)).toEqual(["call_responses_mixed_retry"]);
+    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "Responses 混合收尾已经修复" })]);
   }));
 
   it("公开正文流被打断时不会生成可提交的正式消息", async () => withRepository(async (repository) => {
@@ -650,7 +872,7 @@ describe("OpenAI 兼容协议", () => {
 
     expect(bodies[0]).toMatchObject({ thinking: { type: "enabled" }, reasoning_effort: "max" });
     expect(bodies[1]?.tools).toEqual(bodies[0]?.tools);
-    expect(bodies[1]?.tool_choice).toBe("auto");
+    expect(bodies[1]?.tool_choice).toBe("none");
     const firstContinuation = bodies[1]?.messages as Array<Record<string, unknown>>;
     expect(firstContinuation.at(-3)).toMatchObject({ role: "assistant", reasoning_content: "需要先公开工具", tool_calls: [{ id: "call_reasoning" }] });
     expect(firstContinuation.at(-2)).toMatchObject({ role: "tool", tool_call_id: "call_reasoning" });
@@ -671,6 +893,26 @@ describe("OpenAI 兼容协议", () => {
       { step: 0, delta: "需要先公开工具" },
       { step: 1, delta: "工具已经执行，可以结束" },
     ]);
+  }));
+
+  it("DeepSeek 思考模式进入终结交付时不发送不兼容的 required tool_choice", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://api.deepseek.com/v1";
+    const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { reasoning_content: "需要收尾" } }] }, { choices: [{ delta: { content: "尚未公开的私有正文" } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { reasoning_content: "现在提交正式结果" } }] }, { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_deepseek_terminal", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "answer" }) } }] } }] }, "[DONE]"]);
+      return sse([{ choices: [{ delta: { reasoning_content: "组织最终正文" } }] }, { choices: [{ delta: { content: "DeepSeek 思考模式正式结果" } }] }, "[DONE]"]);
+    }));
+
+    sendUser(repository, "room_harbor", "需要正式交付"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "enabled" as const } };
+    repository.beginTurn({ turnId: "turn_deepseek_terminal", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_deepseek_terminal", signal: new AbortController().signal });
+
+    expect((bodies[1]?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "continue_task_in_room", "read_no_reply"]);
+    expect(bodies[1]).toMatchObject({ thinking: { type: "enabled" }, tool_choice: "auto" });
+    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "DeepSeek 思考模式正式结果" })]);
   }));
 
   it("DeepSeek 跟随服务商默认思考模式时仍应用 reasoning_effort", async () => withRepository(async (repository) => {
@@ -730,9 +972,9 @@ describe("OpenAI 兼容协议", () => {
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_terminal_tool", signal: new AbortController().signal });
     expect(result.tools.map((tool) => tool.name)).toEqual(["begin_message_to_room", "read_room_history", "begin_message_to_room"]);
     expect(result.effects).toEqual(expect.arrayContaining([expect.objectContaining({ type: "send_message", kind: "progress" }), expect.objectContaining({ type: "send_message", content: "达到上限后的正式结果" })]));
-    expect((bodies[3]?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "read_no_reply"]);
+    expect((bodies[3]?.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "continue_task_in_room", "read_no_reply"]);
     expect(bodies[4]?.tools).toEqual(bodies[3]?.tools);
-    expect(bodies[4]?.tool_choice).toBe("auto");
+    expect(bodies[4]?.tool_choice).toBe("none");
   }));
 
   it("Chat 工具输出让上下文越过阈值时，会在下一次模型请求前整体压缩", async () => withRepository(async (repository) => {
@@ -831,7 +1073,7 @@ describe("OpenAI 兼容协议", () => {
     finally { clearTimeout(timeoutId); releaseRest(); }
     const result = await run; unsubscribe();
     expect(bodies[1]?.tools).toEqual(bodies[0]?.tools);
-    expect(bodies[1]?.tool_choice).toBe("auto");
+    expect(bodies[1]?.tool_choice).toBe("none");
     expect(bodies[1]?.instructions).toBeUndefined();
     expect(bodies[1]?.previous_response_id).toBe("resp_begin_public");
     expect(JSON.stringify(bodies[1]?.input)).toContain("[系统公开输出阶段]");

@@ -240,6 +240,7 @@ export type TurnEffect =
   | { type: "send_message"; roomId: Id; messageId: Id; messageKey: string; content: string; kind: RoomMessage["kind"] }
   | { type: "read_no_reply"; roomId: Id; messageId: Id; receiptId: Id }
   | { type: "create_room"; roomId: Id; title: string; invitedAgentIds: Id[] }
+  | { type: "continue_task_in_room"; roomId: Id }
   | { type: "invite_agent"; roomId: Id; agentId: Id; participantId: Id }
   | { type: "remove_participant"; roomId: Id; participantId: Id }
   | { type: "leave_room"; roomId: Id; participantId: Id }

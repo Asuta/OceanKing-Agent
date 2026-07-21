@@ -57,7 +57,7 @@ describe("Agent runtime 与 canonical tools", () => {
 
   it("工具注册表包含房间、工作区、基础与 Cron 能力", () => {
     const names = new Set(listToolDefinitions().map((tool) => tool.name));
-    for (const name of ["begin_message_to_room", "send_message_to_room", "read_no_reply", "list_available_agents", "read_room_history", "workspace_read", "workspace_write", "shell", "web_fetch", "create_cron_job"]) expect(names.has(name)).toBe(true);
+    for (const name of ["begin_message_to_room", "continue_task_in_room", "send_message_to_room", "read_no_reply", "list_available_agents", "read_room_history", "workspace_read", "workspace_write", "shell", "web_fetch", "create_cron_job"]) expect(names.has(name)).toBe(true);
   });
 
   it("按需返回可协作 Agent 信息卡，不依赖 scheduler packet 携带清单", async () => withRepository(async (repository) => {
@@ -102,6 +102,29 @@ describe("Agent runtime 与 canonical tools", () => {
     expect(repository.getSnapshot().rooms.some((room) => room.title === "无效邀请")).toBe(false);
   }));
 
+  it("跨房间续办必须先在目标房间启动正式协作消息", async () => withRepository(async (repository) => {
+    const packet = packetFor(repository);
+    const agent = repository.getAgent("navigator")!;
+    const baseContext = { agent, roomId: "room_harbor", agentParticipantId: "participant_navigator_harbor", packet, repository, signal: new AbortController().signal };
+    const created = await getToolDefinition("create_room")!.execute(baseContext, { title: "异步协作房间", agentIds: ["builder"] }, "tool_create_deferred_room");
+    const createEffect = created.effects[0];
+    if (!createEffect || createEffect.type !== "create_room") throw new Error("create_room 未返回预期 effect");
+
+    await expect(getToolDefinition("continue_task_in_room")!.execute(
+      { ...baseContext, pendingEffects: created.effects },
+      { roomId: createEffect.roomId },
+      "tool_continue_too_early",
+    )).rejects.toThrow("必须先向目标房间发送一条非 progress 正式消息");
+
+    const initiated = { type: "send_message" as const, roomId: createEffect.roomId, messageId: "msg_deferred_start", messageKey: "deferred-start", content: "1", kind: "answer" as const };
+    const continued = await getToolDefinition("continue_task_in_room")!.execute(
+      { ...baseContext, pendingEffects: [...created.effects, initiated] },
+      { roomId: createEffect.roomId },
+      "tool_continue_ready",
+    );
+    expect(continued.effects).toEqual([{ type: "continue_task_in_room", roomId: createEffect.roomId }]);
+  }));
+
   it("owner Agent 可从其他房间上下文继续邀请成员", async () => withRepository(async (repository) => {
     sendUser(repository, "room_harbor", "先创建房间");
     const packet = packetFor(repository);
@@ -119,6 +142,7 @@ describe("Agent runtime 与 canonical tools", () => {
     repository.beginTurn({ turnId: "turn_invite_cross_room", roomId: "room_harbor", agentId: agent.id, agentParticipantId: context.agentParticipantId, packet: nextPacket });
     const applied = repository.finishTurn({ turnId: "turn_invite_cross_room", assistantContent: "internal", tools: [], timeline: [], effects: invited.effects, modelMeta: {}, cutoffSeq: nextPacket.cutoffSeq, nextParticipantId: null });
     expect(applied.triggerRoomIds).toEqual([createEffect.roomId]);
+    expect(applied.messageRoomIds).toEqual([]);
     expect(repository.getRoom(createEffect.roomId)!.participants.some((participant) => participant.agentId === "builder")).toBe(true);
 
     const duplicate = await getToolDefinition("invite_agent")!.execute(context, { roomId: createEffect.roomId, agentId: "builder" }, "tool_invite_cross_room_duplicate");

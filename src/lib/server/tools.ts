@@ -3,7 +3,7 @@ import dns from "node:dns/promises";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import type { Agent, CronJob, SchedulerPacket, ToolExecutionResult, TurnEffect } from "@/lib/domain/types";
+import type { Agent, CronJob, Room, SchedulerPacket, ToolExecutionResult, TurnEffect } from "@/lib/domain/types";
 import { beginMessageToolSchema, readNoReplyToolSchema, sendMessageToolSchema } from "@/lib/domain/schemas";
 import { WorkspaceRepository } from "@/lib/server/repository";
 import { extractWebContent, isSupportedWebContentType, limitWebContentTokens, readLimitedResponseText } from "@/lib/server/web-content";
@@ -16,6 +16,8 @@ export type ToolContext = {
   packet: SchedulerPacket;
   repository: WorkspaceRepository;
   signal: AbortSignal;
+  turnId?: string;
+  pendingEffects?: readonly TurnEffect[];
 };
 
 export type ToolDefinition = {
@@ -34,10 +36,42 @@ const createRoomToolSchema = z.object({
   agentIds: z.array(z.string().min(1)).max(64).default([]),
 });
 
+const continueTaskInRoomToolSchema = z.object({ roomId: z.string().min(1) });
 const inviteAgentToolSchema = z.object({ roomId: z.string().min(1), agentId: z.string().min(1) });
 
-function connectedRooms(context: ToolContext) {
-  return context.repository.getSnapshot().rooms.filter((room) => room.participants.some((participant) => participant.agentId === context.agent.id && participant.enabled));
+function pendingCreatedRooms(context: ToolContext): Room[] {
+  const snapshot = context.repository.getSnapshot();
+  const createdAt = context.agent.updatedAt;
+  return (context.pendingEffects ?? []).flatMap((effect) => {
+    if (effect.type !== "create_room") return [];
+    const ownerId = `pending_owner_${effect.roomId}`;
+    const invited = effect.invitedAgentIds.flatMap((agentId, index) => {
+      const agent = snapshot.agents.find((entry) => entry.id === agentId);
+      return agent ? [{ id: `pending_agent_${effect.roomId}_${agentId}`, roomId: effect.roomId, kind: "agent" as const, agentId, displayName: agent.label, enabled: true, sortOrder: index + 2, createdAt }] : [];
+    });
+    return [{
+      id: effect.roomId,
+      title: effect.title,
+      ownerParticipantId: ownerId,
+      participants: [
+        { id: ownerId, roomId: effect.roomId, kind: "agent" as const, agentId: context.agent.id, displayName: context.agent.label, enabled: true, sortOrder: 0, createdAt },
+        { id: `pending_human_${effect.roomId}`, roomId: effect.roomId, kind: "human" as const, agentId: null, displayName: "你", enabled: true, sortOrder: 1, createdAt },
+        ...invited,
+      ],
+      messages: [],
+      turns: [],
+      scheduler: { roomId: effect.roomId, status: "idle" as const, nextAgentParticipantId: ownerId, activeParticipantId: null, roundCount: 0, cursorByParticipantId: {}, receiptRevisionByParticipantId: {}, rerunRequested: false },
+      archivedAt: null,
+      createdAt,
+      updatedAt: createdAt,
+    }];
+  });
+}
+
+function connectedRooms(context: ToolContext): Room[] {
+  const persisted = context.repository.getSnapshot().rooms.filter((room) => room.participants.some((participant) => participant.agentId === context.agent.id && participant.enabled));
+  const persistedIds = new Set(persisted.map((room) => room.id));
+  return [...persisted, ...pendingCreatedRooms(context).filter((room) => !persistedIds.has(room.id))];
 }
 
 function requireConnectedRoom(context: ToolContext, roomId: string) {
@@ -167,7 +201,28 @@ const tools: ToolDefinition[] = [
       for (const agentId of invitedAgentIds) if (!context.repository.hasAgent(agentId)) throw new Error(`Agent 不存在：${agentId}`);
       const effect: TurnEffect = { type: "create_room", roomId: createId("room"), title: args.title, invitedAgentIds };
       return {
-        text: `已准备创建房间 ${effect.roomId}；当前 Agent 将自动成为 owner 并连接${invitedAgentIds.length ? `，同时邀请 ${invitedAgentIds.join("、")}` : ""}。本轮结束后统一提交。`,
+        text: `房间 ${effect.roomId} 已加入本轮事务；当前 Agent 将自动成为 owner 并连接${invitedAgentIds.length ? `，同时邀请 ${invitedAgentIds.join("、")}` : ""}。现在可以立即用该 roomId 发送消息；本轮成功后统一提交，失败时不会留下半成品。`,
+        structured: effect,
+        effects: [effect],
+      };
+    },
+  },
+  {
+    name: "continue_task_in_room",
+    description: "把尚未完成、必须等待其他 Agent 后续消息的任务留在一个已连接房间继续。首次转出时目标必须是另一个房间；恢复续办后可继续等待当前房间。调用前必须已向目标房间发送一条非 progress 正式消息；调用后当前 Turn 会提交消息并结束，不要继续轮询。后续消息到达时任务会恢复，完成后再向来源房间汇报最终结果。",
+    schema: continueTaskInRoomToolSchema,
+    parameters: { type: "object", additionalProperties: false, required: ["roomId"], properties: { roomId: { type: "string", description: "等待后续协作消息的目标房间 ID" } } },
+    execute: async (context, raw) => {
+      const args = continueTaskInRoomToolSchema.parse(raw);
+      if (context.packet.type === "delivery_packet") throw new Error("仅投递重试轮不能转移或重新执行任务");
+      const resumingDeferredTask = Boolean(context.turnId && context.repository.getTurnDeferredTasks(context.turnId).length);
+      if (args.roomId === context.roomId && !resumingDeferredTask) throw new Error("首次续办的目标必须是另一个房间");
+      requireConnectedRoom(context, args.roomId);
+      const initiated = (context.pendingEffects ?? []).some((effect) => effect.type === "send_message" && effect.roomId === args.roomId && effect.kind !== "progress");
+      if (!initiated) throw new Error("转入续办前必须先向目标房间发送一条非 progress 正式消息");
+      const effect: TurnEffect = { type: "continue_task_in_room", roomId: args.roomId };
+      return {
+        text: `任务将在房间 ${args.roomId} 等待后续协作消息；当前 Turn 将先原子提交已经创建的房间和公开消息，不要在本轮继续轮询。`,
         structured: effect,
         effects: [effect],
       };

@@ -152,6 +152,75 @@ describe("房间消息自动打断", () => {
     });
   });
 
+  it("AI 跨房间新消息与用户消息一样立即中止目标 Agent 的旧模型流", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    process.env.OPENAI_API_FORMAT = "responses";
+    let markBuilderStarted!: () => void;
+    let markTakeoverStarted!: () => void;
+    let finishTakeover!: (response: Response) => void;
+    const builderStarted = new Promise<void>((resolve) => { markBuilderStarted = resolve; });
+    const takeoverStarted = new Promise<void>((resolve) => { markTakeoverStarted = resolve; });
+    const takeoverResponse = new Promise<Response>((resolve) => { finishTakeover = resolve; });
+    let targetRoomId = "";
+    let builderAborted = false;
+    let callCount = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init); if (pending) return pending;
+      callCount += 1;
+      if (callCount === 1) {
+        markBuilderStarted();
+        return await new Promise<Response>((resolve, reject) => {
+          const fallback = setTimeout(() => resolve(completedResponse("旧搜索自然完成", "response_builder_not_interrupted", [targetRoomId])), 1_500);
+          const signal = init?.signal;
+          const abort = () => { clearTimeout(fallback); builderAborted = true; reject(signal?.reason); };
+          if (signal?.aborted) abort();
+          else signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+      if (callCount === 2) return completedResponse("AI 发出的紧急抢占消息", "response_agent_interrupt", [targetRoomId, "room_harbor"]);
+      markTakeoverStarted();
+      return takeoverResponse;
+    }));
+
+    await withRepository(async (repository) => {
+      repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "AI 消息抢占目标", agentId: "builder" });
+      const targetRoom = repository.getSnapshot().rooms.find((room) => room.title === "AI 消息抢占目标")!;
+      targetRoomId = targetRoom.id;
+      repository.executeCommand({ ...commandBase(repository), type: "add_agent", roomId: targetRoom.id, agentId: "navigator" });
+      const scheduler = new RoomScheduler(repository, new AgentExecutor());
+
+      sendUser(repository, targetRoom.id, "执行一个不会自行结束的长时间搜索");
+      scheduler.enqueue(targetRoom.id, { interruptActive: true });
+      await builderStarted;
+
+      sendUser(repository, "room_harbor", "立即向目标房间发消息抢占搜索");
+      scheduler.enqueue("room_harbor", { interruptActive: true });
+      await takeoverStarted;
+
+      const navigatorParticipant = repository.getRoom(targetRoom.id)!.participants.find((participant) => participant.agentId === "navigator")!;
+      repository.executeCommand({ ...commandBase(repository), type: "toggle_participant", roomId: targetRoom.id, participantId: navigatorParticipant.id, enabled: false });
+      finishTakeover(completedResponse("已立即处理 AI 新消息", "response_after_agent_interrupt", [targetRoom.id]));
+
+      await waitUntil(() => {
+        const target = repository.getRoom(targetRoom.id)!;
+        const source = repository.getRoom("room_harbor")!;
+        return target.scheduler.status === "idle" && source.scheduler.status === "idle"
+          && target.turns.some((turn) => turn.status === "continued")
+          && target.turns.some((turn) => turn.status === "completed");
+      });
+
+      const target = repository.getRoom(targetRoom.id)!;
+      expect(builderAborted).toBe(true);
+      expect(target.turns.map((turn) => turn.status)).toEqual(["continued", "completed"]);
+      expect(target.turns[1]?.userEnvelope.messages.map((message) => message.content)).toEqual([
+        "执行一个不会自行结束的长时间搜索",
+        "AI 发出的紧急抢占消息",
+      ]);
+      expect(repository.getAgentSession("builder").some((message) => message.role === "assistant" && message.content?.includes("[被新消息打断的未完成任务快照]"))).toBe(true);
+    });
+  });
+
   it("另一个房间的新消息抢占同一 Agent 时先把旧房间快照交给新 run", async () => {
     process.env.OPENAI_API_KEY = "test-key";
     process.env.OPENAI_BASE_URL = "https://example.test/v1";
@@ -663,6 +732,69 @@ describe("房间消息自动打断", () => {
       expect(repository.getRoom("room_harbor")!.turns[0]).toMatchObject({ status: "error", error: "结果投递在房间最大轮次内仍未完成" });
       expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs").get() as { count: number }).count).toBe(0);
       expect(callCount).toBe(4);
+    });
+  });
+});
+
+describe("调度错误熔断", () => {
+  it("永久性模型 400 只执行一次，并消费失败消息避免再次入队重跑", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.OPENAI_BASE_URL = "https://api.deepseek.com/v1";
+    process.env.OPENAI_API_FORMAT = "chat_completions";
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: { message: "Thinking mode does not support this tool_choice" } }), { status: 400 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await withRepository(async (repository) => {
+      const settings = repository.getSnapshot().settings;
+      repository.executeCommand({
+        ...commandBase(repository), type: "update_settings", model: settings.model, availableModels: settings.availableModels,
+        apiFormat: "chat_completions", thinkingMode: "enabled", reasoningEffort: settings.reasoningEffort,
+        contextTokenThreshold: settings.contextTokenThreshold, maxToolSteps: settings.maxToolSteps, maxRoomRounds: 32,
+        projectContextRoots: settings.projectContextRoots,
+      });
+      sendUser(repository, "room_harbor", "不应无限重跑的任务");
+      const userSeq = repository.getRoom("room_harbor")!.messages.at(-1)!.seq;
+      const scheduler = new RoomScheduler(repository, new AgentExecutor());
+      scheduler.enqueue("room_harbor");
+      await waitUntil(() => repository.getRoom("room_harbor")!.scheduler.status === "idle" && repository.getRoom("room_harbor")!.turns.length === 1);
+
+      const first = repository.getRoom("room_harbor")!;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(first.turns[0]).toMatchObject({ status: "error", error: expect.stringContaining("模型接口错误 400") });
+      expect(first.scheduler.cursorByParticipantId.participant_navigator_harbor).toBe(userSeq);
+
+      scheduler.enqueue("room_harbor");
+      await waitUntil(() => repository.getRoom("room_harbor")!.scheduler.status === "idle");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(repository.getRoom("room_harbor")!.turns).toHaveLength(1);
+    });
+  });
+
+  it("临时性模型错误最多重试两次，耗尽后熔断并消费消息", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    process.env.OPENAI_API_FORMAT = "chat_completions";
+    const fetchMock = vi.fn(async () => new Response("temporary unavailable", { status: 500 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await withRepository(async (repository) => {
+      const settings = repository.getSnapshot().settings;
+      repository.executeCommand({
+        ...commandBase(repository), type: "update_settings", model: settings.model, availableModels: settings.availableModels,
+        apiFormat: "chat_completions", thinkingMode: "disabled", reasoningEffort: settings.reasoningEffort,
+        contextTokenThreshold: settings.contextTokenThreshold, maxToolSteps: settings.maxToolSteps, maxRoomRounds: 32,
+        projectContextRoots: settings.projectContextRoots,
+      });
+      sendUser(repository, "room_harbor", "临时错误也不能无限重跑");
+      const userSeq = repository.getRoom("room_harbor")!.messages.at(-1)!.seq;
+      const scheduler = new RoomScheduler(repository, new AgentExecutor());
+      scheduler.enqueue("room_harbor");
+      await waitUntil(() => repository.getRoom("room_harbor")!.scheduler.status === "idle" && repository.getRoom("room_harbor")!.turns.length === 3);
+
+      const room = repository.getRoom("room_harbor")!;
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(room.turns.every((turn) => turn.status === "error")).toBe(true);
+      expect(room.scheduler.cursorByParticipantId.participant_navigator_harbor).toBe(userSeq);
     });
   });
 });

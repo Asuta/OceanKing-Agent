@@ -68,7 +68,7 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot, initialEventCur
             return next !== previous ? { ...current, [turnId]: next } : current;
           });
         }
-        if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "room_message_preview" && event.payload.roomId && event.payload.agentId && event.payload.messageKey && (event.payload.delta || event.payload.content)) {
+        if (event.type === "turn.preview" && event.entityId && event.payload?.kind === "room_message_preview" && event.payload.roomId && event.payload.agentId && event.payload.messageKey && (event.payload.delta || event.payload.content !== undefined)) {
           const key = `${event.entityId}:${event.payload.messageKey}`;
           setRoomPreviews((current) => {
             const existing = current[key];

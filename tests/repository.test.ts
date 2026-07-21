@@ -232,12 +232,14 @@ describe("OceanKing 领域仓库", () => {
     repository.beginTurn({ turnId: "turn_emit_trigger_room", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: emitPacket });
     const first = repository.finishTurn({ turnId: "turn_emit_trigger_room", assistantContent: "internal", tools: [], timeline: [], effects: [effect], modelMeta: {}, cutoffSeq: emitPacket.cutoffSeq, nextParticipantId: null });
     expect(first.triggerRoomIds).toEqual(["room_agent_started"]);
+    expect(first.messageRoomIds).toEqual(["room_agent_started"]);
 
     sendUser(repository, "room_harbor", "重放同一工具调用");
     const replayPacket = packetFor(repository);
     repository.beginTurn({ turnId: "turn_replay_trigger_room", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: replayPacket });
     const replay = repository.finishTurn({ turnId: "turn_replay_trigger_room", assistantContent: "internal", tools: [], timeline: [], effects: [effect], modelMeta: {}, cutoffSeq: replayPacket.cutoffSeq, nextParticipantId: null });
     expect(replay.triggerRoomIds).toEqual([]);
+    expect(replay.messageRoomIds).toEqual([]);
     expect(repository.getRoom("room_agent_started")!.messages.filter((message) => message.messageKey === "agent-started")).toHaveLength(1);
   }));
 
@@ -336,6 +338,78 @@ describe("OceanKing 领域仓库", () => {
     expect(applied.unresolvedRoomIds).toEqual([]);
     expect(repository.getRoom("room_harbor")!.scheduler.cursorByParticipantId.participant_navigator_harbor).toBe(oldPacket.cutoffSeq);
     expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs").get() as { count: number }).count).toBe(0);
+  }));
+
+  it("显式跨房间续办会先提交新房间，并跨多轮保留来源任务直到最终汇报", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "去新房间协作，完成后回来汇报");
+    const sourcePacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_deferred_source", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: sourcePacket });
+    const targetRoomId = "room_deferred_task";
+    const started = repository.finishTurn({
+      turnId: "turn_deferred_source", assistantContent: "已启动跨房间协作", tools: [], timeline: [], effects: [
+        { type: "create_room", roomId: targetRoomId, title: "异步协作房间", invitedAgentIds: ["builder"] },
+        { type: "send_message", roomId: targetRoomId, messageId: "msg_deferred_one", messageKey: "deferred-one", content: "1", kind: "answer" },
+        { type: "continue_task_in_room", roomId: targetRoomId },
+      ], modelMeta: {}, cutoffSeq: sourcePacket.cutoffSeq, nextParticipantId: "participant_navigator_harbor",
+    });
+
+    expect(repository.getRoom(targetRoomId)).toMatchObject({ title: "异步协作房间" });
+    expect(started.continuationRoomIds).toEqual([targetRoomId]);
+    expect(repository.getRoom("room_harbor")!.turns.find((turn) => turn.id === "turn_deferred_source")?.status).toBe("continued");
+    expect(repository.raw.prepare("SELECT target_room_id,target_turn_id,delivery_only,deferred FROM turn_handoffs WHERE source_turn_id='turn_deferred_source'").get()).toEqual({
+      target_room_id: targetRoomId, target_turn_id: null, delivery_only: 0, deferred: 1,
+    });
+
+    sendUser(repository, targetRoomId, "另一个 Agent 回复了 2");
+    const targetRoom = repository.getRoom(targetRoomId)!;
+    const navigator = targetRoom.participants.find((participant) => participant.agentId === "navigator")!;
+    const middlePacket = packetFor(repository, targetRoomId);
+    repository.beginTurn({ turnId: "turn_deferred_middle", roomId: targetRoomId, agentId: "navigator", agentParticipantId: navigator.id, packet: middlePacket });
+    expect(repository.getTurnDeliveryObligations("turn_deferred_middle")).toEqual([{ roomId: targetRoomId, messageId: middlePacket.targetMessageId }]);
+    expect(repository.getTurnDeferredTasks("turn_deferred_middle")).toEqual([{ roomId: "room_harbor", messageId: sourcePacket.targetMessageId }]);
+    repository.finishTurn({
+      turnId: "turn_deferred_middle", assistantContent: "继续数数", tools: [], timeline: [],
+      effects: [{ type: "send_message", roomId: targetRoomId, messageId: "msg_deferred_three", messageKey: "deferred-three", content: "3", kind: "answer" }],
+      modelMeta: {}, cutoffSeq: middlePacket.cutoffSeq, nextParticipantId: navigator.id,
+    });
+    expect(repository.raw.prepare("SELECT target_room_id,target_turn_id,deferred FROM turn_handoffs WHERE source_turn_id='turn_deferred_source'").get()).toEqual({
+      target_room_id: targetRoomId, target_turn_id: null, deferred: 1,
+    });
+
+    sendUser(repository, targetRoomId, "游戏已经数到 10");
+    const finalPacket = packetFor(repository, targetRoomId);
+    repository.beginTurn({ turnId: "turn_deferred_final", roomId: targetRoomId, agentId: "navigator", agentParticipantId: navigator.id, packet: finalPacket });
+    expect(repository.getTurnDeferredTasks("turn_deferred_final")).toHaveLength(1);
+    const completed = repository.finishTurn({
+      turnId: "turn_deferred_final", assistantContent: "完成并汇报", tools: [], timeline: [], effects: [
+        { type: "send_message", roomId: targetRoomId, messageId: "msg_deferred_done", messageKey: "deferred-done", content: "游戏结束", kind: "answer" },
+        { type: "send_message", roomId: "room_harbor", messageId: "msg_deferred_report", messageKey: "deferred-report", content: "数数游戏已经完成到 10", kind: "answer" },
+      ], modelMeta: {}, cutoffSeq: finalPacket.cutoffSeq, nextParticipantId: navigator.id,
+    });
+    expect(completed.unresolvedRoomIds).toEqual([]);
+    expect(repository.getRoom("room_harbor")!.messages.at(-1)?.content).toBe("数数游戏已经完成到 10");
+    expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs").get() as { count: number }).count).toBe(0);
+  }));
+
+  it("来源房间即使提前发送普通回复，显式续办仍会保留最终汇报义务", async () => withRepository((repository) => {
+    sendUser(repository, "room_harbor", "去新房间协作，完成后回来汇报");
+    const packet = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_deferred_after_source_answer", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    const applied = repository.finishTurn({
+      turnId: "turn_deferred_after_source_answer", assistantContent: "已经启动", tools: [], timeline: [], effects: [
+        { type: "create_room", roomId: "room_deferred_after_answer", title: "提前回复后的续办房间", invitedAgentIds: ["builder"] },
+        { type: "send_message", roomId: "room_harbor", messageId: "msg_source_started", messageKey: "source-started", content: "任务已经启动，完成后再汇报", kind: "answer" },
+        { type: "send_message", roomId: "room_deferred_after_answer", messageId: "msg_target_started", messageKey: "target-started", content: "请开始执行任务", kind: "answer" },
+        { type: "continue_task_in_room", roomId: "room_deferred_after_answer" },
+      ], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null,
+    });
+
+    expect(applied.continuationRoomIds).toEqual(["room_deferred_after_answer"]);
+    expect(applied.unresolvedRoomIds).toEqual(["room_harbor"]);
+    expect(repository.getRoom("room_harbor")!.turns.at(-1)?.status).toBe("continued");
+    expect(repository.raw.prepare("SELECT target_room_id,delivery_only,deferred FROM turn_handoffs WHERE source_turn_id='turn_deferred_after_source_answer'").get()).toEqual({
+      target_room_id: "room_deferred_after_answer", delivery_only: 0, deferred: 1,
+    });
   }));
 
   it("接管 turn 只回复新房间时保留旧房间义务并退回原房间续跑", async () => withRepository((repository) => {
