@@ -17,7 +17,7 @@ describe("scheduler 增量提示词", () => {
           sender: { id: "builder", name: "执行者" },
           content: "    if ready:\n      run()\n",
           source: "agent_emit",
-          kind: "progress",
+          kind: "notify",
           attachments: [],
         },
         {

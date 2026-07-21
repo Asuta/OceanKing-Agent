@@ -73,7 +73,7 @@ export function useWorkspace(initialSnapshot: WorkspaceSnapshot, initialEventCur
           setRoomPreviews((current) => {
             const existing = current[key];
             const content = event.payload!.content ?? `${existing?.content ?? ""}${event.payload!.delta ?? ""}`;
-            const preview: RoomMessagePreview = { turnId: event.entityId!, roomId: event.payload!.roomId!, agentId: event.payload!.agentId!, messageKey: event.payload!.messageKey!, content, kind: event.payload!.messageKind ?? "answer" };
+            const preview: RoomMessagePreview = { turnId: event.entityId!, roomId: event.payload!.roomId!, agentId: event.payload!.agentId!, messageKey: event.payload!.messageKey!, content, kind: event.payload!.messageKind ?? "notify" };
             return { ...current, [key]: preview };
           });
           setReasoningPreviews((current) => {

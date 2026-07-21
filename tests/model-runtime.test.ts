@@ -47,7 +47,7 @@ describe("Agent runtime 与 canonical tools", () => {
       repository.executeCommand({ ...commandBase(repository), type: "add_agent", roomId: "room_harbor", agentId: "builder" });
       sendUser(repository, "room_harbor", "原始用户任务"); const userPacket = packetFor(repository); const builderParticipant = repository.getRoom("room_harbor")!.participants.find((participant) => participant.agentId === "builder")!;
       repository.beginTurn({ turnId: "turn_builder_emit", roomId: "room_harbor", agentId: "builder", agentParticipantId: builderParticipant.id, packet: userPacket });
-      repository.finishTurn({ turnId: "turn_builder_emit", assistantContent: "internal", tools: [], timeline: [], effects: [{ type: "send_message", roomId: "room_harbor", messageId: "agent_message", messageKey: "agent-message", content: "另一个 Agent 的正式结果", kind: "answer" }], modelMeta: {}, cutoffSeq: userPacket.cutoffSeq, nextParticipantId: null });
+      repository.finishTurn({ turnId: "turn_builder_emit", assistantContent: "internal", tools: [], timeline: [], effects: [{ type: "send_message", roomId: "room_harbor", messageId: "agent_message", messageKey: "agent-message", content: "另一个 Agent 的正式结果", kind: "handoff" }], modelMeta: {}, cutoffSeq: userPacket.cutoffSeq, nextParticipantId: null });
       const packet = packetFor(repository); const agent = repository.getAgent("navigator")!;
       const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_no_echo", signal: new AbortController().signal });
       expect(result.effects[0]?.type).toBe("read_no_reply");

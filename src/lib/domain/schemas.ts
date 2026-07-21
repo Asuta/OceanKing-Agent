@@ -34,13 +34,13 @@ export const maxRoomMessageContentCharacters = 100_000;
 export const sendMessageToolSchema = z.object({
   roomId: z.string().min(1),
   content: z.string().min(1).max(maxRoomMessageContentCharacters),
-  kind: z.enum(publicAgentMessageKinds).default("answer"),
+  kind: z.enum(publicAgentMessageKinds).default("notify"),
   messageKey: z.string().max(200).optional(),
 });
 
 export const beginMessageToolSchema = z.object({
   roomId: z.string().min(1),
-  kind: z.enum(publicAgentMessageKinds).default("answer"),
+  kind: z.enum(publicAgentMessageKinds).default("notify"),
 });
 
 export const readNoReplyToolSchema = z.object({ roomId: z.string(), messageId: z.string() });

@@ -36,7 +36,7 @@ export class RoomScheduler {
       const agentIds = room?.participants
         .filter((participant) => participant.kind === "agent" && participant.enabled && participant.agentId)
         .map((participant) => participant.agentId!) ?? [];
-      const messageSeq = room?.messages.findLast((message) => message.source === "user" || message.source === "agent_emit")?.seq;
+      const messageSeq = room?.messages.findLast((message) => message.source === "user" || (message.source === "agent_emit" && message.kind === "handoff"))?.seq;
       if (messageSeq !== undefined) {
         const pending = this.pendingMessageInterrupts.get(roomId) ?? new Map<string, number>();
         for (const agentId of agentIds) pending.set(agentId, Math.max(pending.get(agentId) ?? 0, messageSeq));
@@ -72,7 +72,7 @@ export class RoomScheduler {
   private consumeMessageInterrupt(roomId: string, agentId: string, messages: SchedulerPacket["messages"]): boolean {
     const pending = this.pendingMessageInterrupts.get(roomId);
     const messageSeq = pending?.get(agentId);
-    if (messageSeq === undefined || !messages.some((message) => (message.source === "user" || message.source === "agent_emit") && message.seq >= messageSeq)) return false;
+    if (messageSeq === undefined || !messages.some((message) => (message.source === "user" || (message.source === "agent_emit" && message.kind === "handoff")) && message.seq >= messageSeq)) return false;
     pending!.delete(agentId);
     if (!pending!.size) this.pendingMessageInterrupts.delete(roomId);
     return true;
@@ -119,7 +119,8 @@ export class RoomScheduler {
         const cutoffSeq = room.messages.at(-1)?.seq ?? 0;
         const cursor = room.scheduler.cursorByParticipantId[current.id] ?? 0;
         const unseen = room.messages.filter((message) => message.seq > cursor && message.seq <= cutoffSeq && message.sender.id !== current.id);
-        const targets = unseen.filter((message) => message.sender.role === "participant");
+        const targets = unseen.filter((message) => message.sender.role === "participant"
+          && (message.source !== "agent_emit" || message.kind === "handoff"));
         const pendingDelivery = this.repository.getPendingDeliveryObligations(roomId, current.agentId);
         const handedOffCutoff = this.repository.getPendingHandoffCutoff(roomId, current.id);
         const handedOffWithoutNewUser = handedOffCutoff !== null

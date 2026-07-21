@@ -36,7 +36,7 @@ function completedResponse(content: string, responseId: string, roomIds = ["room
   roomIds.forEach((roomId, index) => {
     const routeId = `${responseId}_route_${index}`;
     const bodyId = `${responseId}_body_${index}`;
-    const item = { id: `${routeId}_item`, call_id: `${routeId}_call`, type: "function_call", name: "begin_message_to_room", arguments: JSON.stringify({ roomId, kind: "answer" }) };
+    const item = { id: `${routeId}_item`, call_id: `${routeId}_call`, type: "function_call", name: "begin_message_to_room", arguments: JSON.stringify({ roomId, kind: "handoff" }) };
     const routeResponse = responseEvents([{ type: "response.output_item.added", item }, { type: "response.output_item.done", item }, { type: "response.completed", response: { id: routeId } }, "[DONE]"]);
     const bodyResponse = responseEvents([{ type: "response.output_text.delta", delta: content }, { type: "response.completed", response: { id: bodyId } }, "[DONE]"]);
     if (!firstResponse) firstResponse = routeResponse;
@@ -335,7 +335,7 @@ describe("房间消息自动打断", () => {
       const pending = takePendingCompletedResponse(init); if (pending) return pending;
       callCount += 1;
       requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
-      if (callCount === 1) return toolResponse("begin_message_to_room", { roomId: "room_harbor", kind: "progress" }, "response_initial_progress");
+      if (callCount === 1) return toolResponse("begin_message_to_room", { roomId: "room_harbor", kind: "notify" }, "response_initial_progress");
       if (callCount === 2) return privateResponse("我先创建目标房间，再汇报最终结果。", "response_initial_progress_body");
       if (callCount === 3) return toolResponse("create_room", { title: "副作用只能执行一次", agentIds: [] }, "response_create_once");
       if (callCount <= 6) return privateResponse("任务已做完，但仍未公开结果", `response_missing_delivery_${callCount}`);

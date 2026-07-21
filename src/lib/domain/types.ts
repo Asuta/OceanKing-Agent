@@ -83,12 +83,11 @@ export type ReadNoReplyReceipt = {
   createdAt: string;
 };
 
-export const publicAgentMessageKinds = ["answer", "progress", "collaboration", "warning", "error", "clarification"] as const;
-export const terminalAgentMessageKinds = ["answer", "warning", "error", "clarification"] as const;
+export const publicAgentMessageKinds = ["notify", "handoff"] as const;
 export type PublicAgentMessageKind = (typeof publicAgentMessageKinds)[number];
 
-export function isTerminalAgentMessageKind(kind: string): boolean {
-  return (terminalAgentMessageKinds as readonly string[]).includes(kind);
+export function agentMessageTriggersReply(kind: string): boolean {
+  return kind === "handoff";
 }
 
 export type RoomMessage = {
@@ -245,7 +244,7 @@ export type SchedulerPacket = {
 };
 
 export type TurnEffect =
-  | { type: "send_message"; roomId: Id; messageId: Id; messageKey: string; content: string; kind: RoomMessage["kind"] }
+  | { type: "send_message"; roomId: Id; messageId: Id; messageKey: string; content: string; kind: PublicAgentMessageKind }
   | { type: "read_no_reply"; roomId: Id; messageId: Id; receiptId: Id }
   | { type: "create_room"; roomId: Id; title: string; invitedAgentIds: Id[] }
   | { type: "invite_agent"; roomId: Id; agentId: Id; participantId: Id }

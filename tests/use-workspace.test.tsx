@@ -176,7 +176,7 @@ describe("工作区实时事件", () => {
     ]);
     expect(screen.getByLabelText("Assistant 实时阶段").textContent).toBe("thinking");
 
-    act(() => FakeEventSource.latest?.emit("turn.preview", { id: 166, type: "turn.preview", entityId: "turn_live", payload: { kind: "room_message_preview", roomId: "room_live", agentId: "navigator", messageKey: "progress_live", delta: "公开进度", messageKind: "progress" } }));
+    act(() => FakeEventSource.latest?.emit("turn.preview", { id: 166, type: "turn.preview", entityId: "turn_live", payload: { kind: "room_message_preview", roomId: "room_live", agentId: "navigator", messageKey: "progress_live", delta: "公开进度", messageKind: "notify" } }));
     expect(JSON.parse(screen.getByLabelText("Assistant 思考预览").textContent ?? "[]")[1]).toMatchObject({ status: "answer_started" });
     expect(screen.getByLabelText("Assistant 实时阶段").textContent).toBe("answering");
   });
@@ -189,15 +189,15 @@ describe("工作区实时事件", () => {
     act(() => {
       FakeEventSource.latest?.emit("turn.preview", {
         id: 201, type: "turn.preview", entityId: "turn_multi",
-        payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_a", delta: "房间 A ", messageKind: "answer" },
+        payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_a", delta: "房间 A ", messageKind: "notify" },
       });
       FakeEventSource.latest?.emit("turn.preview", {
         id: 202, type: "turn.preview", entityId: "turn_multi",
-        payload: { kind: "room_message_preview", roomId: "room_b", agentId: "navigator", messageKey: "call_b", delta: "房间 B 初稿", messageKind: "answer" },
+        payload: { kind: "room_message_preview", roomId: "room_b", agentId: "navigator", messageKey: "call_b", delta: "房间 B 初稿", messageKind: "notify" },
       });
       FakeEventSource.latest?.emit("turn.preview", {
         id: 203, type: "turn.preview", entityId: "turn_multi",
-        payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_a", delta: "更新", messageKind: "answer" },
+        payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_a", delta: "更新", messageKind: "notify" },
       });
     });
 
@@ -212,11 +212,11 @@ describe("工作区实时事件", () => {
     act(() => {
       FakeEventSource.latest?.emit("turn.preview", {
         id: 211, type: "turn.preview", entityId: "turn_sanitized",
-        payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_dsml", delta: "正在创建…<｜｜DSML｜｜tool_calls>", messageKind: "progress" },
+        payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_dsml", delta: "正在创建…<｜｜DSML｜｜tool_calls>", messageKind: "notify" },
       });
       FakeEventSource.latest?.emit("turn.preview", {
         id: 212, type: "turn.preview", entityId: "turn_sanitized",
-        payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_dsml", content: "正在创建…", messageKind: "progress" },
+        payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_dsml", content: "正在创建…", messageKind: "notify" },
       });
     });
 
@@ -232,7 +232,7 @@ describe("工作区实时事件", () => {
 
     act(() => FakeEventSource.latest?.emit("turn.preview", {
       id: 301, type: "turn.preview", entityId: "turn_stream",
-      payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_stream", delta: "流式帧", messageKind: "answer" },
+      payload: { kind: "room_message_preview", roomId: "room_a", agentId: "navigator", messageKey: "call_stream", delta: "流式帧", messageKind: "notify" },
     }));
     act(() => FakeEventSource.latest?.emit("turn.preview", {
       id: 302, type: "turn.preview", entityId: "turn_stream",

@@ -3,7 +3,7 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import type { WorkspaceCommand } from "@/lib/domain/schemas";
 import {
-  isTerminalAgentMessageKind, type Agent, type AgentConversationHistory, type AgentSessionMessage, type AgentTurn, type Attachment, type ContextCompaction, type CronJob, type CronRun, type ModelAndRuntimeSettings, type Participant, type ReadNoReplyReceipt,
+  agentMessageTriggersReply, type Agent, type AgentConversationHistory, type AgentSessionMessage, type AgentTurn, type Attachment, type ContextCompaction, type CronJob, type CronRun, type ModelAndRuntimeSettings, type Participant, type ReadNoReplyReceipt,
   type Room, type RoomMessage, type SchedulerPacket, type SchedulerState, type TimelineEvent, type ToolExecution, type TurnEffect, type WorkspaceSnapshot,
 } from "@/lib/domain/types";
 import { getDatabase, type DatabaseHandle } from "@/lib/server/db/client";
@@ -59,9 +59,9 @@ function normalizeSessionMessage(value: unknown): AgentSessionMessage | null {
   return normalized;
 }
 
-function hasTerminalRoomDelivery(effects: TurnEffect[], roomId: string, messageId: string): boolean {
+function hasRoomDelivery(effects: TurnEffect[], roomId: string, messageId: string): boolean {
   return effects.some((effect) => {
-    if (effect.type === "send_message") return effect.roomId === roomId && isTerminalAgentMessageKind(effect.kind);
+    if (effect.type === "send_message") return effect.roomId === roomId && effect.kind === "handoff";
     return effect.type === "read_no_reply" && effect.roomId === roomId && effect.messageId === messageId;
   });
 }
@@ -402,10 +402,7 @@ export class WorkspaceRepository {
       const packet = parseJson<SchedulerPacket>(turn.user_envelope_json, {} as SchedulerPacket);
       const deliveryOnly = packet.type === "delivery_packet";
       const transfersCurrentTask = Boolean(args.awaitingRoomId && args.awaitingRoomId !== roomId);
-      const continuesCurrentAwaitingTask = args.awaitingRoomId === roomId
-        && Boolean(this.raw.prepare("SELECT 1 found FROM turn_handoffs WHERE target_turn_id=? AND awaiting_reply=1 LIMIT 1").get(args.turnId))
-        && args.effects.some((effect) => effect.type === "send_message" && effect.roomId === roomId && effect.kind === "collaboration");
-      const currentRoomResolved = deliveryOnly || continuesCurrentAwaitingTask || hasTerminalRoomDelivery(args.effects, roomId, packet.targetMessageId);
+      const currentRoomResolved = deliveryOnly || hasRoomDelivery(args.effects, roomId, packet.targetMessageId);
       if (!currentRoomResolved || transfersCurrentTask) unresolvedRoomIds.add(roomId);
       this.persistTurnTrace(args.turnId, args.tools, args.timeline);
       for (const effect of args.effects) this.applyEffect(effect, agentId, participantId, emittedMessageIds, triggerRoomIds, messageRoomIds, at);
@@ -444,12 +441,25 @@ export class WorkspaceRepository {
 
   private settleContinuationHandoffs(targetTurnId: string, effects: TurnEffect[], awaitingRoomId: string | null): { roomIds: string[]; unresolvedRoomIds: string[] } {
     const rows = this.raw.prepare("SELECT handoff.source_turn_id,handoff.source_room_id,handoff.source_participant_id,handoff.cutoff_seq,handoff.awaiting_reply,turn.anchor_message_id FROM turn_handoffs handoff JOIN agent_turns turn ON turn.id=handoff.source_turn_id WHERE handoff.target_turn_id=?").all(targetTurnId) as Row[];
+    const targetTurn = this.raw.prepare("SELECT room_id,anchor_message_id,user_envelope_json FROM agent_turns WHERE id=?").get(targetTurnId) as Row | undefined;
+    const targetPacket = targetTurn ? parseJson<SchedulerPacket>(targetTurn.user_envelope_json, {} as SchedulerPacket) : null;
+    const targetAnchorIsHandoff = Boolean(targetTurn && targetPacket?.messages.some((message) => message.id === str(targetTurn.anchor_message_id)
+      && message.source === "agent_emit"
+      && message.kind === "handoff"));
+    const currentHandoffReadWithoutReply = Boolean(targetTurn && targetAnchorIsHandoff && effects.some((effect) => effect.type === "read_no_reply"
+      && effect.roomId === str(targetTurn.room_id)
+      && effect.messageId === str(targetTurn.anchor_message_id)));
     const roomIds = new Set<string>();
     const unresolvedRoomIds = new Set<string>();
     for (const row of rows) {
       const sourceTurnId = str(row.source_turn_id);
       const roomId = str(row.source_room_id);
-      if (!hasTerminalRoomDelivery(effects, roomId, str(row.anchor_message_id))) {
+      if (bool(row.awaiting_reply) && currentHandoffReadWithoutReply) {
+        this.advanceParticipantCursor(roomId, str(row.source_participant_id), num(row.cutoff_seq));
+        this.raw.prepare("DELETE FROM turn_handoffs WHERE source_turn_id=?").run(sourceTurnId);
+        continue;
+      }
+      if (!hasRoomDelivery(effects, roomId, str(row.anchor_message_id))) {
         unresolvedRoomIds.add(roomId);
         if (bool(row.awaiting_reply) && awaitingRoomId) {
           this.raw.prepare("UPDATE turn_handoffs SET target_room_id=?,target_turn_id=NULL WHERE source_turn_id=?").run(awaitingRoomId, sourceTurnId);
@@ -545,7 +555,12 @@ export class WorkspaceRepository {
       const seq = this.takeNextSeq(effect.roomId, at);
       this.raw.prepare("INSERT INTO room_messages(id,room_id,seq,sender_id,sender_name,sender_role,source,kind,status,content,final,message_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .run(effect.messageId, effect.roomId, seq, str(membership.id), str(membership.display_name), "participant", "agent_emit", effect.kind, "completed", effect.content, 1, effect.messageKey, at);
-      emitted.push(effect.messageId); triggerRooms.add(effect.roomId); messageRooms.add(effect.roomId); return;
+      emitted.push(effect.messageId);
+      if (agentMessageTriggersReply(effect.kind)) {
+        triggerRooms.add(effect.roomId);
+        messageRooms.add(effect.roomId);
+      }
+      return;
     }
     if (effect.type === "read_no_reply") {
       const membership = this.raw.prepare("SELECT id FROM participants WHERE room_id=? AND agent_id=? AND enabled=1").get(effect.roomId, agentId) as Row | undefined;

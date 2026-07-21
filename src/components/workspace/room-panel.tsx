@@ -10,6 +10,10 @@ import { Markdown } from "@/components/workspace/markdown";
 type SendCommand = (draft: WorkspaceCommandDraft) => Promise<boolean>;
 const scrollFollowThreshold = 48;
 
+function messageKindLabel(kind: RoomMessagePreview["kind"]): string {
+  return kind === "handoff" ? "结束" : "过程";
+}
+
 function isAtMessageBottom(element: HTMLDivElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= scrollFollowThreshold;
 }
@@ -162,14 +166,14 @@ export function RoomPanel({ room, agents, previews, assistantPreviews, reasoning
       <div className="message-day">公开房间转录</div>
       {room.messages.map((message) => message.source === "system" ? <div className="system-message" key={message.id}><span />{message.content}<span /></div> : <article key={message.id} className={`message ${message.source === "user" ? "from-user" : "from-agent"}`}>
         <div className="message-avatar">{message.source === "agent_emit" ? <Bot size={16} /> : message.sender.name.slice(0, 1)}</div>
-        <div className="message-body"><div className="message-meta"><strong>{message.sender.name}</strong><span>#{message.seq}</span><time>{new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>{message.kind !== "user_input" ? <em>{message.kind}</em> : null}</div><div className="message-content"><Markdown>{message.content}</Markdown></div>
+        <div className="message-body"><div className="message-meta"><strong>{message.sender.name}</strong><span>#{message.seq}</span><time>{new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>{message.kind === "notify" || message.kind === "handoff" ? <em>{messageKindLabel(message.kind)}</em> : null}</div><div className="message-content"><Markdown>{message.content}</Markdown></div>
           {message.attachments.length ? <div className="attachment-list">{message.attachments.map((attachment) => <a href={`/api/uploads/${attachment.id}`} target="_blank" rel="noreferrer" key={attachment.id}><FileText size={15} /><span>{attachment.fileName}</span><small>{Math.ceil(attachment.byteSize / 1024)} KB</small></a>)}</div> : null}
           {message.receipts.length ? <div className="receipt-line">已阅不回 · {message.receipts.map((receipt) => room.participants.find((participant) => participant.id === receipt.agentParticipantId)?.displayName ?? "Agent").join("、")}</div> : null}
         </div>
       </article>)}
       {visiblePreviews.map((preview) => <article key={`${preview.turnId}:${preview.messageKey}`} className="message from-agent streaming-message" aria-live="polite" aria-label="Agent 正在生成公开回复">
         <div className="message-avatar"><Bot size={16} /></div>
-        <div className="message-body"><div className="message-meta"><strong>{agents.find((agent) => agent.id === preview.agentId)?.label ?? "Agent"}</strong><span>生成中</span><em>{preview.kind}</em></div><div className="message-content streaming-content"><span>{preview.content}</span><span className="stream-cursor" aria-hidden="true" /></div></div>
+        <div className="message-body"><div className="message-meta"><strong>{agents.find((agent) => agent.id === preview.agentId)?.label ?? "Agent"}</strong><span>生成中</span><em>{messageKindLabel(preview.kind)}</em></div><div className="message-content streaming-content"><span>{preview.content}</span><span className="stream-cursor" aria-hidden="true" /></div></div>
       </article>)}
       {privateStatuses.map(({ turn, content: privateContent, reasoning }) => <PrivateAssistantStatus key={turn.id} turn={turn} agentLabel={agents.find((agent) => agent.id === turn.agentId)?.label ?? room.participants.find((participant) => participant.id === turn.agentParticipantId)?.displayName ?? "Agent"} content={privateContent} reasoning={reasoning} />)}
       {room.scheduler.status === "running" && !runningTurns.length ? <div className="agent-working"><LoaderCircle className="spin" size={15} /><span>{room.participants.find((participant) => participant.id === room.scheduler.activeParticipantId)?.displayName ?? "Agent"} 正在私有执行区工作</span><small>正在等待执行状态同步</small></div> : null}

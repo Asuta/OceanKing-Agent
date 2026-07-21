@@ -1,4 +1,4 @@
-import { isTerminalAgentMessageKind, publicAgentMessageKinds, type Agent, type AgentSessionMessage, type ContextCompaction, type ModelCallRecord, type SchedulerPacket, type TimelineEvent, type ToolExecution, type TurnEffect } from "@/lib/domain/types";
+import { publicAgentMessageKinds, type Agent, type AgentSessionMessage, type ContextCompaction, type ModelCallRecord, type SchedulerPacket, type TimelineEvent, type ToolExecution, type TurnEffect } from "@/lib/domain/types";
 import { publishWorkspaceEvent } from "@/lib/server/events";
 import { getToolDefinition, listToolDefinitions, toolDefinitionsForChat, toolDefinitionsForResponses, type ToolContext } from "@/lib/server/tools";
 import { WorkspaceRepository } from "@/lib/server/repository";
@@ -20,6 +20,7 @@ const maxDeliveryRepairAttempts = 2;
 const maxPublicMessageRepairAttempts = 2;
 const maxInitialProgressRepairAttempts = 2;
 const maxTerminalToolRepairAttempts = 2;
+const maxAwaitingDecisionAttempts = 2;
 class ResponsesUnsupportedError extends Error {}
 class ModelHttpError extends Error {
   constructor(readonly status: number, body: string) {
@@ -179,15 +180,15 @@ function systemPrompt(args: RunArgs): string {
     "begin_message_to_room 之后可以按需继续调用工具；结构化工具调用本身不会成为公开正文。此阶段的 assistant content 会实时公开，只能写给房间成员阅读的正文，不得夹带私有构思、路由解释或 JSON。不要为了看起来有回复而伪造消息；无需回复时调用 read_no_reply。",
     "历史记录里可能出现旧工具 send_message_to_room；它已经停用，绝不能继续调用，也不要把公开正文放进任何工具参数。",
     "每个待处理房间都是独立交付义务；一次 begin_message_to_room 后的公开正文，或一次 read_no_reply，只处理它明确指定的那个房间。结束本轮前必须逐一处理下面列出的全部义务。",
-    "kind=progress 只表示进度。kind=collaboration 表示需要其他 Agent 后续回复的协作请求，不会完成来源任务的最终汇报义务；但在系统标记的自动续办协作房间中，它会处理当前来信并继续等待下一条消息。任务完成时必须向来源房间发送 answer、warning、error 或 clarification。read_no_reply 必须精确指向所列 messageId。",
-    "进度汇报规则：对需要调用工具或分阶段完成的任务，在开始实质工作前，必须向对应房间发送一条 kind=progress，简要说明准备怎样处理；短小且可直接回答的任务不必发送进度。",
-    "执行过程中可以多次发送 kind=progress，但只在完成有意义的阶段、得到关键发现、遇到阻塞或执行计划发生变化时发送。进度应是面向房间成员的简洁阶段摘要，不是私有思维链，也不要逐次复述每个工具调用。",
-    "不要发送定时心跳、等待状态、重复内容、没有新信息的进度、敏感信息或完整工具参数。最后仍须向每个相关房间发送 answer、warning、error 或 clarification 终结消息。",
+    "公开消息只有两种：kind=notify 是过程消息，只公开内容，当前 Agent 必须继续执行，不触发其他 Agent，也不能完成本轮交付义务；kind=handoff 是结束消息，公开内容后结束当前 Turn，并把控制权交给房间中的下一个 Agent。read_no_reply 不产生公开消息，只能用于确实无需回复的精确 messageId。",
+    "对需要调用工具或分阶段完成的任务，在开始实质工作前，先向当前房间发送一条 kind=notify，简要说明准备怎样处理；短小且可直接回答的任务不必发送过程通知。",
+    "执行过程中可以多次发送 kind=notify，但只在完成有意义的阶段、得到关键发现、遇到阻塞或计划变化时发送。notify 提交后必须继续当前工作；它不能作为最终答复，也不能自然结束当前 Turn。",
+    "不要发送定时心跳、等待状态、重复内容、没有新信息的通知、敏感信息或完整工具参数。完成、警告、错误、澄清等结束正文统一使用 kind=handoff；收到 handoff 后若确实无需公开回复，则调用 read_no_reply 结束，不要再发送消息。",
     "房间不是默认隐私边界，但只能读取和发送到当前 Agent 已连接的房间。房间管理权限由工具执行层校验。",
     "创建房间时，create_room 会让你自动成为 owner 并连接；如需拉人，直接在同一次调用的 agentIds 中列出所有目标 Agent，不要要求人类手动操作。",
-    "在新房间启动协作的第一条正式消息必须包含足够独立执行的任务目标、分工、终止条件和当前进度；其他 Agent 看不到来源房间，不要只发送孤立的数字或片段。",
-    "向另一个包含 Agent 的房间发出需要后续回复的任务请求时，必须使用 kind=collaboration；运行时会自动提交消息、结束当前 Turn，并在目标房间出现新消息后恢复。无需回复的单向通知或最终结果不得使用 collaboration。不要调用 read_room_history 轮询，不要发送重复的等待进度，也不要用 read_no_reply 放弃仍需最终汇报的来源任务。",
-    "恢复自动续办任务后：若目标尚未完成并且需要对方继续回复，向当前协作房间发送 kind=collaboration；运行时会同时处理当前来信并继续等待下一条消息。若目标已经完成，必须在同一 Turn 向系统列出的来源房间发送 answer、warning、error 或 clarification 最终结果。",
+    "在新房间启动交接的第一条 handoff 必须包含足够独立执行的任务目标、分工、终止条件和当前进度；其他 Agent 看不到来源房间，不要只发送孤立的数字或片段。",
+    "需要另一个 Agent 后续回复或接手，以及提交最终结果时，都使用 kind=handoff；运行时会提交消息、结束当前 Turn，并触发目标房间的下一个 Agent。单向过程信息使用 kind=notify。不要调用 read_room_history 轮询，不要发送重复等待通知，也不要用 read_no_reply 放弃仍需最终汇报的来源任务。",
+    "恢复跨房间任务后：若目标尚未完成并且需要对方继续工作，向当前房间发送 kind=handoff；若目标已经完成，必须向系统列出的来源房间发送 kind=handoff 最终结果。",
     "每轮输入只携带尚未处理的房间增量；需要房间清单或可用 Agent 清单时，分别调用 list_connected_rooms 或 list_available_agents。",
     ...interruptedTurnSystemInstructions,
     `当前 Agent：${args.agent.label}（${args.agent.id}）`,
@@ -213,8 +214,8 @@ function turnUserContent(args: RunArgs): string {
     ...(awaitingTasks.length
       ? [
         "",
-        "[系统跨房间自动续办]",
-        "以下来源任务正在当前协作房间推进。目标未完成且需要对方继续回复时，向当前房间发送 kind=collaboration，系统会处理当前来信并自动等待下一条消息；目标完成时必须向来源房间发送 answer、warning、error 或 clarification 最终结果：",
+        "[系统跨房间交接任务]",
+        "以下来源任务正在当前房间推进。目标未完成且需要对方继续工作时，向当前房间发送 kind=handoff；目标完成时必须向来源房间发送 kind=handoff 最终结果：",
         ...awaitingTasks.map((task) => `- sourceRoomId=${task.roomId}, sourceMessageId=${task.messageId}`),
       ]
       : []),
@@ -223,10 +224,7 @@ function turnUserContent(args: RunArgs): string {
 
 function unresolvedDeliveryObligations(args: RunArgs, effects: TurnEffect[]): Array<{ roomId: string; messageId: string }> {
   return args.repository.getTurnDeliveryObligations(args.turnId).filter((obligation) => !effects.some((effect) => {
-    if (effect.type === "send_message") {
-      return effect.roomId === obligation.roomId
-        && (isTerminalAgentMessageKind(effect.kind) || isCurrentRoomAwaitingContinuation(args, effects, effect));
-    }
+    if (effect.type === "send_message") return effect.roomId === obligation.roomId && effect.kind === "handoff";
     return effect.type === "read_no_reply" && effect.roomId === obligation.roomId && effect.messageId === obligation.messageId;
   }));
 }
@@ -238,7 +236,7 @@ function allDeliveryObligationsResolved(args: RunArgs, effects: TurnEffect[]): b
 
 function unresolvedAwaitingTasks(args: RunArgs, effects: TurnEffect[]): Array<{ roomId: string; messageId: string }> {
   return args.repository.getTurnAwaitingTasks(args.turnId).filter((task) => !effects.some((effect) => {
-    if (effect.type === "send_message") return effect.roomId === task.roomId && isTerminalAgentMessageKind(effect.kind);
+    if (effect.type === "send_message") return effect.roomId === task.roomId && effect.kind === "handoff";
     return effect.type === "read_no_reply" && effect.roomId === task.roomId && effect.messageId === task.messageId;
   }));
 }
@@ -263,30 +261,27 @@ function roomHasOtherAgent(args: RunArgs, effects: TurnEffect[], roomId: string)
   return [...effectiveParticipants.values()].some((agentId) => agentId !== args.agent.id);
 }
 
-function isCurrentRoomAwaitingContinuation(args: RunArgs, effects: TurnEffect[], effect: Extract<TurnEffect, { type: "send_message" }>): boolean {
-  return args.packet.type !== "delivery_packet"
-    && effect.kind === "collaboration"
-    && effect.roomId === args.packet.room.id
-    && unresolvedAwaitingTasks(args, effects).length > 0
-    && roomHasOtherAgent(args, effects, effect.roomId);
-}
-
 function automaticAwaitingTarget(args: RunArgs, effects: TurnEffect[], effect: Extract<TurnEffect, { type: "send_message" }>): string | null {
-  if (args.packet.type === "delivery_packet" || effect.kind !== "collaboration") return null;
+  if (args.packet.type === "delivery_packet" || effect.kind !== "handoff") return null;
   if (!roomHasOtherAgent(args, effects, effect.roomId)) return null;
-  return effect.roomId !== args.packet.room.id || isCurrentRoomAwaitingContinuation(args, effects, effect)
-    ? effect.roomId
-    : null;
+  if (effect.roomId === args.packet.room.id) {
+    return unresolvedAwaitingTasks(args, effects).length > 0 ? effect.roomId : null;
+  }
+  const fulfillsExistingObligation = [
+    ...args.repository.getTurnDeliveryObligations(args.turnId),
+    ...args.repository.getTurnAwaitingTasks(args.turnId),
+  ].some((task) => task.roomId === effect.roomId);
+  return fulfillsExistingObligation ? null : effect.roomId;
 }
 
 function awaitingTaskDecisionMessage(args: RunArgs, tasks: Array<{ roomId: string; messageId: string }>): AgentSessionMessage {
   return {
     role: "user",
     content: [
-      "[系统跨房间自动续办判断]",
-      `当前协作房间 ${args.packet.room.id} 的本轮消息已经处理，但以下来源任务还没有最终汇报：`,
+      "[系统跨房间交接判断]",
+      `当前房间 ${args.packet.room.id} 的本轮消息已经处理，但以下来源任务还没有最终汇报：`,
       ...tasks.map((task) => `- sourceRoomId=${task.roomId}, sourceMessageId=${task.messageId}`),
-      "如果完整目标已经达成，现在向来源房间发送 answer、warning、error 或 clarification 最终结果；如果仍需等待当前房间的未来消息，直接结束本轮，不要调用历史读取工具、不要发送等待状态，运行时会自动续办。",
+      "如果完整目标已经达成，现在向来源房间发送 kind=handoff 最终结果；如果仍需当前房间的另一个 Agent 继续工作，向当前房间发送 kind=handoff。不要调用历史读取工具或发送重复等待通知。",
     ].join("\n"),
   };
 }
@@ -296,7 +291,7 @@ function deliveryRepairMessage(obligations: Array<{ roomId: string; messageId: s
     role: "user",
     content: [
       "[系统交付校验未通过]",
-      "下面这些房间仍没有终结动作。现在只处理交付：对每个房间分别调用 begin_message_to_room，然后在下一次 assistant 回复中只输出该房间的完整公开正文；或在确实无需回复时调用精确 messageId 的 read_no_reply。默认私有 assistant 文本、kind=progress 和 kind=collaboration 都不能完成来源房间义务。",
+      "下面这些房间仍没有结束消息或已读不回动作。现在只处理交付：对每个房间分别调用 begin_message_to_room，使用 kind=handoff 输出完整结束正文；确实无需公开回复时调用精确 messageId 的 read_no_reply。普通 assistant 文本和 kind=notify 过程消息都不能完成房间义务。",
       ...obligations.map((obligation) => `- roomId=${obligation.roomId}, messageId=${obligation.messageId}`),
     ].join("\n"),
   };
@@ -348,6 +343,7 @@ function maxModelStepsForRun(args: RunArgs): number {
       + maxPublicMessageRepairAttempts
       + maxInitialProgressRepairAttempts
       + maxTerminalToolRepairAttempts
+      + maxAwaitingDecisionAttempts
       + 4,
   );
 }
@@ -398,7 +394,7 @@ function publicMessageRouteSwitchRetry(current: PublicMessageRoute, attempted: P
 function publicMessageRouteCancelledForAwaiting(committed: PublicMessageRoute, attempted: PublicMessageRoute): AgentSessionMessage {
   return {
     role: "user",
-    content: `[系统跨房间自动等待]\n房间 ${committed.roomId} 的 collaboration 请求已经提交，当前 Turn 将在该房间等待后续回复。刚才请求打开的房间 ${attempted.roomId} 没有生效；任务恢复后如仍需发言，请重新调用 begin_message_to_room。`,
+    content: `[系统跨房间交接]\n房间 ${committed.roomId} 的 handoff 已经提交，当前 Turn 已把控制权交给该房间的下一个 Agent。刚才请求打开的房间 ${attempted.roomId} 没有生效；任务恢复后如仍需发言，请重新调用 begin_message_to_room。`,
   };
 }
 
@@ -415,25 +411,25 @@ function publicMessageControl(route: PublicMessageRoute): AgentSessionMessage {
   };
 }
 
-function progressContinuation(route: PublicMessageRoute): AgentSessionMessage {
+function notifyContinuation(route: PublicMessageRoute): AgentSessionMessage {
   return {
     role: "user",
     content: [
-      "[系统进度消息已提交]",
-      `房间 ${route.roomId} 已收到这条阶段进度。继续执行当前任务。`,
-      "之后完成有意义的阶段、得到关键发现、遇到阻塞或计划变化时，可以再次发送 kind=progress；不要发送定时心跳、重复状态或没有新信息的消息。",
-      "最终完成时仍须使用 begin_message_to_room 提交 answer、warning、error 或 clarification 正式结果。",
+      "[系统通知消息已提交]",
+      `房间 ${route.roomId} 已收到这条 notify。`,
+      "这是一条过程消息，必须继续执行当前任务；它没有完成本轮交付义务。完成工作或需要另一个 Agent 接手时发送 kind=handoff。",
+      "不要发送定时心跳、重复状态或没有新信息的通知。",
     ].join("\n"),
   };
 }
 
 function consumesToolStep(calls: ToolCall[], openedRoute: PublicMessageRoute | null): boolean {
-  return !(openedRoute?.kind === "progress" && calls.length === 1 && calls[0]?.name === "begin_message_to_room");
+  return !(openedRoute?.kind === "notify" && calls.length === 1 && calls[0]?.name === "begin_message_to_room");
 }
 
 function needsInitialProgress(args: RunArgs, effects: TurnEffect[], calls: ToolCall[]): boolean {
   if (args.packet.type === "delivery_packet" || calls.every((call) => terminalToolNames.has(call.name))) return false;
-  return !effects.some((effect) => effect.type === "send_message" && effect.roomId === args.packet.room.id && effect.kind === "progress");
+  return !effects.some((effect) => effect.type === "send_message" && effect.roomId === args.packet.room.id && effect.kind === "notify");
 }
 
 function initialProgressRepairMessage(args: RunArgs, calls: ToolCall[]): AgentSessionMessage {
@@ -443,7 +439,7 @@ function initialProgressRepairMessage(args: RunArgs, calls: ToolCall[]): AgentSe
     content: [
       "[系统初始进度校验未通过]",
       `房间 ${args.packet.room.id} 的任务尚未收到开始进度，因此这些工作工具没有执行：${toolNames.join("、")}。`,
-      `现在先调用 begin_message_to_room，roomId 必须是 ${args.packet.room.id}，kind 必须是 progress；在下一次 assistant 正文中简要说明处理计划。`,
+      `现在先调用 begin_message_to_room，roomId 必须是 ${args.packet.room.id}，kind 必须是 notify；在下一次 assistant 正文中简要说明处理计划。`,
       "进度提交后，再重新调用刚才需要的工作工具。不要把工具结果写进进度消息，因为工具尚未执行。",
     ].join("\n"),
   };
@@ -453,7 +449,7 @@ function blockedToolOutputs(calls: ToolCall[], roomId: string): ToolCallOutput[]
   return calls.map((call) => ({
     callId: call.id,
     name: call.name,
-    text: `[系统未执行工具] 房间 ${roomId} 尚未收到初始进度；请先发送 kind=progress，再重试此工具。`,
+    text: `[系统未执行工具] 房间 ${roomId} 尚未收到初始过程通知；请先发送 kind=notify，再重试此工具。`,
     error: true,
     structured: null,
   }));
@@ -465,7 +461,6 @@ function publicMessageEffect(route: PublicMessageRoute, content: string): Extrac
 }
 
 function commitPublicMessage(args: RunArgs, effects: TurnEffect[], route: PublicMessageRoute, content: string) {
-  const unresolvedBefore = unresolvedDeliveryObligations(args, effects);
   const effect = publicMessageEffect(route, content);
   effects.push(effect);
   const unresolved = unresolvedDeliveryObligations(args, effects);
@@ -474,7 +469,6 @@ function commitPublicMessage(args: RunArgs, effects: TurnEffect[], route: Public
     unresolved,
     awaitingTasks: unresolvedAwaitingTasks(args, effects),
     awaitingRoomId: automaticAwaitingTarget(args, effects, effect),
-    resolvedObligation: unresolved.length < unresolvedBefore.length,
   };
 }
 
@@ -734,7 +728,7 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
   let initialProgressRepairAttempts = 0;
   let terminalToolRepairAttempts = 0;
   let awaitingRoomId: string | null = null;
-  let awaitingDecisionRoomId: string | null = null;
+  let awaitingDecisionRoomId: string | null = null; let awaitingDecisionAttempts = 0;
   let activePublicTools: typeof chatToolDefinitions = [];
   const maxModelSteps = maxModelStepsForRun(args);
   checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -856,7 +850,7 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
         continue;
       }
       const committed = commitPublicMessage(args, effects, publicRouteForStep, publicContent);
-      const { effect, unresolved, awaitingTasks, awaitingRoomId: crossRoomAwaitingTarget, resolvedObligation } = committed;
+      const { effect, unresolved, awaitingTasks, awaitingRoomId: crossRoomAwaitingTarget } = committed;
       addTimeline("message_emitted", { roomId: effect.roomId, messageId: effect.messageId, messageKey: effect.messageKey, kind: effect.kind });
       activePublicRoute = null; activePublicContent = ""; activePublicTools = []; publicMessageRepairAttempts = 0;
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -864,22 +858,22 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
         awaitingRoomId = crossRoomAwaitingTarget;
         break;
       }
-      if (!unresolved.length && isTerminalAgentMessageKind(publicRouteForStep.kind)) {
-        if (awaitingTasks.length) {
-          awaitingDecisionRoomId = publicRouteForStep.roomId;
-          const decisionMessage = awaitingTaskDecisionMessage(args, awaitingTasks);
-          messages.push(decisionMessage); sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage);
-          checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-          continue;
-        }
-        break;
-      }
-      const continuationMessage = publicRouteForStep.kind === "progress"
-        ? progressContinuation(publicRouteForStep)
-        : resolvedObligation
+      if (publicRouteForStep.kind === "handoff") {
+        if (!unresolved.length && !awaitingTasks.length) break;
+        const continuationMessage = unresolved.length
           ? deliveryRepairMessage(unresolved)
-          : { role: "user" as const, content: `[系统公开消息已提交]\n房间 ${publicRouteForStep.roomId} 的消息已经提交。继续处理本轮任务；仍须逐一完成剩余房间义务。` };
-      if (resolvedObligation && isTerminalAgentMessageKind(publicRouteForStep.kind)) deliveryOnly = true;
+          : awaitingTaskDecisionMessage(args, awaitingTasks);
+        if (unresolved.length) {
+          deliveryOnly = true;
+        } else {
+          awaitingDecisionRoomId = args.packet.room.id;
+          awaitingDecisionAttempts = 0;
+        }
+        messages.push(continuationMessage); sessionMessages.push(continuationMessage); auditMessages.push(continuationMessage);
+        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+        continue;
+      }
+      const continuationMessage = notifyContinuation(publicRouteForStep);
       messages.push(continuationMessage); sessionMessages.push(continuationMessage); auditMessages.push(continuationMessage);
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
       continue;
@@ -899,10 +893,6 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       continue;
     }
     if (!calls.length) {
-      if (awaitingDecisionRoomId) {
-        awaitingRoomId = awaitingDecisionRoomId;
-        break;
-      }
       const unresolved = unresolvedDeliveryObligations(args, effects);
       if (unresolved.length && deliveryRepairAttempts < maxDeliveryRepairAttempts) {
         deliveryOnly = true; deliveryRepairAttempts += 1;
@@ -911,6 +901,17 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
         checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
         continue;
       }
+      const awaitingTasks = unresolvedAwaitingTasks(args, effects);
+      if (awaitingTasks.length) {
+        if (awaitingDecisionAttempts >= maxAwaitingDecisionAttempts) throw new Error("跨房间任务既未向来源房间汇报，也未 handoff 给下一个 Agent");
+        awaitingDecisionRoomId = args.packet.room.id;
+        awaitingDecisionAttempts += 1;
+        const decisionMessage = awaitingTaskDecisionMessage(args, awaitingTasks);
+        messages.push(decisionMessage); sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage);
+        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+        continue;
+      }
+      awaitingDecisionRoomId = null;
       break;
     }
     if (!publicRouteForStep && regularToolsAllowed && needsInitialProgress(args, effects, calls)) {
@@ -945,12 +946,11 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
           continue;
         }
         const committed = commitPublicMessage(args, effects, publicRouteForStep, previousPublicContent);
-        const { effect, awaitingRoomId: crossRoomAwaitingTarget, resolvedObligation } = committed;
+        const { effect, awaitingRoomId: crossRoomAwaitingTarget } = committed;
         addTimeline("message_emitted", { roomId: effect.roomId, messageId: effect.messageId, messageKey: effect.messageKey, kind: effect.kind });
         activePublicRoute = null; activePublicContent = ""; activePublicTools = []; publicMessageRepairAttempts = 0;
-        if (resolvedObligation && isTerminalAgentMessageKind(publicRouteForStep.kind)) deliveryOnly = true;
         checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-        if (crossRoomAwaitingTarget) {
+        if (publicRouteForStep.kind === "handoff") {
           const cancelledRouteMessage = publicMessageRouteCancelledForAwaiting(publicRouteForStep, openedRoute);
           messages.push(cancelledRouteMessage); sessionMessages.push(cancelledRouteMessage); auditMessages.push(cancelledRouteMessage);
           awaitingRoomId = crossRoomAwaitingTarget;
@@ -968,17 +968,16 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       activePublicContent += content;
       continue;
     }
-    if (allDeliveryObligationsResolved(args, effects)) {
-      const awaitingTasks = unresolvedAwaitingTasks(args, effects);
-      if (awaitingTasks.length) {
-        awaitingDecisionRoomId = args.packet.room.id;
-        const decisionMessage = awaitingTaskDecisionMessage(args, awaitingTasks);
-        messages.push(decisionMessage); sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage);
-        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-        continue;
-      }
-      if (!sawReasoningContent) break;
+    const pendingAwaitingTasks = unresolvedAwaitingTasks(args, effects);
+    if (allDeliveryObligationsResolved(args, effects) && pendingAwaitingTasks.length) {
+      awaitingDecisionRoomId = args.packet.room.id;
+      awaitingDecisionAttempts = 0;
+      const decisionMessage = awaitingTaskDecisionMessage(args, pendingAwaitingTasks);
+      messages.push(decisionMessage); sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage);
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
     }
+    if (allDeliveryObligationsResolved(args, effects) && calls.every((call) => terminalToolAllowed(call.name)) && !unresolvedAwaitingTasks(args, effects).length) break;
     if (terminalToolsOnly) {
       const unresolved = unresolvedDeliveryObligations(args, effects);
       if (!unresolved.length) break;
@@ -1016,7 +1015,7 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
   let initialProgressRepairAttempts = 0;
   let terminalToolRepairAttempts = 0;
   let awaitingRoomId: string | null = null;
-  let awaitingDecisionRoomId: string | null = null;
+  let awaitingDecisionRoomId: string | null = null; let awaitingDecisionAttempts = 0;
   let activePublicTools: typeof responseToolDefinitions = [];
   const maxModelSteps = maxModelStepsForRun(args);
   checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -1139,7 +1138,7 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
         continue;
       }
       const committed = commitPublicMessage(args, effects, publicRouteForStep, publicContent);
-      const { effect, unresolved, awaitingTasks, awaitingRoomId: crossRoomAwaitingTarget, resolvedObligation } = committed;
+      const { effect, unresolved, awaitingTasks, awaitingRoomId: crossRoomAwaitingTarget } = committed;
       addTimeline("message_emitted", { roomId: effect.roomId, messageId: effect.messageId, messageKey: effect.messageKey, kind: effect.kind });
       activePublicRoute = null; activePublicContent = ""; activePublicTools = []; publicMessageRepairAttempts = 0;
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -1147,23 +1146,23 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
         awaitingRoomId = crossRoomAwaitingTarget;
         break;
       }
-      if (!unresolved.length && isTerminalAgentMessageKind(publicRouteForStep.kind)) {
-        if (awaitingTasks.length) {
-          awaitingDecisionRoomId = publicRouteForStep.roomId;
-          const decisionMessage = awaitingTaskDecisionMessage(args, awaitingTasks);
-          sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage); continuationMessages.push(responseContextMessage(decisionMessage));
-          input = [responseContextMessage(decisionMessage)];
-          checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-          continue;
-        }
-        break;
-      }
-      const continuationMessage = publicRouteForStep.kind === "progress"
-        ? progressContinuation(publicRouteForStep)
-        : resolvedObligation
+      if (publicRouteForStep.kind === "handoff") {
+        if (!unresolved.length && !awaitingTasks.length) break;
+        const continuationMessage = unresolved.length
           ? deliveryRepairMessage(unresolved)
-          : { role: "user" as const, content: `[系统公开消息已提交]\n房间 ${publicRouteForStep.roomId} 的消息已经提交。继续处理本轮任务；仍须逐一完成剩余房间义务。` };
-      if (resolvedObligation && isTerminalAgentMessageKind(publicRouteForStep.kind)) deliveryOnly = true;
+          : awaitingTaskDecisionMessage(args, awaitingTasks);
+        if (unresolved.length) {
+          deliveryOnly = true;
+        } else {
+          awaitingDecisionRoomId = args.packet.room.id;
+          awaitingDecisionAttempts = 0;
+        }
+        sessionMessages.push(continuationMessage); auditMessages.push(continuationMessage); continuationMessages.push(responseContextMessage(continuationMessage));
+        input = [responseContextMessage(continuationMessage)];
+        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+        continue;
+      }
+      const continuationMessage = notifyContinuation(publicRouteForStep);
       sessionMessages.push(continuationMessage); auditMessages.push(continuationMessage); continuationMessages.push(responseContextMessage(continuationMessage));
       input = [responseContextMessage(continuationMessage)];
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
@@ -1189,10 +1188,6 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       continue;
     }
     if (!calls.length) {
-      if (awaitingDecisionRoomId) {
-        awaitingRoomId = awaitingDecisionRoomId;
-        break;
-      }
       const unresolved = unresolvedDeliveryObligations(args, effects);
       if (unresolved.length && deliveryRepairAttempts < maxDeliveryRepairAttempts) {
         deliveryOnly = true; deliveryRepairAttempts += 1;
@@ -1202,6 +1197,18 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
         checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
         continue;
       }
+      const awaitingTasks = unresolvedAwaitingTasks(args, effects);
+      if (awaitingTasks.length) {
+        if (awaitingDecisionAttempts >= maxAwaitingDecisionAttempts) throw new Error("跨房间任务既未向来源房间汇报，也未 handoff 给下一个 Agent");
+        awaitingDecisionRoomId = args.packet.room.id;
+        awaitingDecisionAttempts += 1;
+        const decisionMessage = awaitingTaskDecisionMessage(args, awaitingTasks);
+        sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage); continuationMessages.push(responseContextMessage(decisionMessage));
+        input = [responseContextMessage(decisionMessage)];
+        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+        continue;
+      }
+      awaitingDecisionRoomId = null;
       break;
     }
     if (!publicRouteForStep && regularToolsAllowed && needsInitialProgress(args, effects, calls)) {
@@ -1244,12 +1251,11 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
           continue;
         }
         const committed = commitPublicMessage(args, effects, publicRouteForStep, previousPublicContent);
-        const { effect, awaitingRoomId: crossRoomAwaitingTarget, resolvedObligation } = committed;
+        const { effect, awaitingRoomId: crossRoomAwaitingTarget } = committed;
         addTimeline("message_emitted", { roomId: effect.roomId, messageId: effect.messageId, messageKey: effect.messageKey, kind: effect.kind });
         activePublicRoute = null; activePublicContent = ""; activePublicTools = []; publicMessageRepairAttempts = 0;
-        if (resolvedObligation && isTerminalAgentMessageKind(publicRouteForStep.kind)) deliveryOnly = true;
         checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-        if (crossRoomAwaitingTarget) {
+        if (publicRouteForStep.kind === "handoff") {
           const cancelledRouteMessage = publicMessageRouteCancelledForAwaiting(publicRouteForStep, openedRoute);
           sessionMessages.push(cancelledRouteMessage); auditMessages.push(cancelledRouteMessage); continuationMessages.push(responseContextMessage(cancelledRouteMessage));
           awaitingRoomId = crossRoomAwaitingTarget;
@@ -1268,18 +1274,17 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       activePublicContent += stepContent;
       continue;
     }
-    if (allDeliveryObligationsResolved(args, effects)) {
-      const awaitingTasks = unresolvedAwaitingTasks(args, effects);
-      if (awaitingTasks.length) {
-        awaitingDecisionRoomId = args.packet.room.id;
-        const decisionMessage = awaitingTaskDecisionMessage(args, awaitingTasks);
-        sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage); continuationMessages.push(responseContextMessage(decisionMessage));
-        input = [responseContextMessage(decisionMessage)];
-        checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-        continue;
-      }
-      break;
+    const pendingAwaitingTasks = unresolvedAwaitingTasks(args, effects);
+    if (allDeliveryObligationsResolved(args, effects) && pendingAwaitingTasks.length) {
+      awaitingDecisionRoomId = args.packet.room.id;
+      awaitingDecisionAttempts = 0;
+      const decisionMessage = awaitingTaskDecisionMessage(args, pendingAwaitingTasks);
+      sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage); continuationMessages.push(responseContextMessage(decisionMessage));
+      input = [...outputItems, responseContextMessage(decisionMessage)];
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
     }
+    if (allDeliveryObligationsResolved(args, effects) && calls.every((call) => terminalToolAllowed(call.name)) && !unresolvedAwaitingTasks(args, effects).length) break;
     if (terminalToolsOnly) {
       const unresolved = unresolvedDeliveryObligations(args, effects);
       if (!unresolved.length) break;
@@ -1320,11 +1325,11 @@ async function runMock(args: RunArgs): Promise<ModelTurnResult> {
     ? args.repository.getTurnDeliveryObligations(args.turnId).map((obligation) => ({
       id: createId("tool"),
       name: "send_message_to_room",
-      arguments: JSON.stringify({ roomId: obligation.roomId, content: "此前任务已经处理完成，现补交结果。", kind: "answer" }),
+      arguments: JSON.stringify({ roomId: obligation.roomId, content: "此前任务已经处理完成，现补交结果。", kind: "handoff" }),
     }))
     : [wantsNoReply
       ? { id: createId("tool"), name: "read_no_reply", arguments: JSON.stringify({ roomId: args.packet.room.id, messageId: latest?.id }) }
-      : { id: createId("tool"), name: "send_message_to_room", arguments: JSON.stringify({ roomId: args.packet.room.id, content: `收到。我会处理「${(latest?.content ?? "附件任务").slice(0, 160)}」并把可验证结果留在这个房间。`, kind: "answer" }) }];
+      : { id: createId("tool"), name: "send_message_to_room", arguments: JSON.stringify({ roomId: args.packet.room.id, content: `收到。我会处理「${(latest?.content ?? "附件任务").slice(0, 160)}」并把可验证结果留在这个房间。`, kind: "handoff" }) }];
   const assistantMessage: AgentSessionMessage = { role: "assistant", content: assistantContent, tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } })) };
   sessionMessages.push(assistantMessage); auditMessages.push(assistantMessage);
   checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);

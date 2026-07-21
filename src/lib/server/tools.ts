@@ -136,9 +136,9 @@ async function runShell(command: string, signal: AbortSignal): Promise<{ stdout:
 const tools: ToolDefinition[] = [
   {
     name: "begin_message_to_room",
-    description: "打开一个房间的公开消息通道。调用成功后，后续 assistant 正文会实时显示并正式提交到该房间；一次只打开一个房间。多阶段任务开始时用 kind=progress 汇报计划；向其他 Agent 房间发出需要后续回复的任务请求，或在自动续办的当前协作房间回复并继续等待时，必须用 kind=collaboration；单向通知或最终结果使用 answer、warning、error 或 clarification。",
+    description: "打开一个房间的公开消息通道。调用成功后，后续 assistant 正文会实时显示并正式提交到该房间；一次只打开一个房间。kind=notify 是过程消息，提交后当前 Agent 继续执行且不会触发其他 Agent；kind=handoff 是结束消息，提交后当前 Turn 结束并触发房间中的下一个 Agent。",
     schema: beginMessageToolSchema,
-    parameters: { type: "object", additionalProperties: false, required: ["roomId", "kind"], properties: { roomId: { type: "string" }, kind: { type: "string", enum: [...publicAgentMessageKinds], description: "collaboration 用于发出需要后续回复的跨房间协作请求，或续办当前协作房间并继续等待" } } },
+    parameters: { type: "object", additionalProperties: false, required: ["roomId", "kind"], properties: { roomId: { type: "string" }, kind: { type: "string", enum: [...publicAgentMessageKinds], description: "notify 继续当前 Turn；handoff 结束当前 Turn并把控制权交给下一个 Agent" } } },
     execute: async (context, raw, callId, invocationKey) => {
       const args = beginMessageToolSchema.parse(raw); requireConnectedRoom(context, args.roomId);
       const route = { type: "begin_room_message" as const, roomId: args.roomId, kind: args.kind, messageKey: invocationKey ?? callId };

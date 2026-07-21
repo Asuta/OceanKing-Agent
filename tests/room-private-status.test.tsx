@@ -148,14 +148,18 @@ describe("房间私有 Assistant 临时状态", () => {
 
   it("正式公开流开始后保留同一 Turn 的临时卡片并收起当前思考", () => {
     const room = createRoom("room_a", [createTurn("turn_a", "room_a", "navigator", "私有准备内容")]);
-    const publicPreview: RoomMessagePreview = { turnId: "turn_a", roomId: "room_a", agentId: "navigator", messageKey: "public_a", content: "正式公开内容", kind: "answer" };
+    const publicPreview: RoomMessagePreview = { turnId: "turn_a", roomId: "room_a", agentId: "navigator", messageKey: "public_a", content: "正式公开内容", kind: "notify" };
     const answering: ReasoningPreview = { steps: [{ step: 0, content: "公开正文前的思考", status: "answer_started" }], phase: "answering" };
     const { rerender } = render(panel(room, { turn_a: "私有准备内容仍在生成" }, [publicPreview], { turn_a: answering }));
 
     expect(screen.getByLabelText("领航员 私有执行状态").textContent).toContain("私有准备内容仍在生成");
     expect(screen.getByLabelText("Agent 正在生成公开回复").textContent).toContain("正式公开内容");
+    expect(screen.getByLabelText("Agent 正在生成公开回复").textContent).toContain("过程");
     expect(screen.getByRole("button", { name: /思考步骤 1/ }).getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByText(/公开正文前的思考/)).toBeNull();
+
+    rerender(panel(room, { turn_a: "私有准备内容仍在生成" }, [{ ...publicPreview, kind: "handoff" }], { turn_a: answering }));
+    expect(screen.getByLabelText("Agent 正在生成公开回复").textContent).toContain("结束");
 
     const resumed: ReasoningPreview = { steps: [
       { ...answering.steps[0]!, status: "completed" },
@@ -177,7 +181,7 @@ describe("房间私有 Assistant 临时状态", () => {
 
   it("向其他房间发送公开消息时仍保留源房间的思考状态", () => {
     const room = createRoom("room_a", [createTurn("turn_a", "room_a", "navigator", "")]);
-    const crossRoomPreview: RoomMessagePreview = { turnId: "turn_a", roomId: "room_b", agentId: "navigator", messageKey: "public_b", content: "发往房间 B 的进度", kind: "progress" };
+    const crossRoomPreview: RoomMessagePreview = { turnId: "turn_a", roomId: "room_b", agentId: "navigator", messageKey: "public_b", content: "发往房间 B 的进度", kind: "notify" };
     render(panel(room, {}, [crossRoomPreview], { turn_a: { steps: [{ step: 1, content: "源房间继续思考", status: "streaming" }], phase: "thinking" } }));
 
     expect(screen.getByLabelText("领航员 私有执行状态")).toBeTruthy();
