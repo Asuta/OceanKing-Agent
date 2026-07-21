@@ -3,7 +3,7 @@ import dns from "node:dns/promises";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import type { Agent, CronJob, Room, SchedulerPacket, ToolExecutionResult, TurnEffect } from "@/lib/domain/types";
+import { publicAgentMessageKinds, type Agent, type CronJob, type Room, type SchedulerPacket, type ToolExecutionResult, type TurnEffect } from "@/lib/domain/types";
 import { beginMessageToolSchema, readNoReplyToolSchema, sendMessageToolSchema } from "@/lib/domain/schemas";
 import { WorkspaceRepository } from "@/lib/server/repository";
 import { extractWebContent, isSupportedWebContentType, limitWebContentTokens, readLimitedResponseText } from "@/lib/server/web-content";
@@ -36,7 +36,6 @@ const createRoomToolSchema = z.object({
   agentIds: z.array(z.string().min(1)).max(64).default([]),
 });
 
-const continueTaskInRoomToolSchema = z.object({ roomId: z.string().min(1) });
 const inviteAgentToolSchema = z.object({ roomId: z.string().min(1), agentId: z.string().min(1) });
 
 function pendingCreatedRooms(context: ToolContext): Room[] {
@@ -137,9 +136,9 @@ async function runShell(command: string, signal: AbortSignal): Promise<{ stdout:
 const tools: ToolDefinition[] = [
   {
     name: "begin_message_to_room",
-    description: "打开一个房间的公开消息通道。调用成功后，下一次 assistant 输出的全部正文会实时显示并正式提交到该房间；一次只打开一个房间。多阶段或工具任务开始时先用 kind=progress 说明计划，之后仅在有意义的阶段节点继续汇报，完成时再用非 progress 类型提交正式结果；不要发送心跳或思维链。",
+    description: "打开一个房间的公开消息通道。调用成功后，后续 assistant 正文会实时显示并正式提交到该房间；一次只打开一个房间。多阶段任务开始时用 kind=progress 汇报计划；向其他 Agent 房间发出需要后续回复的任务请求，或在自动续办的当前协作房间回复并继续等待时，必须用 kind=collaboration；单向通知或最终结果使用 answer、warning、error 或 clarification。",
     schema: beginMessageToolSchema,
-    parameters: { type: "object", additionalProperties: false, required: ["roomId", "kind"], properties: { roomId: { type: "string" }, kind: { type: "string", enum: ["answer", "progress", "warning", "error", "clarification"] } } },
+    parameters: { type: "object", additionalProperties: false, required: ["roomId", "kind"], properties: { roomId: { type: "string" }, kind: { type: "string", enum: [...publicAgentMessageKinds], description: "collaboration 用于发出需要后续回复的跨房间协作请求，或续办当前协作房间并继续等待" } } },
     execute: async (context, raw, callId, invocationKey) => {
       const args = beginMessageToolSchema.parse(raw); requireConnectedRoom(context, args.roomId);
       const route = { type: "begin_room_message" as const, roomId: args.roomId, kind: args.kind, messageKey: invocationKey ?? callId };
@@ -148,8 +147,8 @@ const tools: ToolDefinition[] = [
           "[系统公开输出阶段]",
           `目标房间：${args.roomId}`,
           `消息类型：${args.kind}`,
-          "下一次 assistant 回复的全部 content 会被实时公开到目标房间。",
-          "只输出要给房间成员阅读的完整正文；不要输出构思、前言、路由信息、JSON 或工具调用。正文不能为空。",
+          "后续 assistant 回复的全部 content 会被实时公开到目标房间。",
+          "可以按需继续调用结构化工具；content 只输出给房间成员阅读的正文，不要输出构思、前言、路由信息或 JSON。最终正文不能为空。",
         ].join("\n"),
         structured: route,
         effects: [],
@@ -159,7 +158,7 @@ const tools: ToolDefinition[] = [
   {
     name: "send_message_to_room", description: "旧版兼容工具：把完整正文作为工具参数一次性提交。新任务应使用 begin_message_to_room，以获得可靠的普通文本流式输出。", schema: sendMessageToolSchema,
     modelVisible: false,
-    parameters: { type: "object", additionalProperties: false, required: ["roomId", "content", "kind"], properties: { roomId: { type: "string" }, content: { type: "string" }, kind: { type: "string", enum: ["answer", "progress", "warning", "error", "clarification"] }, messageKey: { type: "string" } } },
+    parameters: { type: "object", additionalProperties: false, required: ["roomId", "content", "kind"], properties: { roomId: { type: "string" }, content: { type: "string" }, kind: { type: "string", enum: [...publicAgentMessageKinds] }, messageKey: { type: "string" } } },
     execute: async (context, raw, callId) => {
       const args = sendMessageToolSchema.parse(raw); requireConnectedRoom(context, args.roomId);
       const effect: TurnEffect = { type: "send_message", roomId: args.roomId, messageId: createId("msg"), messageKey: args.messageKey ?? callId, content: args.content, kind: args.kind };
@@ -202,27 +201,6 @@ const tools: ToolDefinition[] = [
       const effect: TurnEffect = { type: "create_room", roomId: createId("room"), title: args.title, invitedAgentIds };
       return {
         text: `房间 ${effect.roomId} 已加入本轮事务；当前 Agent 将自动成为 owner 并连接${invitedAgentIds.length ? `，同时邀请 ${invitedAgentIds.join("、")}` : ""}。现在可以立即用该 roomId 发送消息；本轮成功后统一提交，失败时不会留下半成品。`,
-        structured: effect,
-        effects: [effect],
-      };
-    },
-  },
-  {
-    name: "continue_task_in_room",
-    description: "把尚未完成、必须等待其他 Agent 后续消息的任务留在一个已连接房间继续。首次转出时目标必须是另一个房间；恢复续办后可继续等待当前房间。调用前必须已向目标房间发送一条非 progress 正式消息；调用后当前 Turn 会提交消息并结束，不要继续轮询。后续消息到达时任务会恢复，完成后再向来源房间汇报最终结果。",
-    schema: continueTaskInRoomToolSchema,
-    parameters: { type: "object", additionalProperties: false, required: ["roomId"], properties: { roomId: { type: "string", description: "等待后续协作消息的目标房间 ID" } } },
-    execute: async (context, raw) => {
-      const args = continueTaskInRoomToolSchema.parse(raw);
-      if (context.packet.type === "delivery_packet") throw new Error("仅投递重试轮不能转移或重新执行任务");
-      const resumingDeferredTask = Boolean(context.turnId && context.repository.getTurnDeferredTasks(context.turnId).length);
-      if (args.roomId === context.roomId && !resumingDeferredTask) throw new Error("首次续办的目标必须是另一个房间");
-      requireConnectedRoom(context, args.roomId);
-      const initiated = (context.pendingEffects ?? []).some((effect) => effect.type === "send_message" && effect.roomId === args.roomId && effect.kind !== "progress");
-      if (!initiated) throw new Error("转入续办前必须先向目标房间发送一条非 progress 正式消息");
-      const effect: TurnEffect = { type: "continue_task_in_room", roomId: args.roomId };
-      return {
-        text: `任务将在房间 ${args.roomId} 等待后续协作消息；当前 Turn 将先原子提交已经创建的房间和公开消息，不要在本轮继续轮询。`,
         structured: effect,
         effects: [effect],
       };

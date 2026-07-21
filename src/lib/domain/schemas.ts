@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { publicAgentMessageKinds } from "@/lib/domain/types";
 
 const base = {
   commandId: z.string().uuid(),
@@ -33,13 +34,13 @@ export const maxRoomMessageContentCharacters = 100_000;
 export const sendMessageToolSchema = z.object({
   roomId: z.string().min(1),
   content: z.string().min(1).max(maxRoomMessageContentCharacters),
-  kind: z.enum(["answer", "progress", "warning", "error", "clarification"]).default("answer"),
+  kind: z.enum(publicAgentMessageKinds).default("answer"),
   messageKey: z.string().max(200).optional(),
 });
 
 export const beginMessageToolSchema = z.object({
   roomId: z.string().min(1),
-  kind: z.enum(["answer", "progress", "warning", "error", "clarification"]).default("answer"),
+  kind: z.enum(publicAgentMessageKinds).default("answer"),
 });
 
 export const readNoReplyToolSchema = z.object({ roomId: z.string(), messageId: z.string() });

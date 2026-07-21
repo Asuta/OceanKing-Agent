@@ -31,6 +31,8 @@ SQLite is authoritative; SSE and browser state are projections. Public Agent spe
 
 New participant messages have uniform preemption semantics: both human messages and committed Agent `send_message_to_room` messages immediately supersede active target-Agent runs, which must preserve an interruption snapshot for takeover. Non-message room events such as invitations remain queued without preemption.
 
+Cross-room Agent collaboration waits are runtime-managed, not model-managed. A message that requests future work from another Agent must use `kind=collaboration`; the current Turn then commits and ends automatically, while one-way notifications and final results use the ordinary terminal kinds and do not wait. `turn_handoffs.awaiting_reply` carries the source task until a later target-room Turn either continues waiting or reports the final result. In a resumed target-room Turn, another `collaboration` message to that same room atomically satisfies the current inbound-message obligation and renews the wait; it must not require a terminal reply or `read_no_reply`. Do not add a model-visible wait/continue tool or poll `read_room_history` inside the sending Turn.
+
 ## Global Model Configuration
 
 - The server natively reads `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_MODELS`, and `OPENAI_API_FORMAT` from `process.env`; a repository-root `.env.local` is only one way to populate them.

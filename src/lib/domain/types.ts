@@ -83,13 +83,21 @@ export type ReadNoReplyReceipt = {
   createdAt: string;
 };
 
+export const publicAgentMessageKinds = ["answer", "progress", "collaboration", "warning", "error", "clarification"] as const;
+export const terminalAgentMessageKinds = ["answer", "warning", "error", "clarification"] as const;
+export type PublicAgentMessageKind = (typeof publicAgentMessageKinds)[number];
+
+export function isTerminalAgentMessageKind(kind: string): boolean {
+  return (terminalAgentMessageKinds as readonly string[]).includes(kind);
+}
+
 export type RoomMessage = {
   id: Id;
   roomId: Id;
   seq: number;
   sender: { id: Id; name: string; role: "participant" | "system" };
   source: "user" | "agent_emit" | "system";
-  kind: "user_input" | "answer" | "progress" | "warning" | "error" | "clarification" | "system";
+  kind: "user_input" | PublicAgentMessageKind | "system";
   status: "pending" | "streaming" | "completed" | "failed";
   content: string;
   attachments: Attachment[];
@@ -105,7 +113,7 @@ export type RoomMessagePreview = {
   agentId: Id;
   messageKey: string;
   content: string;
-  kind: "answer" | "progress" | "warning" | "error" | "clarification";
+  kind: PublicAgentMessageKind;
 };
 
 export type ToolExecution = {
@@ -240,7 +248,6 @@ export type TurnEffect =
   | { type: "send_message"; roomId: Id; messageId: Id; messageKey: string; content: string; kind: RoomMessage["kind"] }
   | { type: "read_no_reply"; roomId: Id; messageId: Id; receiptId: Id }
   | { type: "create_room"; roomId: Id; title: string; invitedAgentIds: Id[] }
-  | { type: "continue_task_in_room"; roomId: Id }
   | { type: "invite_agent"; roomId: Id; agentId: Id; participantId: Id }
   | { type: "remove_participant"; roomId: Id; participantId: Id }
   | { type: "leave_room"; roomId: Id; participantId: Id }
