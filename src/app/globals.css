@@ -133,7 +133,10 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .danger-button { height: 32px; padding: 0 11px; color: #ffb5ba; background: rgba(255, 107, 117, .1); font-size: 10px; }
 .danger-button:hover { background: rgba(255, 107, 117, .18); }
 
-.message-scroll { min-height: 0; overflow: auto; padding: 20px max(24px, 5vw) 36px; scrollbar-width: thin; }
+.message-scroll-shell { position: relative; min-height: 0; }
+.message-scroll { height: 100%; min-height: 0; overflow: auto; padding: 20px max(24px, 5vw) 36px; scrollbar-width: thin; }
+.latest-message-button { position: absolute; z-index: 3; left: 50%; bottom: 11px; display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 0 11px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--panel-raised); color: var(--text-soft); box-shadow: 0 8px 24px rgba(0, 0, 0, .24); font-size: 9px; font-weight: 700; cursor: pointer; transform: translateX(-50%); transition: .18s ease; }
+.latest-message-button:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); transform: translate(-50%, -1px); }
 .message-day { display: flex; align-items: center; justify-content: center; margin: 2px 0 22px; color: var(--muted); font-size: 9px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
 .system-message { display: flex; align-items: center; gap: 13px; max-width: 720px; margin: 0 auto 24px; color: var(--muted); font-size: 10px; text-align: center; }
 .system-message span { flex: 1; height: 1px; background: var(--line); }

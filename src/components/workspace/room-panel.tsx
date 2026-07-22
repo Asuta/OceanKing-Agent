@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Archive, Bot, Check, ChevronDown, FileText, LoaderCircle, Paperclip, PanelRightOpen, Pencil, Send, Square, UserPlus, X } from "lucide-react";
+import { Archive, ArrowDown, Bot, Check, ChevronDown, FileText, LoaderCircle, Paperclip, PanelRightOpen, Pencil, Send, Square, UserPlus, X } from "lucide-react";
 import type { Agent, AgentTurn, Attachment, Room, RoomMessagePreview } from "@/lib/domain/types";
 import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
 import { mergedAssistantPreview, type ReasoningPreview } from "@/components/workspace/live-assistant-preview";
@@ -9,6 +9,19 @@ import { Markdown } from "@/components/workspace/markdown";
 
 type SendCommand = (draft: WorkspaceCommandDraft) => Promise<boolean>;
 const scrollFollowThreshold = 48;
+const readingPositionStorageKey = "oceanking:chat-reading-positions:v1";
+const readingPositionPersistenceDelay = 160;
+
+type ChatReadingPosition = {
+  mode: "latest" | "anchor";
+  messageCount: number;
+  messageId?: string;
+  offset?: number;
+};
+
+type ChatReadingPositions = Record<string, ChatReadingPosition>;
+type ChatReadingPositionsRef = { current: ChatReadingPositions | null };
+type ReadingPositionPersistenceTimerRef = { current: number | null };
 
 function messageKindLabel(kind: RoomMessagePreview["kind"]): string {
   return kind === "handoff" ? "结束" : "过程";
@@ -16,6 +29,112 @@ function messageKindLabel(kind: RoomMessagePreview["kind"]): string {
 
 function isAtMessageBottom(element: HTMLDivElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= scrollFollowThreshold;
+}
+
+function loadReadingPositions(): ChatReadingPositions {
+  if (typeof window === "undefined") return {};
+  try {
+    const encoded = window.sessionStorage.getItem(readingPositionStorageKey);
+    if (!encoded) return {};
+    const parsed = JSON.parse(encoded) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).flatMap(([key, value]) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const candidate = value as Partial<ChatReadingPosition>;
+      if ((candidate.mode !== "latest" && candidate.mode !== "anchor") || !Number.isInteger(candidate.messageCount) || candidate.messageCount! < 0) return [];
+      if (candidate.mode === "anchor" && (typeof candidate.messageId !== "string" || !Number.isFinite(candidate.offset))) return [];
+      return [[key, candidate as ChatReadingPosition]];
+    }));
+  } catch {
+    return {};
+  }
+}
+
+function getReadingPositions(ref: ChatReadingPositionsRef): ChatReadingPositions {
+  if (!ref.current) ref.current = loadReadingPositions();
+  return ref.current;
+}
+
+function cacheReadingPosition(ref: ChatReadingPositionsRef, key: string, position: ChatReadingPosition): void {
+  const positions = getReadingPositions(ref);
+  positions[key] = position;
+}
+
+function persistReadingPositions(ref: ChatReadingPositionsRef): void {
+  if (!ref.current || typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(readingPositionStorageKey, JSON.stringify(ref.current));
+  } catch { /* 浏览器禁用或耗尽会话存储时，当前页面内的内存记录仍然有效。 */ }
+}
+
+function storeReadingPosition(ref: ChatReadingPositionsRef, key: string, position: ChatReadingPosition): void {
+  cacheReadingPosition(ref, key, position);
+  persistReadingPositions(ref);
+}
+
+function scheduleReadingPositionPersistence(ref: ChatReadingPositionsRef, timerRef: ReadingPositionPersistenceTimerRef): void {
+  if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+  timerRef.current = window.setTimeout(() => {
+    timerRef.current = null;
+    persistReadingPositions(ref);
+  }, readingPositionPersistenceDelay);
+}
+
+function flushReadingPositionPersistence(ref: ChatReadingPositionsRef, timerRef: ReadingPositionPersistenceTimerRef): void {
+  if (timerRef.current === null) return;
+  window.clearTimeout(timerRef.current);
+  timerRef.current = null;
+  persistReadingPositions(ref);
+}
+
+function readingPositionKey(room: Room): string {
+  return room.kind === "direct" && room.directAgentId ? `agent:${room.directAgentId}` : `room:${room.id}`;
+}
+
+function findMessageElement(element: HTMLDivElement, messageId: string): HTMLElement | undefined {
+  return Array.from(element.querySelectorAll<HTMLElement>("[data-message-id]"))
+    .find((message) => message.dataset.messageId === messageId);
+}
+
+function captureReadingPosition(element: HTMLDivElement, messageCount: number, previous?: ChatReadingPosition): ChatReadingPosition {
+  if (isAtMessageBottom(element)) return { mode: "latest", messageCount };
+  const containerTop = element.getBoundingClientRect().top;
+  const messages = element.querySelectorAll<HTMLElement>("[data-message-id]");
+  let low = 0;
+  let high = messages.length - 1;
+  let anchor: HTMLElement | undefined;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const message = messages.item(middle);
+    if (message.getBoundingClientRect().bottom > containerTop) {
+      anchor = message;
+      high = middle - 1;
+    } else {
+      low = middle + 1;
+    }
+  }
+  if (!anchor?.dataset.messageId) return { mode: "latest", messageCount };
+  const acknowledgedCount = Math.min(previous?.messageCount ?? messageCount, messageCount);
+  return {
+    mode: "anchor",
+    messageCount: acknowledgedCount,
+    messageId: anchor.dataset.messageId,
+    offset: anchor.getBoundingClientRect().top - containerTop,
+  };
+}
+
+function restoreReadingPosition(element: HTMLDivElement, position?: ChatReadingPosition): boolean {
+  if (!position || position.mode === "latest" || !position.messageId || position.offset === undefined) {
+    element.scrollTop = element.scrollHeight;
+    return true;
+  }
+  const anchor = findMessageElement(element, position.messageId);
+  if (!anchor) {
+    element.scrollTop = element.scrollHeight;
+    return true;
+  }
+  element.scrollTop += anchor.getBoundingClientRect().top - element.getBoundingClientRect().top - position.offset;
+  return false;
 }
 
 export function RoomTitleEditor({ roomId, title, busy, sendCommand }: { roomId: string; title: string; busy: boolean; sendCommand: SendCommand }) {
@@ -102,7 +221,14 @@ export function RoomPanel({ room, directAgent, agents, previews, assistantPrevie
   const fileRef = useRef<HTMLInputElement>(null);
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const followLatestRef = useRef(false);
+  const readingPositionsRef = useRef<ChatReadingPositions | null>(null);
+  const readingPositionPersistenceTimerRef = useRef<number | null>(null);
+  const currentMessageCountRef = useRef(room.messages.length);
+  const [awayFromLatest, setAwayFromLatest] = useState(false);
+  const [newMessageCount, setNewMessageCount] = useState(0);
   const isDirect = room.kind === "direct";
+  const viewKey = readingPositionKey(room);
+  const viewInstanceKey = `${viewKey}:${room.id}`;
   const directChatAgent = directAgent ?? (room.directAgentId ? agents.find((agent) => agent.id === room.directAgentId) : undefined);
   const availableAgents = isDirect ? [] : agents.filter((agent) => !room.participants.some((participant) => participant.agentId === agent.id));
   const visiblePreviews = previews.filter((preview) => preview.roomId === room.id && !room.messages.some((message) => message.messageKey === preview.messageKey));
@@ -114,14 +240,69 @@ export function RoomPanel({ room, directAgent, agents, previews, assistantPrevie
     + privateStatuses.reduce((total, status) => total + status.content.length + (status.reasoning?.steps.reduce((length, step) => length + step.content.length, 0) ?? 0), 0);
 
   useEffect(() => {
-    const element = messageScrollRef.current;
-    if (element) followLatestRef.current = isAtMessageBottom(element);
-  }, [room.id]);
+    currentMessageCountRef.current = room.messages.length;
+  }, [room.messages.length]);
+
+  useEffect(() => {
+    const flush = () => flushReadingPositionPersistence(readingPositionsRef, readingPositionPersistenceTimerRef);
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
+    };
+  }, []);
 
   useEffect(() => {
     const element = messageScrollRef.current;
-    if (element && followLatestRef.current) element.scrollTop = element.scrollHeight;
-  }, [previewLength, room.messages.length, visiblePreviews.length]);
+    if (!element) return;
+    const saved = getReadingPositions(readingPositionsRef)[viewKey];
+    const followsLatest = restoreReadingPosition(element, saved);
+    followLatestRef.current = followsLatest;
+    setAwayFromLatest(!followsLatest);
+    if (followsLatest) {
+      storeReadingPosition(readingPositionsRef, viewKey, { mode: "latest", messageCount: currentMessageCountRef.current });
+      setNewMessageCount(0);
+    } else {
+      setNewMessageCount(Math.max(0, currentMessageCountRef.current - saved.messageCount));
+    }
+    return () => flushReadingPositionPersistence(readingPositionsRef, readingPositionPersistenceTimerRef);
+  }, [viewInstanceKey, viewKey]);
+
+  useEffect(() => {
+    const element = messageScrollRef.current;
+    if (!element) return;
+    const saved = getReadingPositions(readingPositionsRef)[viewKey];
+    if (followLatestRef.current || !saved || (saved.mode === "anchor" && (!saved.messageId || !findMessageElement(element, saved.messageId)))) {
+      element.scrollTop = element.scrollHeight;
+      followLatestRef.current = true;
+      setAwayFromLatest(false);
+      setNewMessageCount(0);
+      storeReadingPosition(readingPositionsRef, viewKey, { mode: "latest", messageCount: room.messages.length });
+      return;
+    }
+    setNewMessageCount(Math.max(0, room.messages.length - saved.messageCount));
+  }, [previewLength, room.messages.length, visiblePreviews.length, viewKey]);
+
+  const handleMessageScroll = (element: HTMLDivElement) => {
+    const previous = getReadingPositions(readingPositionsRef)[viewKey];
+    const position = captureReadingPosition(element, room.messages.length, previous);
+    const followsLatest = position.mode === "latest";
+    followLatestRef.current = followsLatest;
+    setAwayFromLatest(!followsLatest);
+    setNewMessageCount(followsLatest ? 0 : Math.max(0, room.messages.length - position.messageCount));
+    cacheReadingPosition(readingPositionsRef, viewKey, position);
+    scheduleReadingPositionPersistence(readingPositionsRef, readingPositionPersistenceTimerRef);
+  };
+
+  const returnToLatest = () => {
+    const element = messageScrollRef.current;
+    if (!element) return;
+    element.scrollTop = element.scrollHeight;
+    followLatestRef.current = true;
+    setAwayFromLatest(false);
+    setNewMessageCount(0);
+    storeReadingPosition(readingPositionsRef, viewKey, { mode: "latest", messageCount: room.messages.length });
+  };
 
   const submit = async () => {
     if ((!content.trim() && !attachments.length) || busy) return;
@@ -150,21 +331,24 @@ export function RoomPanel({ room, directAgent, agents, previews, assistantPrevie
       </div>
     </header>
 
-    <div className="message-scroll" ref={messageScrollRef} onScroll={(event) => { followLatestRef.current = isAtMessageBottom(event.currentTarget); }}>
-      <div className="message-day">{isDirect ? "单聊记录" : "公开房间转录"}</div>
-      {room.messages.map((message) => message.source === "system" ? <div className="system-message" key={message.id}><span />{message.content}<span /></div> : <article key={message.id} className={`message ${message.source === "user" ? "from-user" : "from-agent"}`}>
+    <div className="message-scroll-shell">
+      <div className="message-scroll" ref={messageScrollRef} onScroll={(event) => handleMessageScroll(event.currentTarget)}>
+        <div className="message-day">{isDirect ? "单聊记录" : "公开房间转录"}</div>
+        {room.messages.map((message) => message.source === "system" ? <div className="system-message" data-message-id={message.id} key={message.id}><span />{message.content}<span /></div> : <article data-message-id={message.id} key={message.id} className={`message ${message.source === "user" ? "from-user" : "from-agent"}`}>
         <div className="message-avatar">{message.source === "agent_emit" ? <Bot size={16} /> : message.sender.name.slice(0, 1)}</div>
         <div className="message-body"><div className="message-meta"><strong>{message.sender.name}</strong><span>#{message.seq}</span><time>{new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>{message.kind === "notify" || message.kind === "handoff" ? <em>{messageKindLabel(message.kind)}</em> : null}</div><div className="message-content"><Markdown>{message.content}</Markdown></div>
           {message.attachments.length ? <div className="attachment-list">{message.attachments.map((attachment) => <a href={`/api/uploads/${attachment.id}`} target="_blank" rel="noreferrer" key={attachment.id}><FileText size={15} /><span>{attachment.fileName}</span><small>{Math.ceil(attachment.byteSize / 1024)} KB</small></a>)}</div> : null}
           {message.receipts.length ? <div className="receipt-line">已阅不回 · {message.receipts.map((receipt) => room.participants.find((participant) => participant.id === receipt.agentParticipantId)?.displayName ?? "Agent").join("、")}</div> : null}
         </div>
       </article>)}
-      {visiblePreviews.map((preview) => <article key={`${preview.turnId}:${preview.messageKey}`} className="message from-agent streaming-message" aria-live="polite" aria-label="Agent 正在生成公开回复">
+        {visiblePreviews.map((preview) => <article key={`${preview.turnId}:${preview.messageKey}`} className="message from-agent streaming-message" aria-live="polite" aria-label="Agent 正在生成公开回复">
         <div className="message-avatar"><Bot size={16} /></div>
         <div className="message-body"><div className="message-meta"><strong>{agents.find((agent) => agent.id === preview.agentId)?.label ?? "Agent"}</strong><span>生成中</span><em>{messageKindLabel(preview.kind)}</em></div><div className="message-content streaming-content"><span>{preview.content}</span><span className="stream-cursor" aria-hidden="true" /></div></div>
       </article>)}
-      {privateStatuses.map(({ turn, content: privateContent, reasoning, publicReplyActive }) => <PrivateAssistantStatus key={turn.id} turn={turn} agentLabel={agents.find((agent) => agent.id === turn.agentId)?.label ?? room.participants.find((participant) => participant.id === turn.agentParticipantId)?.displayName ?? "Agent"} content={privateContent} reasoning={reasoning} publicReplyActive={publicReplyActive} />)}
-      {room.scheduler.status === "running" && !runningTurns.length ? <div className="agent-working"><LoaderCircle className="spin" size={15} /><span>{room.participants.find((participant) => participant.id === room.scheduler.activeParticipantId)?.displayName ?? "Agent"} 正在私有执行区工作</span><small>正在等待执行状态同步</small></div> : null}
+        {privateStatuses.map(({ turn, content: privateContent, reasoning, publicReplyActive }) => <PrivateAssistantStatus key={turn.id} turn={turn} agentLabel={agents.find((agent) => agent.id === turn.agentId)?.label ?? room.participants.find((participant) => participant.id === turn.agentParticipantId)?.displayName ?? "Agent"} content={privateContent} reasoning={reasoning} publicReplyActive={publicReplyActive} />)}
+        {room.scheduler.status === "running" && !runningTurns.length ? <div className="agent-working"><LoaderCircle className="spin" size={15} /><span>{room.participants.find((participant) => participant.id === room.scheduler.activeParticipantId)?.displayName ?? "Agent"} 正在私有执行区工作</span><small>正在等待执行状态同步</small></div> : null}
+      </div>
+      {awayFromLatest ? <button type="button" className="latest-message-button" onClick={returnToLatest} aria-label={newMessageCount ? `${newMessageCount} 条新消息，回到最新` : "回到最新消息"}><ArrowDown size={14} />{newMessageCount ? `${newMessageCount > 99 ? "99+" : newMessageCount} 条新消息` : "回到最新"}</button> : null}
     </div>
 
     <footer className="composer-wrap">
