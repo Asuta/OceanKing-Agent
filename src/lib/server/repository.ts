@@ -258,7 +258,7 @@ export class WorkspaceRepository {
     const rooms: Room[] = roomRows.map((row) => {
       const roomId = str(row.id);
       return {
-        id: roomId, title: str(row.title), ownerParticipantId: nullableStr(row.owner_participant_id), participants: participants.filter((p) => p.roomId === roomId), messages: messages.filter((m) => m.roomId === roomId),
+        id: roomId, title: str(row.title), kind: str(row.kind) === "direct" ? "direct" : "shared", directAgentId: nullableStr(row.direct_agent_id), ownerParticipantId: nullableStr(row.owner_participant_id), participants: participants.filter((p) => p.roomId === roomId), messages: messages.filter((m) => m.roomId === roomId),
         turns: turns.filter((turn) => turn.roomId === roomId), scheduler: schedulers.get(roomId) ?? { roomId, status: "idle", nextAgentParticipantId: null, activeParticipantId: null, roundCount: 0, cursorByParticipantId: {}, receiptRevisionByParticipantId: {}, rerunRequested: false },
         archivedAt: nullableStr(row.archived_at), pinnedAt: nullableStr(row.pinned_at), createdAt: str(row.created_at), updatedAt: str(row.updated_at),
       };
@@ -319,15 +319,15 @@ export class WorkspaceRepository {
           this.raw.prepare("INSERT INTO scheduler_states(room_id,status,next_agent_participant_id,active_participant_id,round_count,cursor_json,receipt_revision_json,rerun_requested) VALUES(?,?,?,?,0,?,?,0)").run(roomId, "idle", nextParticipant, null, "{}", "{}");
           break;
         }
-        case "rename_room": this.requireRoom(command.roomId); this.raw.prepare("UPDATE rooms SET title=?,updated_at=? WHERE id=?").run(command.title, at, command.roomId); break;
+        case "rename_room": this.requireSharedRoom(command.roomId); this.raw.prepare("UPDATE rooms SET title=?,updated_at=? WHERE id=?").run(command.title, at, command.roomId); break;
         case "archive_room": {
-          this.requireRoom(command.roomId);
+          this.requireSharedRoom(command.roomId);
           this.raw.prepare("UPDATE rooms SET archived_at=?,pinned_at=CASE WHEN ?=1 THEN NULL ELSE pinned_at END,updated_at=? WHERE id=?")
             .run(command.archived ? at : null, command.archived ? 1 : 0, at, command.roomId);
           break;
         }
         case "set_room_pinned": {
-          const room = this.requireRoom(command.roomId);
+          const room = this.requireSharedRoom(command.roomId);
           if (command.pinned && nullableStr(room.archived_at)) throw new DomainError("已归档房间不能置顶");
           this.raw.prepare("UPDATE rooms SET pinned_at=? WHERE id=?").run(command.pinned ? this.nextRoomPinnedAt(at) : null, command.roomId);
           break;
@@ -343,14 +343,30 @@ export class WorkspaceRepository {
           result.triggerRoomId = command.roomId;
           break;
         }
-        case "add_agent": this.requireRoom(command.roomId); this.insertAgentParticipant(command.roomId, command.agentId, at); result.triggerRoomId = command.roomId; break;
-        case "remove_participant": this.requireRoom(command.roomId); this.raw.prepare("DELETE FROM participants WHERE id=? AND room_id=?").run(command.participantId, command.roomId); break;
-        case "toggle_participant": this.raw.prepare("UPDATE participants SET enabled=? WHERE id=? AND room_id=? AND kind='agent'").run(command.enabled ? 1 : 0, command.participantId, command.roomId); result.triggerRoomId = command.roomId; break;
+        case "send_direct_message": {
+          if (!command.content.trim() && command.attachmentIds.length === 0) throw new DomainError("消息或附件不能为空");
+          const direct = this.ensureDirectRoom(command.agentId, at);
+          const messageId = createId("msg");
+          const seq = this.takeNextSeq(direct.roomId, at);
+          this.raw.prepare("INSERT INTO room_messages(id,room_id,seq,sender_id,sender_name,sender_role,source,kind,status,content,final,message_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .run(messageId, direct.roomId, seq, direct.humanParticipantId, "你", "participant", "user", "user_input", "completed", command.content.trim(), 1, null, at);
+          for (const attachmentId of command.attachmentIds) this.raw.prepare("UPDATE attachments SET room_id=?,message_id=? WHERE id=? AND message_id IS NULL").run(direct.roomId, messageId, attachmentId);
+          result.triggerRoomId = direct.roomId;
+          break;
+        }
+        case "add_agent": this.requireSharedRoom(command.roomId); this.insertAgentParticipant(command.roomId, command.agentId, at); result.triggerRoomId = command.roomId; break;
+        case "remove_participant": this.requireSharedRoom(command.roomId); this.raw.prepare("DELETE FROM participants WHERE id=? AND room_id=?").run(command.participantId, command.roomId); break;
+        case "toggle_participant": this.requireSharedRoom(command.roomId); this.raw.prepare("UPDATE participants SET enabled=? WHERE id=? AND room_id=? AND kind='agent'").run(command.enabled ? 1 : 0, command.participantId, command.roomId); result.triggerRoomId = command.roomId; break;
         case "stop_room": this.stopRoomState(command.roomId, at); result.stopRoomId = command.roomId; break;
         case "create_agent": {
           this.insertAgent({ id: createId("agent"), label: command.label, summary: command.summary, instruction: command.instruction }, at); break;
         }
-        case "update_agent": this.raw.prepare("UPDATE agents SET label=?,summary=?,instruction=?,updated_at=? WHERE id=?").run(command.label, command.summary, command.instruction, at, command.agentId); break;
+        case "update_agent": {
+          this.raw.prepare("UPDATE agents SET label=?,summary=?,instruction=?,updated_at=? WHERE id=?").run(command.label, command.summary, command.instruction, at, command.agentId);
+          this.raw.prepare("UPDATE participants SET display_name=? WHERE agent_id=?").run(command.label, command.agentId);
+          this.raw.prepare("UPDATE rooms SET title=?,updated_at=? WHERE kind='direct' AND direct_agent_id=?").run(`${command.label} · 单聊`, at, command.agentId);
+          break;
+        }
         case "create_cron": {
           const id = createId("cron");
           this.raw.prepare("INSERT INTO cron_jobs(id,agent_id,room_id,name,schedule,timezone,prompt,enabled,last_run_at,next_run_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,NULL,NULL,?,?)")
@@ -391,6 +407,38 @@ export class WorkspaceRepository {
     const latest = nullableStr(row.latest);
     if (!latest || latest < at) return at;
     return new Date(Date.parse(latest) + 1).toISOString();
+  }
+
+  private requireSharedRoom(roomId: string): Row {
+    const room = this.requireRoom(roomId);
+    if (str(room.kind) === "direct") throw new DomainError("Agent 单聊不能修改成员、名称或归档状态");
+    return room;
+  }
+
+  private ensureDirectRoom(agentId: string, at: string): { roomId: string; humanParticipantId: string; agentParticipantId: string } {
+    const agent = this.raw.prepare("SELECT label FROM agents WHERE id=?").get(agentId) as Row | undefined;
+    if (!agent) throw new DomainError("Agent 不存在");
+    const existing = this.raw.prepare("SELECT id FROM rooms WHERE kind='direct' AND direct_agent_id=?").get(agentId) as Row | undefined;
+    if (existing) {
+      const participants = this.raw.prepare("SELECT id,kind,agent_id,enabled FROM participants WHERE room_id=? ORDER BY sort_order").all(existing.id) as Row[];
+      const human = participants.find((participant) => str(participant.kind) === "human");
+      const directAgent = participants.find((participant) => str(participant.kind) === "agent");
+      if (!human || !directAgent || participants.length !== 2 || nullableStr(directAgent.agent_id) !== agentId || !bool(directAgent.enabled)) throw new DomainError("Agent 单聊成员状态损坏");
+      return { roomId: str(existing.id), humanParticipantId: str(human.id), agentParticipantId: str(directAgent.id) };
+    }
+
+    const roomId = createId("direct");
+    const humanParticipantId = createId("human");
+    const agentParticipantId = createId("participant");
+    this.raw.prepare("INSERT INTO rooms(id,title,kind,direct_agent_id,owner_participant_id,next_seq,archived_at,created_at,updated_at) VALUES(?,?,?,?,?,1,NULL,?,?)")
+      .run(roomId, `${str(agent.label)} · 单聊`, "direct", agentId, humanParticipantId, at, at);
+    this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,1,0,?)")
+      .run(humanParticipantId, roomId, "human", null, "你", at);
+    this.raw.prepare("INSERT INTO participants(id,room_id,kind,agent_id,display_name,enabled,sort_order,created_at) VALUES(?,?,?,?,?,1,1,?)")
+      .run(agentParticipantId, roomId, "agent", agentId, str(agent.label), at);
+    this.raw.prepare("INSERT INTO scheduler_states(room_id,status,next_agent_participant_id,active_participant_id,round_count,cursor_json,receipt_revision_json,rerun_requested) VALUES(?,'idle',?,NULL,0,?,'{}',0)")
+      .run(roomId, agentParticipantId, JSON.stringify({ [agentParticipantId]: 0 }));
+    return { roomId, humanParticipantId, agentParticipantId };
   }
 
   private insertAgent(agent: Pick<Agent, "id" | "label" | "summary" | "instruction">, at: string): void {
@@ -664,18 +712,24 @@ export class WorkspaceRepository {
       return;
     }
     if (effect.type === "invite_agent") {
+      this.requireSharedRoom(effect.roomId);
       this.assertAgentConnected(effect.roomId, agentId);
       const invitation = this.insertAgentParticipant(effect.roomId, effect.agentId, at, effect.participantId);
       if (invitation.inserted) triggerRooms.add(effect.roomId);
       return;
     }
     if (effect.type === "remove_participant") {
+      this.requireSharedRoom(effect.roomId);
       this.assertAgentOwner(effect.roomId, agentId);
       this.raw.prepare("DELETE FROM participants WHERE room_id=? AND id=? AND id<>(SELECT owner_participant_id FROM rooms WHERE id=?)")
         .run(effect.roomId, effect.participantId, effect.roomId);
       return;
     }
-    if (effect.type === "leave_room") { this.raw.prepare("DELETE FROM participants WHERE room_id=? AND id=?").run(effect.roomId, participantId); return; }
+    if (effect.type === "leave_room") {
+      this.requireSharedRoom(effect.roomId);
+      this.raw.prepare("DELETE FROM participants WHERE room_id=? AND id=?").run(effect.roomId, participantId);
+      return;
+    }
     if (effect.type === "create_cron") {
       const job = effect.job; this.raw.prepare("INSERT OR IGNORE INTO cron_jobs(id,agent_id,room_id,name,schedule,timezone,prompt,enabled,last_run_at,next_run_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
         .run(job.id, agentId, job.roomId, job.name, job.schedule, job.timezone, job.prompt, job.enabled ? 1 : 0, job.lastRunAt, job.nextRunAt, at, at); return;

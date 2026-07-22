@@ -15,8 +15,8 @@ const viewportMargin = 8;
 export function RoomSidebar({ snapshot, activeRoomId, activeAgentId, onSelect, onSelectAgent, sendCommand, busy }: { snapshot: WorkspaceSnapshot; activeRoomId: string; activeAgentId: string | null; onSelect: (id: string) => void; onSelectAgent: (id: string) => void; sendCommand: SendCommand; busy: boolean }) {
   const [roomMenu, setRoomMenu] = useState<RoomMenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const activeRooms = snapshot.rooms.filter((room) => !room.archivedAt);
-  const archived = snapshot.rooms.filter((room) => room.archivedAt);
+  const activeRooms = snapshot.rooms.filter((room) => room.kind === "shared" && !room.archivedAt);
+  const archived = snapshot.rooms.filter((room) => room.kind === "shared" && room.archivedAt);
   const menuRoom = roomMenu ? activeRooms.find((room) => room.id === roomMenu.roomId) : null;
 
   useEffect(() => {
@@ -101,7 +101,7 @@ export function RoomSidebar({ snapshot, activeRoomId, activeAgentId, onSelect, o
     <div className="agent-roster">
       {snapshot.agents.map((agent, index) => {
         const active = snapshot.rooms.some((room) => room.scheduler.activeParticipantId && room.participants.some((participant) => participant.id === room.scheduler.activeParticipantId && participant.agentId === agent.id));
-        return <button type="button" className={activeAgentId === agent.id ? "active" : ""} key={agent.id} onClick={() => onSelectAgent(agent.id)} aria-label={`查看 ${agent.label} 的底层对话`}><span className={`agent-avatar tone-${index % 4}`}><Bot size={15} /></span><span><strong>{agent.label}</strong><small>{agent.summary}</small></span>{active ? <Circle className="agent-live" size={9} fill="currentColor" /> : <Check className="agent-ready" size={13} />}</button>;
+        return <button type="button" className={activeAgentId === agent.id ? "active" : ""} key={agent.id} onClick={() => onSelectAgent(agent.id)} aria-label={`与 ${agent.label} 单聊`}><span className={`agent-avatar tone-${index % 4}`}><Bot size={15} /></span><span><strong>{agent.label}</strong><small>{agent.summary}</small></span>{active ? <Circle className="agent-live" size={9} fill="currentColor" /> : <Check className="agent-ready" size={13} />}</button>;
       })}
     </div>
     {roomMenu && menuRoom ? <div ref={menuRef} className="room-context-menu" role="menu" aria-label={`${menuRoom.title} 房间菜单`} style={{ left: roomMenu.x, top: roomMenu.y }}>

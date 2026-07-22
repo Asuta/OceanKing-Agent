@@ -99,6 +99,41 @@ afterEach(() => {
 });
 
 describe("房间消息自动打断", () => {
+  it("单 Agent 单聊会完成一次回复并自然收敛，不会把 handoff 再交给自己", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    process.env.OPENAI_API_FORMAT = "responses";
+    let directRoomId = "";
+    const requestBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const pending = takePendingCompletedResponse(init);
+      if (pending) return pending;
+      requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return completedResponse("这是单聊回复", "response_direct_chat", [directRoomId]);
+    }));
+
+    await withRepository(async (repository) => {
+      sendUser(repository, "room_harbor", "共享房间里的旧上下文");
+      const sharedPacket = packetFor(repository);
+      repository.beginTurn({ turnId: "turn_before_direct", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: sharedPacket });
+      repository.finishTurn({ turnId: "turn_before_direct", assistantContent: "已记住共享上下文", sessionMessages: [{ role: "user", content: "共享房间里的旧上下文" }, { role: "assistant", content: "已记住共享上下文" }], tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: sharedPacket.cutoffSeq, nextParticipantId: null });
+      const command = repository.executeCommand({ ...commandBase(repository), type: "send_direct_message", agentId: "navigator", content: "开始单聊", attachmentIds: [] });
+      directRoomId = command.triggerRoomId!;
+      const scheduler = new RoomScheduler(repository, new AgentExecutor());
+      scheduler.enqueue(directRoomId, { interruptActive: true });
+
+      await waitUntil(() => repository.getRoom(directRoomId)?.scheduler.status === "idle" && repository.getRoom(directRoomId)?.turns.length === 1);
+
+      const room = repository.getRoom(directRoomId)!;
+      expect(room.kind).toBe("direct");
+      expect(room.participants).toHaveLength(2);
+      expect(room.turns).toHaveLength(1);
+      expect(room.turns[0]).toMatchObject({ agentId: "navigator", status: "completed" });
+      expect(room.messages.map((message) => [message.source, message.content])).toEqual([["user", "开始单聊"], ["agent_emit", "这是单聊回复"]]);
+      expect(JSON.stringify(requestBodies[0]?.input)).toContain("共享房间里的旧上下文");
+    });
+  });
+
   it("下一个 Agent 已读不回后终止跨房间 handoff，且不会继续唤醒第三个 Agent", async () => {
     delete process.env.OPENAI_API_KEY;
     delete process.env.OPENAI_BASE_URL;

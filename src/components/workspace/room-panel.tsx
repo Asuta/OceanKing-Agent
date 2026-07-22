@@ -95,14 +95,16 @@ function PrivateAssistantStatus({ turn, agentLabel, content, reasoning, publicRe
   </article>;
 }
 
-export function RoomPanel({ room, agents, previews, assistantPreviews, reasoningPreviews, busy, sendCommand, onToggleConsole, consoleOpen }: { room: Room; agents: Agent[]; previews: RoomMessagePreview[]; assistantPreviews: Record<string, string>; reasoningPreviews: Record<string, ReasoningPreview>; busy: boolean; sendCommand: SendCommand; onToggleConsole: () => void; consoleOpen: boolean }) {
+export function RoomPanel({ room, directAgent, agents, previews, assistantPreviews, reasoningPreviews, busy, sendCommand, onToggleConsole, consoleOpen }: { room: Room; directAgent?: Agent; agents: Agent[]; previews: RoomMessagePreview[]; assistantPreviews: Record<string, string>; reasoningPreviews: Record<string, ReasoningPreview>; busy: boolean; sendCommand: SendCommand; onToggleConsole: () => void; consoleOpen: boolean }) {
   const [content, setContent] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const followLatestRef = useRef(false);
-  const availableAgents = agents.filter((agent) => !room.participants.some((participant) => participant.agentId === agent.id));
+  const isDirect = room.kind === "direct";
+  const directChatAgent = directAgent ?? (room.directAgentId ? agents.find((agent) => agent.id === room.directAgentId) : undefined);
+  const availableAgents = isDirect ? [] : agents.filter((agent) => !room.participants.some((participant) => participant.agentId === agent.id));
   const visiblePreviews = previews.filter((preview) => preview.roomId === room.id && !room.messages.some((message) => message.messageKey === preview.messageKey));
   const publiclyStreamingTurnIds = new Set(visiblePreviews.map((preview) => preview.turnId));
   const runningTurns = room.turns.filter((turn) => turn.status === "running");
@@ -123,7 +125,10 @@ export function RoomPanel({ room, agents, previews, assistantPreviews, reasoning
 
   const submit = async () => {
     if ((!content.trim() && !attachments.length) || busy) return;
-    const ok = await sendCommand({ type: "send_message", roomId: room.id, content, attachmentIds: attachments.map((item) => item.id) });
+    if (isDirect && !directChatAgent) return;
+    const ok = await sendCommand(isDirect
+      ? { type: "send_direct_message", agentId: directChatAgent!.id, content, attachmentIds: attachments.map((item) => item.id) }
+      : { type: "send_message", roomId: room.id, content, attachmentIds: attachments.map((item) => item.id) });
     if (ok) { setContent(""); setAttachments([]); }
   };
 
@@ -135,18 +140,18 @@ export function RoomPanel({ room, agents, previews, assistantPreviews, reasoning
 
   return <div className="room-panel">
     <header className="room-header">
-      <div className="room-title-block"><div className="room-title-line"><RoomTitleEditor key={`${room.id}:${room.title}`} roomId={room.id} title={room.title} busy={busy} sendCommand={sendCommand} /><span className={`status-label ${room.scheduler.status}`}>{room.scheduler.status === "running" ? "运行中" : "已就绪"}</span></div><p>{room.participants.filter((participant) => participant.enabled).length} 位参与者 · 房间公开消息与 Agent 私有执行严格分层</p></div>
+      <div className="room-title-block"><div className="room-title-line">{isDirect ? <div className="room-title-display direct-chat-title"><span className="agent-avatar"><Bot size={15} /></span><h1>{directChatAgent?.label ?? room.title}</h1></div> : <RoomTitleEditor key={`${room.id}:${room.title}`} roomId={room.id} title={room.title} busy={busy} sendCommand={sendCommand} />}<span className={`status-label ${room.scheduler.status}`}>{room.scheduler.status === "running" ? "运行中" : "已就绪"}</span></div><p>{isDirect ? "你与该 Agent 的单聊 · 延续 Agent 的全局上下文" : `${room.participants.filter((participant) => participant.enabled).length} 位参与者 · 房间公开消息与 Agent 私有执行严格分层`}</p></div>
       <div className="room-header-actions">
         <div className="participant-stack" aria-label="房间成员">{room.participants.slice(0, 5).map((participant, index) => <span key={participant.id} title={participant.displayName} className={participant.kind === "human" ? "human" : `tone-${index % 4}`}>{participant.kind === "agent" ? <Bot size={14} /> : participant.displayName.slice(0, 1)}</span>)}</div>
         {availableAgents.length ? <label className="select-action"><UserPlus size={16} /><select aria-label="邀请 Agent" value="" onChange={(event) => { if (event.target.value) void sendCommand({ type: "add_agent", roomId: room.id, agentId: event.target.value }); }}><option value="">邀请 Agent</option>{availableAgents.map((agent) => <option value={agent.id} key={agent.id}>{agent.label}</option>)}</select><ChevronDown size={13} /></label> : null}
         {room.scheduler.status === "running" ? <button className="danger-button" onClick={() => void sendCommand({ type: "stop_room", roomId: room.id })}><Square size={13} fill="currentColor" />紧急停止</button> : null}
-        <button className="icon-button desktop-only" onClick={() => void sendCommand({ type: "archive_room", roomId: room.id, archived: !room.archivedAt })} aria-label="归档房间"><Archive size={17} /></button>
+        {!isDirect ? <button className="icon-button desktop-only" onClick={() => void sendCommand({ type: "archive_room", roomId: room.id, archived: !room.archivedAt })} aria-label="归档房间"><Archive size={17} /></button> : null}
         {!consoleOpen ? <button className="icon-button desktop-only" onClick={onToggleConsole} aria-label="打开 Console"><PanelRightOpen size={18} /></button> : null}
       </div>
     </header>
 
     <div className="message-scroll" ref={messageScrollRef} onScroll={(event) => { followLatestRef.current = isAtMessageBottom(event.currentTarget); }}>
-      <div className="message-day">公开房间转录</div>
+      <div className="message-day">{isDirect ? "单聊记录" : "公开房间转录"}</div>
       {room.messages.map((message) => message.source === "system" ? <div className="system-message" key={message.id}><span />{message.content}<span /></div> : <article key={message.id} className={`message ${message.source === "user" ? "from-user" : "from-agent"}`}>
         <div className="message-avatar">{message.source === "agent_emit" ? <Bot size={16} /> : message.sender.name.slice(0, 1)}</div>
         <div className="message-body"><div className="message-meta"><strong>{message.sender.name}</strong><span>#{message.seq}</span><time>{new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>{message.kind === "notify" || message.kind === "handoff" ? <em>{messageKindLabel(message.kind)}</em> : null}</div><div className="message-content"><Markdown>{message.content}</Markdown></div>
@@ -164,7 +169,7 @@ export function RoomPanel({ room, agents, previews, assistantPreviews, reasoning
 
     <footer className="composer-wrap">
       {attachments.length ? <div className="composer-attachments">{attachments.map((attachment) => <span key={attachment.id}><Paperclip size={13} />{attachment.fileName}<button onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}><X size={12} /></button></span>)}</div> : null}
-      <div className="composer"><textarea value={content} onChange={(event) => setContent(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} placeholder="向这个房间发送公开消息…" rows={3} /><div className="composer-tools"><input ref={fileRef} type="file" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file); }} /><button className="icon-button" disabled={uploading} onClick={() => fileRef.current?.click()} aria-label="添加附件">{uploading ? <LoaderCircle className="spin" size={17} /> : <Paperclip size={17} />}</button><span>Enter 发送 · Shift+Enter 换行</span><button className="send-button" disabled={busy || (!content.trim() && !attachments.length)} onClick={() => void submit()}><Send size={16} />发送</button></div></div>
+      <div className="composer"><textarea value={content} onChange={(event) => setContent(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } }} placeholder={isDirect ? `给 ${directChatAgent?.label ?? "Agent"} 发送消息…` : "向这个房间发送公开消息…"} rows={3} /><div className="composer-tools"><input ref={fileRef} type="file" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file); }} /><button className="icon-button" disabled={uploading} onClick={() => fileRef.current?.click()} aria-label="添加附件">{uploading ? <LoaderCircle className="spin" size={17} /> : <Paperclip size={17} />}</button><span>Enter 发送 · Shift+Enter 换行</span><button className="send-button" disabled={busy || (!content.trim() && !attachments.length) || (isDirect && !directChatAgent)} onClick={() => void submit()}><Send size={16} />发送</button></div></div>
     </footer>
   </div>;
 }

@@ -26,7 +26,7 @@ type DatabaseInstanceLockMetadata = {
 const createSql = `
 CREATE TABLE IF NOT EXISTS workspace_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, revision INTEGER NOT NULL, settings_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, label TEXT NOT NULL, summary TEXT NOT NULL, instruction TEXT NOT NULL, skills_json TEXT NOT NULL, settings_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, title TEXT NOT NULL, owner_participant_id TEXT, next_seq INTEGER NOT NULL DEFAULT 1, archived_at TEXT, pinned_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'shared', direct_agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE, owner_participant_id TEXT, next_seq INTEGER NOT NULL DEFAULT 1, archived_at TEXT, pinned_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS participants (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, kind TEXT NOT NULL, agent_id TEXT REFERENCES agents(id), display_name TEXT NOT NULL, enabled INTEGER NOT NULL, sort_order INTEGER NOT NULL, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS participants_room_idx ON participants(room_id, sort_order);
 CREATE TABLE IF NOT EXISTS room_messages (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, seq INTEGER NOT NULL, sender_id TEXT NOT NULL, sender_name TEXT NOT NULL, sender_role TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, content TEXT NOT NULL, final INTEGER NOT NULL, message_key TEXT, created_at TEXT NOT NULL, UNIQUE(room_id,seq), UNIQUE(room_id,message_key));
@@ -118,6 +118,9 @@ export function createDatabase(explicitDataDir?: string): DatabaseHandle {
   raw.exec(createSql);
   const roomColumns = new Set((raw.prepare("PRAGMA table_info(rooms)").all() as Array<{ name: string }>).map((column) => column.name));
   if (!roomColumns.has("pinned_at")) raw.exec("ALTER TABLE rooms ADD COLUMN pinned_at TEXT");
+  if (!roomColumns.has("kind")) raw.exec("ALTER TABLE rooms ADD COLUMN kind TEXT NOT NULL DEFAULT 'shared'");
+  if (!roomColumns.has("direct_agent_id")) raw.exec("ALTER TABLE rooms ADD COLUMN direct_agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE");
+  raw.exec("CREATE UNIQUE INDEX IF NOT EXISTS rooms_direct_agent_unique ON rooms(direct_agent_id) WHERE kind='direct' AND direct_agent_id IS NOT NULL");
   const turnColumns = new Set((raw.prepare("PRAGMA table_info(agent_turns)").all() as Array<{ name: string }>).map((column) => column.name));
   if (!turnColumns.has("system_prompt")) raw.exec("ALTER TABLE agent_turns ADD COLUMN system_prompt TEXT NOT NULL DEFAULT ''");
   if (!turnColumns.has("conversation_json")) raw.exec("ALTER TABLE agent_turns ADD COLUMN conversation_json TEXT NOT NULL DEFAULT '[]'");

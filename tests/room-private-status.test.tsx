@@ -47,6 +47,8 @@ function createRoom(id: string, turns: AgentTurn[]): Room {
   return {
     id,
     title: id === "room_a" ? "房间 A" : "房间 B",
+    kind: "shared",
+    directAgentId: null,
     ownerParticipantId: `participant_navigator_${id}`,
     participants: [
       { id: "human", roomId: id, kind: "human", agentId: null, displayName: "你", enabled: true, sortOrder: 0, createdAt },

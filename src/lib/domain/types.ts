@@ -180,6 +180,8 @@ export type SchedulerState = {
 export type Room = {
   id: Id;
   title: string;
+  kind: "shared" | "direct";
+  directAgentId: Id | null;
   ownerParticipantId: Id | null;
   participants: Participant[];
   messages: RoomMessage[];

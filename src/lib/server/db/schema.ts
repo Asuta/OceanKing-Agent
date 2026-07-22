@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const workspaceMeta = sqliteTable("workspace_meta", {
@@ -9,9 +10,9 @@ export const agents = sqliteTable("agents", {
   skillsJson: text("skills_json").notNull(), settingsJson: text("settings_json").notNull(), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
 });
 export const rooms = sqliteTable("rooms", {
-  id: text("id").primaryKey(), title: text("title").notNull(), ownerParticipantId: text("owner_participant_id"), nextSeq: integer("next_seq").notNull(),
+  id: text("id").primaryKey(), title: text("title").notNull(), kind: text("kind").notNull().default("shared"), directAgentId: text("direct_agent_id"), ownerParticipantId: text("owner_participant_id"), nextSeq: integer("next_seq").notNull(),
   archivedAt: text("archived_at"), pinnedAt: text("pinned_at"), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
-});
+}, (table) => [uniqueIndex("rooms_direct_agent_unique").on(table.directAgentId).where(sql`${table.kind} = 'direct' AND ${table.directAgentId} IS NOT NULL`)]);
 export const participants = sqliteTable("participants", {
   id: text("id").primaryKey(), roomId: text("room_id").notNull(), kind: text("kind").notNull(), agentId: text("agent_id"), displayName: text("display_name").notNull(),
   enabled: integer("enabled", { mode: "boolean" }).notNull(), sortOrder: integer("sort_order").notNull(), createdAt: text("created_at").notNull(),

@@ -33,6 +33,8 @@ const runningSnapshot: WorkspaceSnapshot = {
   rooms: [{
     id: "room_live",
     title: "实时房间",
+    kind: "shared",
+    directAgentId: null,
     ownerParticipantId: null,
     participants: [],
     messages: [],

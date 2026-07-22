@@ -43,6 +43,62 @@ describe("OceanKing 领域仓库", () => {
     expect(() => repository.executeCommand({ ...commandBase(repository), type: "set_room_pinned", roomId: first.id, pinned: true })).toThrow("已归档房间不能置顶");
   }));
 
+  it("首次发送时懒创建唯一 Agent 单聊，并在后续消息中复用", async () => withRepository((repository) => {
+    expect(repository.getSnapshot().rooms.every((room) => room.kind === "shared")).toBe(true);
+
+    const first = repository.executeCommand({ ...commandBase(repository), type: "send_direct_message", agentId: "navigator", content: "第一条单聊", attachmentIds: [] });
+    const directRoom = first.snapshot.rooms.find((room) => room.kind === "direct" && room.directAgentId === "navigator")!;
+
+    expect(first.triggerRoomId).toBe(directRoom.id);
+    expect(directRoom.title).toBe("领航员 · 单聊");
+    expect(directRoom.participants).toHaveLength(2);
+    expect(directRoom.participants.map((participant) => [participant.kind, participant.agentId])).toEqual([["human", null], ["agent", "navigator"]]);
+    expect(directRoom.messages.map((message) => message.content)).toEqual(["第一条单聊"]);
+    expect(directRoom.scheduler.nextAgentParticipantId).toBe(directRoom.participants[1]?.id);
+
+    const second = repository.executeCommand({ ...commandBase(repository), type: "send_direct_message", agentId: "navigator", content: "第二条单聊", attachmentIds: [] });
+    const directRooms = second.snapshot.rooms.filter((room) => room.kind === "direct" && room.directAgentId === "navigator");
+    expect(directRooms).toHaveLength(1);
+    expect(directRooms[0]?.id).toBe(directRoom.id);
+    expect(directRooms[0]?.messages.map((message) => message.content)).toEqual(["第一条单聊", "第二条单聊"]);
+
+    const currentAgent = second.snapshot.agents.find((agent) => agent.id === "navigator")!;
+    repository.executeCommand({ ...commandBase(repository), type: "update_agent", agentId: "navigator", label: "新领航员", summary: currentAgent.summary, instruction: currentAgent.instruction });
+    const renamedDirectRoom = repository.getSnapshot().rooms.find((room) => room.id === directRoom.id)!;
+    expect(renamedDirectRoom.title).toBe("新领航员 · 单聊");
+    expect(renamedDirectRoom.participants.find((participant) => participant.agentId === "navigator")?.displayName).toBe("新领航员");
+  }));
+
+  it("Agent 单聊成员固定，不能通过普通房间命令改名、归档或增删成员", async () => withRepository((repository) => {
+    repository.executeCommand({ ...commandBase(repository), type: "send_direct_message", agentId: "navigator", content: "建立单聊", attachmentIds: [] });
+    const directRoom = repository.getSnapshot().rooms.find((room) => room.kind === "direct")!;
+    const agentParticipant = directRoom.participants.find((participant) => participant.kind === "agent")!;
+
+    expect(() => repository.executeCommand({ ...commandBase(repository), type: "rename_room", roomId: directRoom.id, title: "不能改名" })).toThrow("Agent 单聊不能修改成员、名称或归档状态");
+    expect(() => repository.executeCommand({ ...commandBase(repository), type: "archive_room", roomId: directRoom.id, archived: true })).toThrow("Agent 单聊不能修改成员、名称或归档状态");
+    expect(() => repository.executeCommand({ ...commandBase(repository), type: "add_agent", roomId: directRoom.id, agentId: "builder" })).toThrow("Agent 单聊不能修改成员、名称或归档状态");
+    expect(() => repository.executeCommand({ ...commandBase(repository), type: "remove_participant", roomId: directRoom.id, participantId: agentParticipant.id })).toThrow("Agent 单聊不能修改成员、名称或归档状态");
+    expect(() => repository.executeCommand({ ...commandBase(repository), type: "toggle_participant", roomId: directRoom.id, participantId: agentParticipant.id, enabled: false })).toThrow("Agent 单聊不能修改成员、名称或归档状态");
+  }));
+
+  it("旧 rooms 表会在启动时补齐单聊字段与唯一索引", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oceanking-direct-room-migration-"));
+    const legacy = new Database(path.join(dir, "oceanking.db"));
+    legacy.exec("CREATE TABLE rooms (id TEXT PRIMARY KEY, title TEXT NOT NULL, owner_participant_id TEXT, next_seq INTEGER NOT NULL DEFAULT 1, archived_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+    legacy.close();
+
+    const handle = createDatabase(dir);
+    try {
+      const columns = (handle.raw.prepare("PRAGMA table_info(rooms)").all() as Array<{ name: string }>).map((column) => column.name);
+      const indexes = (handle.raw.prepare("PRAGMA index_list(rooms)").all() as Array<{ name: string }>).map((index) => index.name);
+      expect(columns).toEqual(expect.arrayContaining(["kind", "direct_agent_id"]));
+      expect(indexes).toContain("rooms_direct_agent_unique");
+    } finally {
+      handle.raw.close();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("旧默认身份升级为平级描述，同时保留用户自定义身份", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oceanking-agent-migration-"));
     const handle = createDatabase(dir);
@@ -84,6 +140,8 @@ describe("OceanKing 领域仓库", () => {
     await fs.mkdir(customAgentWorkspace, { recursive: true });
     await fs.writeFile(path.join(customAgentWorkspace, "private-note.txt"), "待删除的 Agent 私有文件");
     repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "待删除房间", agentId: "navigator" });
+    repository.executeCommand({ ...commandBase(repository), type: "send_direct_message", agentId: "navigator", content: "需要清空的单聊历史", attachmentIds: [] });
+    expect(repository.getSnapshot().rooms.some((room) => room.kind === "direct")).toBe(true);
     const extraRoom = repository.getSnapshot().rooms.find((room) => room.title === "待删除房间")!;
     const oldMessageCommandId = crypto.randomUUID();
     repository.executeCommand({ commandId: oldMessageCommandId, expectedVersion: repository.getVersion().version, type: "send_message", roomId: "room_harbor", content: "需要被清空的历史", attachmentIds: [] });
@@ -103,7 +161,7 @@ describe("OceanKing 领域仓库", () => {
     const result = repository.executeCommand({ commandId: resetCommandId, expectedVersion: repository.getVersion().version, type: "reset_workspace" });
 
     expect(result.snapshot.rooms).toHaveLength(1);
-    expect(result.snapshot.rooms[0]).toMatchObject({ id: "room_harbor", title: "港湾协作室", archivedAt: null });
+    expect(result.snapshot.rooms[0]).toMatchObject({ id: "room_harbor", title: "港湾协作室", kind: "shared", directAgentId: null, archivedAt: null });
     expect(result.snapshot.rooms[0]?.messages).toEqual([expect.objectContaining({ id: "msg_welcome", seq: 1, source: "system" })]);
     expect(result.snapshot.rooms[0]?.turns).toEqual([]);
     expect(result.snapshot.rooms[0]?.participants.map((participant) => participant.id)).toEqual(["human_local", "participant_navigator_harbor"]);

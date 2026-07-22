@@ -64,6 +64,8 @@ function pendingCreatedRooms(context: ToolContext): Room[] {
     return [{
       id: effect.roomId,
       title: effect.title,
+      kind: "shared" as const,
+      directAgentId: null,
       ownerParticipantId: ownerId,
       participants: [
         { id: ownerId, roomId: effect.roomId, kind: "agent" as const, agentId: context.agent.id, displayName: context.agent.label, enabled: true, sortOrder: 0, createdAt },
@@ -94,9 +96,15 @@ function requireConnectedRoom(context: ToolContext, roomId: string) {
 }
 
 function requireOwnedRoom(context: ToolContext, roomId: string) {
-  const room = requireConnectedRoom(context, roomId);
+  const room = requireSharedRoom(context, roomId);
   const membership = room.participants.find((participant) => participant.agentId === context.agent.id && participant.enabled);
   if (!membership || room.ownerParticipantId !== membership.id) throw new Error("只有 owner Agent 能管理成员");
+  return room;
+}
+
+function requireSharedRoom(context: ToolContext, roomId: string) {
+  const room = requireConnectedRoom(context, roomId);
+  if (room.kind === "direct") throw new Error("Agent 单聊固定为一个用户和一个 Agent，不能修改成员关系");
   return room;
 }
 
@@ -257,7 +265,7 @@ const tools: ToolDefinition[] = [
   {
     name: "invite_agent", description: "向当前 Agent 已连接的房间邀请任意可用 Agent，不要求当前 Agent 是房间 owner。新建房间时优先直接使用 create_room.agentIds。", schema: inviteAgentToolSchema,
     parameters: { type: "object", additionalProperties: false, required: ["roomId", "agentId"], properties: { roomId: { type: "string" }, agentId: { type: "string" } } },
-    execute: async (context, raw) => { const args = inviteAgentToolSchema.parse(raw); requireConnectedRoom(context, args.roomId); if (!hasAvailableAgent(context, args.agentId)) throw new Error("Agent 不存在"); const effect: TurnEffect = { type: "invite_agent", roomId: args.roomId, agentId: args.agentId, participantId: createId("participant") }; return { text: "邀请动作已准备提交", structured: effect, effects: [effect] }; },
+    execute: async (context, raw) => { const args = inviteAgentToolSchema.parse(raw); requireSharedRoom(context, args.roomId); if (!hasAvailableAgent(context, args.agentId)) throw new Error("Agent 不存在"); const effect: TurnEffect = { type: "invite_agent", roomId: args.roomId, agentId: args.agentId, participantId: createId("participant") }; return { text: "邀请动作已准备提交", structured: effect, effects: [effect] }; },
   },
   {
     name: "remove_room_participant", description: "房间 owner 移除一个成员。", schema: z.object({ roomId: z.string(), participantId: z.string() }),
@@ -267,7 +275,7 @@ const tools: ToolDefinition[] = [
   {
     name: "leave_room", description: "当前 Agent 离开指定房间。", schema: z.object({ roomId: z.string() }),
     parameters: { type: "object", additionalProperties: false, required: ["roomId"], properties: { roomId: { type: "string" } } },
-    execute: async (context, raw) => { const args = z.object({ roomId: z.string() }).parse(raw); requireConnectedRoom(context, args.roomId); const participant = context.repository.getRoom(args.roomId)?.participants.find((p) => p.agentId === context.agent.id); if (!participant) throw new Error("成员不存在"); const effect: TurnEffect = { type: "leave_room", roomId: args.roomId, participantId: participant.id }; return { text: "离开动作已准备提交", structured: effect, effects: [effect] }; },
+    execute: async (context, raw) => { const args = z.object({ roomId: z.string() }).parse(raw); requireSharedRoom(context, args.roomId); const participant = context.repository.getRoom(args.roomId)?.participants.find((p) => p.agentId === context.agent.id); if (!participant) throw new Error("成员不存在"); const effect: TurnEffect = { type: "leave_room", roomId: args.roomId, participantId: participant.id }; return { text: "离开动作已准备提交", structured: effect, effects: [effect] }; },
   },
   ...(["list", "read", "write"] as const).map((action): ToolDefinition => ({
     name: `workspace_${action}`, description: `${action === "list" ? "列出" : action === "read" ? "读取" : "写入"} Agent 私有或共享工作区文件。`,

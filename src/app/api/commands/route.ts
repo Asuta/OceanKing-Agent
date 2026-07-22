@@ -54,10 +54,10 @@ export async function POST(request: Request) {
     const repository = getRepository();
     const result = repository.executeCommand(command);
     if (result.stopRoomId) getRoomScheduler().stop(result.stopRoomId);
-    if (result.triggerRoomId) getRoomScheduler().enqueue(result.triggerRoomId, { interruptActive: command.type === "send_message" });
+    if (result.triggerRoomId) getRoomScheduler().enqueue(result.triggerRoomId, { interruptActive: command.type === "send_message" || command.type === "send_direct_message" });
     if (result.refreshCron) getCronDispatcher().refresh();
     if (result.runCronJobId) await getCronDispatcher().runNow(result.runCronJobId);
-    publishWorkspaceEvent(command.type.includes("cron") ? "cron.changed" : "workspace.changed", "roomId" in command ? command.roomId : undefined, { commandId: command.commandId, commandType: command.type });
+    publishWorkspaceEvent(command.type.includes("cron") ? "cron.changed" : "workspace.changed", result.triggerRoomId ?? ("roomId" in command ? command.roomId : undefined), { commandId: command.commandId, commandType: command.type });
     return NextResponse.json({ ok: true, snapshot: repository.getSnapshot() });
   } catch (error) {
     if (error instanceof VersionConflictError) return NextResponse.json({ error: error.message, snapshot: getRepository().getSnapshot() }, { status: 409 });
