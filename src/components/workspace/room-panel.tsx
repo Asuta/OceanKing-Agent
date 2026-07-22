@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Archive, Bot, Check, ChevronDown, ChevronRight, FileText, LoaderCircle, Paperclip, PanelRightOpen, Pencil, Send, Square, UserPlus, X } from "lucide-react";
+import { Archive, Bot, Check, ChevronDown, FileText, LoaderCircle, Paperclip, PanelRightOpen, Pencil, Send, Square, UserPlus, X } from "lucide-react";
 import type { Agent, AgentTurn, Attachment, Room, RoomMessagePreview } from "@/lib/domain/types";
 import type { WorkspaceCommandDraft } from "@/lib/domain/schemas";
-import { mergedAssistantPreview, type ReasoningPreview, type ReasoningPreviewStep } from "@/components/workspace/live-assistant-preview";
+import { mergedAssistantPreview, type ReasoningPreview } from "@/components/workspace/live-assistant-preview";
 import { Markdown } from "@/components/workspace/markdown";
 
 type SendCommand = (draft: WorkspaceCommandDraft) => Promise<boolean>;
@@ -57,57 +57,39 @@ export function RoomTitleEditor({ roomId, title, busy, sendCommand }: { roomId: 
   </form>;
 }
 
-function ReasoningStepPreview({ turnId, preview, index, latest }: { turnId: string; preview: ReasoningPreviewStep; index: number; latest: boolean }) {
-  const [manualOpen, setManualOpen] = useState<boolean | null>(null);
-  const outputRef = useRef<HTMLPreElement>(null);
-  const automaticOpen = latest && preview.status === "streaming";
-  const open = manualOpen ?? automaticOpen;
-  const outputId = `reasoning-${turnId}-${preview.step}`;
-
-  useEffect(() => {
-    const element = outputRef.current;
-    if (open && element) element.scrollTop = element.scrollHeight;
-  }, [open, preview.content]);
-
-  return <section className={`reasoning-preview-step ${preview.status}`}>
-    <button type="button" className="reasoning-preview-toggle" aria-expanded={open} aria-controls={outputId} onClick={() => setManualOpen(!open)}>
-      {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-      <strong>思考步骤 {index + 1}</strong>
-      <span>{latest && preview.status === "streaming" ? "思考中" : "已完成"}</span>
-    </button>
-    {open ? <pre id={outputId} className="reasoning-preview-output" ref={outputRef}>{preview.content}{latest && preview.status === "streaming" ? <span className="stream-cursor" aria-hidden="true" /> : null}</pre> : null}
-  </section>;
+function activityTail(value: string, maxLength = 240): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `…${normalized.slice(-(maxLength - 1)).trimStart()}`;
 }
 
-function PrivateAssistantStatus({ turn, agentLabel, content, reasoning }: { turn: AgentTurn; agentLabel: string; content: string; reasoning?: ReasoningPreview }) {
+function privateActivity(content: string, reasoning: ReasoningPreview | undefined, publicReplyActive: boolean): { phase: string; text: string; singleLine: boolean } {
+  const latestReasoning = reasoning?.steps.at(-1)?.content ?? "";
+  if (reasoning?.phase === "thinking") return { phase: "思考中", text: activityTail(latestReasoning) || "正在思考…", singleLine: false };
+  if (reasoning?.phase === "working") return { phase: "执行中", text: "正在处理工具结果…", singleLine: true };
+  if (publicReplyActive) return { phase: "生成中", text: "正在生成公开回复…", singleLine: true };
+  if (reasoning?.phase === "answering") return { phase: "组织中", text: activityTail(content) || "正在生成正文…", singleLine: false };
+  if (content) return { phase: "私有执行中", text: activityTail(content), singleLine: false };
+  return { phase: "私有执行中", text: "正在等待 Assistant 输出…", singleLine: true };
+}
+
+function PrivateAssistantStatus({ turn, agentLabel, content, reasoning, publicReplyActive }: { turn: AgentTurn; agentLabel: string; content: string; reasoning?: ReasoningPreview; publicReplyActive: boolean }) {
   const outputRef = useRef<HTMLDivElement>(null);
-  const reasoningSteps = reasoning?.steps ?? [];
-  const phase = reasoning?.phase === "thinking" ? "思考中" : reasoning?.phase === "answering" ? "生成回复中" : "私有执行中";
-  const emptyStatus = reasoning?.phase === "thinking"
-    ? "正在思考，尚未生成正文…"
-    : reasoning?.phase === "answering"
-      ? "正在生成正文…"
-      : reasoning?.phase === "working"
-        ? "正在继续执行…"
-        : "正在等待 Assistant 输出…";
+  const activity = privateActivity(content, reasoning, publicReplyActive);
 
   useEffect(() => {
     const element = outputRef.current;
     if (element) element.scrollTop = element.scrollHeight;
-  }, [content]);
+  }, [activity.text]);
 
   return <article className="message from-agent private-status-message" aria-live="polite" aria-label={`${agentLabel} 私有执行状态`} data-turn-id={turn.id}>
     <div className="message-avatar"><LoaderCircle className="spin" size={16} /></div>
     <div className="message-body">
-      <div className="message-meta"><strong>{agentLabel}</strong><span>{phase}</span><em>临时状态</em></div>
+      <div className="message-meta"><strong>{agentLabel}</strong><span>{activity.phase}</span><em>临时状态</em></div>
       <div className="message-content private-status-content">
-        {reasoningSteps.length ? <div className="reasoning-preview-list" aria-label="实时思考过程">
-          {reasoningSteps.map((preview, index) => <ReasoningStepPreview key={preview.step} turnId={turn.id} preview={preview} index={index} latest={index === reasoningSteps.length - 1} />)}
-        </div> : null}
-        <div className="private-status-output" ref={outputRef}>
-          {content ? <><Markdown>{content}</Markdown><span className="stream-cursor" aria-hidden="true" /></> : <p className="private-status-empty">{emptyStatus}</p>}
+        <div className={`private-status-output${activity.singleLine ? " single-line" : ""}`} ref={outputRef}>
+          <span>{activity.text}</span><span className="stream-cursor" aria-hidden="true" />
         </div>
-        <small>仅用于展示当前进度，不写入房间历史</small>
       </div>
     </div>
   </article>;
@@ -122,9 +104,10 @@ export function RoomPanel({ room, agents, previews, assistantPreviews, reasoning
   const followLatestRef = useRef(false);
   const availableAgents = agents.filter((agent) => !room.participants.some((participant) => participant.agentId === agent.id));
   const visiblePreviews = previews.filter((preview) => preview.roomId === room.id && !room.messages.some((message) => message.messageKey === preview.messageKey));
+  const publiclyStreamingTurnIds = new Set(visiblePreviews.map((preview) => preview.turnId));
   const runningTurns = room.turns.filter((turn) => turn.status === "running");
   const privateStatuses = runningTurns
-    .map((turn) => ({ turn, content: mergedAssistantPreview(turn.assistantContent, assistantPreviews[turn.id]), reasoning: reasoningPreviews[turn.id] }));
+    .map((turn) => ({ turn, content: mergedAssistantPreview(turn.assistantContent, assistantPreviews[turn.id]), reasoning: reasoningPreviews[turn.id], publicReplyActive: publiclyStreamingTurnIds.has(turn.id) }));
   const previewLength = visiblePreviews.reduce((total, preview) => total + preview.content.length, 0)
     + privateStatuses.reduce((total, status) => total + status.content.length + (status.reasoning?.steps.reduce((length, step) => length + step.content.length, 0) ?? 0), 0);
 
@@ -175,7 +158,7 @@ export function RoomPanel({ room, agents, previews, assistantPreviews, reasoning
         <div className="message-avatar"><Bot size={16} /></div>
         <div className="message-body"><div className="message-meta"><strong>{agents.find((agent) => agent.id === preview.agentId)?.label ?? "Agent"}</strong><span>生成中</span><em>{messageKindLabel(preview.kind)}</em></div><div className="message-content streaming-content"><span>{preview.content}</span><span className="stream-cursor" aria-hidden="true" /></div></div>
       </article>)}
-      {privateStatuses.map(({ turn, content: privateContent, reasoning }) => <PrivateAssistantStatus key={turn.id} turn={turn} agentLabel={agents.find((agent) => agent.id === turn.agentId)?.label ?? room.participants.find((participant) => participant.id === turn.agentParticipantId)?.displayName ?? "Agent"} content={privateContent} reasoning={reasoning} />)}
+      {privateStatuses.map(({ turn, content: privateContent, reasoning, publicReplyActive }) => <PrivateAssistantStatus key={turn.id} turn={turn} agentLabel={agents.find((agent) => agent.id === turn.agentId)?.label ?? room.participants.find((participant) => participant.id === turn.agentParticipantId)?.displayName ?? "Agent"} content={privateContent} reasoning={reasoning} publicReplyActive={publicReplyActive} />)}
       {room.scheduler.status === "running" && !runningTurns.length ? <div className="agent-working"><LoaderCircle className="spin" size={15} /><span>{room.participants.find((participant) => participant.id === room.scheduler.activeParticipantId)?.displayName ?? "Agent"} 正在私有执行区工作</span><small>正在等待执行状态同步</small></div> : null}
     </div>
 

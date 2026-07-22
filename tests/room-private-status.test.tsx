@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Agent, AgentTurn, Room, RoomMessagePreview } from "@/lib/domain/types";
 import type { ReasoningPreview } from "@/components/workspace/live-assistant-preview";
@@ -76,7 +76,7 @@ describe("房间私有 Assistant 临时状态", () => {
     const status = screen.getByLabelText("领航员 私有执行状态");
     expect(status.textContent).toContain("已经分析，正在查询资料");
     expect(status.textContent?.match(/已经分析/g)).toHaveLength(1);
-    expect(status.textContent).toContain("不写入房间历史");
+    expect(status.textContent).toContain("临时状态");
 
     const output = status.querySelector(".private-status-output") as HTMLDivElement;
     Object.defineProperty(output, "scrollHeight", { configurable: true, value: 420 });
@@ -86,30 +86,27 @@ describe("房间私有 Assistant 临时状态", () => {
     expect(status.textContent).toContain("并整理结果");
   });
 
-  it("思考时自动展开，正文开始后自动收起，并尊重手动展开", () => {
+  it("思考与临时正文只显示当前最新活动且没有步骤展开入口", () => {
     const room = createRoom("room_a", [createTurn("turn_a", "room_a", "navigator", "")]);
-    const thinking: ReasoningPreview = { steps: [{ step: 0, content: "正在分析上下文", status: "streaming" }], phase: "thinking" };
+    const thinking: ReasoningPreview = { steps: [
+      { step: 0, content: "已经完成的旧思考", status: "completed" },
+      { step: 1, content: "正在分析最新上下文", status: "streaming" },
+    ], phase: "thinking" };
     const { rerender } = render(panel(room, {}, [], { turn_a: thinking }));
 
-    const toggle = screen.getByRole("button", { name: /思考步骤 1/ });
-    expect(toggle.getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByText(/正在分析上下文/)).toBeTruthy();
-    expect(screen.getAllByText("思考中")).toHaveLength(2);
+    const status = screen.getByLabelText("领航员 私有执行状态");
+    expect(status.textContent).toContain("正在分析最新上下文");
+    expect(status.textContent).not.toContain("已经完成的旧思考");
+    expect(screen.queryByRole("button", { name: /思考步骤/ })).toBeNull();
 
-    const answering: ReasoningPreview = { steps: [{ step: 0, content: "正在分析上下文", status: "answer_started" }], phase: "answering" };
+    const answering: ReasoningPreview = { steps: thinking.steps.map((step) => ({ ...step, status: "answer_started" as const })), phase: "answering" };
     rerender(panel(room, { turn_a: "开始生成正文" }, [], { turn_a: answering }));
-    expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(screen.queryByText(/正在分析上下文/)).toBeNull();
-    expect(screen.getByText("生成回复中")).toBeTruthy();
-
-    fireEvent.click(toggle);
-    expect(toggle.getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByText(/正在分析上下文/)).toBeTruthy();
-    rerender(panel(room, { turn_a: "开始生成正文，继续更新" }, [], { turn_a: { steps: [{ ...answering.steps[0]!, status: "completed" }], phase: "working" } }));
-    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(status.textContent).toContain("开始生成正文");
+    expect(status.textContent).not.toContain("正在分析最新上下文");
+    expect(screen.getByText("组织中")).toBeTruthy();
   });
 
-  it("多次工具续轮将旧思考步骤收起并自动展开最新步骤", () => {
+  it("多次工具续轮只展示最新思考步骤的内容", () => {
     const room = createRoom("room_a", [createTurn("turn_a", "room_a", "navigator", "")]);
     const reasoning: ReasoningPreview = { steps: [
       { step: 0, content: "第一次思考", status: "completed" },
@@ -117,11 +114,29 @@ describe("房间私有 Assistant 临时状态", () => {
     ], phase: "thinking" };
     render(panel(room, {}, [], { turn_a: reasoning }));
 
-    const toggles = screen.getAllByRole("button", { name: /思考步骤/ });
-    expect(toggles[0]?.getAttribute("aria-expanded")).toBe("false");
-    expect(toggles[1]?.getAttribute("aria-expanded")).toBe("true");
-    expect(screen.queryByText(/第一次思考/)).toBeNull();
-    expect(screen.getByText(/工具返回后的第二次思考/)).toBeTruthy();
+    const status = screen.getByLabelText("领航员 私有执行状态");
+    expect(status.textContent).not.toContain("第一次思考");
+    expect(status.textContent).toContain("工具返回后的第二次思考");
+  });
+
+  it("长活动文本只保留最新尾部片段", () => {
+    const room = createRoom("room_a", [createTurn("turn_a", "room_a", "navigator", "")]);
+    const longReasoning = `最早内容${"旧内容".repeat(100)}最新结论正在生成`;
+    render(panel(room, {}, [], { turn_a: { steps: [{ step: 0, content: longReasoning, status: "streaming" }], phase: "thinking" } }));
+
+    const status = screen.getByLabelText("领航员 私有执行状态");
+    expect(status.textContent).not.toContain("最早内容");
+    expect(status.textContent).toContain("最新结论正在生成");
+  });
+
+  it("工具处理阶段隐藏旧文本并显示单行状态", () => {
+    const room = createRoom("room_a", [createTurn("turn_a", "room_a", "navigator", "上一阶段正文")]);
+    render(panel(room, { turn_a: "上一阶段正文" }, [], { turn_a: { steps: [{ step: 0, content: "上一阶段思考", status: "completed" }], phase: "working" } }));
+
+    const status = screen.getByLabelText("领航员 私有执行状态");
+    expect(status.textContent).toContain("正在处理工具结果…");
+    expect(status.textContent).not.toContain("上一阶段正文");
+    expect(status.querySelector(".private-status-output")?.classList.contains("single-line")).toBe(true);
   });
 
   it("分别归属并展示多个房间的运行状态", () => {
@@ -134,28 +149,32 @@ describe("房间私有 Assistant 临时状态", () => {
     };
     const { rerender } = render(panel(roomA, assistantPreviews, [], reasoningPreviews));
 
-    expect(screen.getByLabelText("领航员 私有执行状态").textContent).toContain("只属于房间 A");
+    expect(screen.getByLabelText("领航员 私有执行状态").textContent).toContain("房间 A 的思考");
+    expect(screen.getByLabelText("领航员 私有执行状态").textContent).not.toContain("只属于房间 A");
     expect(screen.queryByText("只属于房间 B")).toBeNull();
     expect(screen.getByText(/房间 A 的思考/)).toBeTruthy();
     expect(screen.queryByText(/房间 B 的思考/)).toBeNull();
 
     rerender(panel(roomB, assistantPreviews, [], reasoningPreviews));
-    expect(screen.getByLabelText("执行者 私有执行状态").textContent).toContain("只属于房间 B");
+    expect(screen.getByLabelText("执行者 私有执行状态").textContent).toContain("房间 B 的思考");
+    expect(screen.getByLabelText("执行者 私有执行状态").textContent).not.toContain("只属于房间 B");
     expect(screen.queryByText("只属于房间 A")).toBeNull();
     expect(screen.getByText(/房间 B 的思考/)).toBeTruthy();
     expect(screen.queryByText(/房间 A 的思考/)).toBeNull();
   });
 
-  it("正式公开流开始后保留同一 Turn 的临时卡片并收起当前思考", () => {
+  it("正式公开流开始后将同一 Turn 的临时卡片缩成一行", () => {
     const room = createRoom("room_a", [createTurn("turn_a", "room_a", "navigator", "私有准备内容")]);
     const publicPreview: RoomMessagePreview = { turnId: "turn_a", roomId: "room_a", agentId: "navigator", messageKey: "public_a", content: "正式公开内容", kind: "notify" };
     const answering: ReasoningPreview = { steps: [{ step: 0, content: "公开正文前的思考", status: "answer_started" }], phase: "answering" };
     const { rerender } = render(panel(room, { turn_a: "私有准备内容仍在生成" }, [publicPreview], { turn_a: answering }));
 
-    expect(screen.getByLabelText("领航员 私有执行状态").textContent).toContain("私有准备内容仍在生成");
+    const privateStatus = screen.getByLabelText("领航员 私有执行状态");
+    expect(privateStatus.textContent).toContain("正在生成公开回复…");
+    expect(privateStatus.textContent).not.toContain("私有准备内容仍在生成");
+    expect(privateStatus.querySelector(".private-status-output")?.classList.contains("single-line")).toBe(true);
     expect(screen.getByLabelText("Agent 正在生成公开回复").textContent).toContain("正式公开内容");
     expect(screen.getByLabelText("Agent 正在生成公开回复").textContent).toContain("过程");
-    expect(screen.getByRole("button", { name: /思考步骤 1/ }).getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByText(/公开正文前的思考/)).toBeNull();
 
     rerender(panel(room, { turn_a: "私有准备内容仍在生成" }, [{ ...publicPreview, kind: "handoff" }], { turn_a: answering }));
@@ -166,8 +185,8 @@ describe("房间私有 Assistant 临时状态", () => {
       { step: 1, content: "进度消息后的新思考", status: "streaming" },
     ], phase: "thinking" };
     rerender(panel(room, { turn_a: "私有准备内容仍在生成" }, [publicPreview], { turn_a: resumed }));
-    expect(screen.getByRole("button", { name: /思考步骤 2/ }).getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByText(/进度消息后的新思考/)).toBeTruthy();
+    expect(privateStatus.textContent).toContain("进度消息后的新思考");
+    expect(privateStatus.querySelector(".private-status-output")?.classList.contains("single-line")).toBe(false);
   });
 
   it("Turn 仍在运行时不因已经提交过公开消息而隐藏临时状态", () => {
@@ -175,8 +194,9 @@ describe("房间私有 Assistant 临时状态", () => {
     turn.emittedMessageIds = ["message_public"];
     render(panel(createRoom("room_a", [turn]), { turn_a: "提交后继续生成的私有内容" }, [], { turn_a: { steps: [{ step: 1, content: "提交后的后续思考", status: "streaming" }], phase: "thinking" } }));
 
-    expect(screen.getByLabelText("领航员 私有执行状态").textContent).toContain("提交后继续生成的私有内容");
-    expect(screen.getByText(/提交后的后续思考/)).toBeTruthy();
+    const status = screen.getByLabelText("领航员 私有执行状态");
+    expect(status.textContent).toContain("提交后的后续思考");
+    expect(status.textContent).not.toContain("提交后继续生成的私有内容");
   });
 
   it("向其他房间发送公开消息时仍保留源房间的思考状态", () => {
