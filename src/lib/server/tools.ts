@@ -7,6 +7,7 @@ import { publicAgentMessageKinds, type Agent, type CronJob, type Room, type Sche
 import { beginMessageToolSchema, readNoReplyToolSchema, sendMessageToolSchema } from "@/lib/domain/schemas";
 import { WorkspaceRepository } from "@/lib/server/repository";
 import { extractWebContent, isSupportedWebContentType, limitWebContentTokens, readLimitedResponseText } from "@/lib/server/web-content";
+import { formatWebSearchResponse, runWebSearch, webSearchSchema } from "@/lib/server/web-search";
 import { createId, nowIso } from "@/lib/utils/id";
 
 export type ToolContext = {
@@ -237,6 +238,11 @@ const tools: ToolDefinition[] = [
     name: "shell", description: "在本机 PowerShell 中执行命令。继承 OceanKing 进程权限，可访问整个磁盘且不进行高危审批。", schema: z.object({ command: z.string().min(1).max(100_000) }),
     parameters: { type: "object", additionalProperties: false, required: ["command"], properties: { command: { type: "string" } } },
     execute: async (context, raw) => { const { command } = z.object({ command: z.string().min(1).max(100_000) }).parse(raw); const result = await runShell(command, context.signal); const text = [result.stdout, result.stderr].filter(Boolean).join("\n"); return noEffects(text || `进程退出码 ${result.exitCode}`, result); },
+  },
+  {
+    name: "web_search", description: "零配置查找公开网页或新闻，返回标题、URL、来源、发布时间和摘要；如配置 Brave Search 会自动使用更可靠的正式 API。联网检索必须优先使用此工具发现来源，再用 web_fetch 阅读具体页面；不要用 shell 抓取搜索引擎结果页。", schema: webSearchSchema,
+    parameters: { type: "object", additionalProperties: false, required: ["query"], properties: { query: { type: "string", description: "搜索词，最多 400 字符或 50 个单词" }, type: { type: "string", enum: ["web", "news"], description: "普通网页使用 web；时事和最新新闻使用 news" }, freshness: { type: "string", enum: ["any", "day", "week", "month", "year"], description: "结果时间范围" }, count: { type: "integer", minimum: 1, maximum: 10, description: "返回结果数，默认 8" }, country: { type: "string", description: "可选的两位国家代码或 ALL；中文查询默认 CN" }, searchLanguage: { type: "string", description: "可选的搜索语言代码；中文查询默认 zh-hans" } } },
+    execute: async (context, raw) => { const args = webSearchSchema.parse(raw); const result = await runWebSearch(args, context.signal); return noEffects(formatWebSearchResponse(result), result); },
   },
   {
     name: "web_fetch", description: "抓取公开 HTTP/HTTPS 页面文本；HTML 会提取正文并限制返回长度，拒绝本机、内网与二进制内容。", schema: z.object({ url: z.string().url() }),

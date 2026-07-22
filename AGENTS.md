@@ -36,6 +36,7 @@ Public Agent messages have only two protocol kinds: `notify` is a process update
 ## Global Model Configuration
 
 - The server natively reads `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_MODELS`, and `OPENAI_API_FORMAT` from `process.env`; a repository-root `.env.local` is only one way to populate them.
+- The model-visible `web_search` tool works without configuration through public search sources (DuckDuckGo for webpages, Google News RSS for news, with Bing RSS as a webpage fallback). If `BRAVE_SEARCH_API_KEY` is present in `process.env`, it automatically upgrades to Brave Search; the optional key is never persisted in SQLite. Restart OceanKing after adding or changing it.
 - On Windows, share model configuration across Git worktrees by storing these variables as user-scoped environment variables, for example with `[Environment]::SetEnvironmentVariable("OPENAI_API_KEY", "<secret>", "User")`. Do not add a repository-specific loader for `%USERPROFILE%\.oceanking\config.env`; OceanKing does not natively read that file.
 - Restart the terminal or host application and the OceanKing server after changing user-scoped variables. Existing processes retain the environment captured when they started.
 - Never record real keys or private values in this file, Git, shell history, logs, tests, or screenshots.
