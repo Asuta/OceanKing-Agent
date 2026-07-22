@@ -47,7 +47,7 @@ describe("OceanKing 领域仓库", () => {
     }
   });
 
-  it("重置工作台会清空全部历史并只重建初始房间，同时保留 Agent 与模型思考配置", async () => withRepository(async (repository) => {
+  it("重置工作台会清空全部历史和新建 Agent，只保留初始 Agent、房间与模型思考配置", async () => withRepository(async (repository) => {
     const initialSettings = repository.getSnapshot().settings;
     repository.executeCommand({
       ...commandBase(repository), type: "update_settings", model: initialSettings.model, availableModels: initialSettings.availableModels,
@@ -56,6 +56,9 @@ describe("OceanKing 领域仓库", () => {
     });
     repository.executeCommand({ ...commandBase(repository), type: "create_agent", label: "审计 Agent", summary: "确认保留注册表", instruction: "执行审计" });
     const customAgentId = repository.getSnapshot().agents.find((agent) => agent.label === "审计 Agent")!.id;
+    const customAgentWorkspace = path.join(repository.dataDir, "workspaces", "agents", customAgentId);
+    await fs.mkdir(customAgentWorkspace, { recursive: true });
+    await fs.writeFile(path.join(customAgentWorkspace, "private-note.txt"), "待删除的 Agent 私有文件");
     repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "待删除房间", agentId: "navigator" });
     const extraRoom = repository.getSnapshot().rooms.find((room) => room.title === "待删除房间")!;
     const oldMessageCommandId = crypto.randomUUID();
@@ -81,17 +84,21 @@ describe("OceanKing 领域仓库", () => {
     expect(result.snapshot.rooms[0]?.turns).toEqual([]);
     expect(result.snapshot.rooms[0]?.participants.map((participant) => participant.id)).toEqual(["human_local", "participant_navigator_harbor"]);
     expect(result.snapshot.cronJobs).toEqual([]); expect(result.snapshot.cronRuns).toEqual([]);
-    expect(result.snapshot.agents.some((agent) => agent.id === customAgentId)).toBe(true);
+    expect(result.snapshot.agents.map((agent) => agent.id)).toEqual(["navigator", "builder"]);
+    expect(result.snapshot.agents.some((agent) => agent.id === customAgentId)).toBe(false);
     expect(result.snapshot.settings).toMatchObject({ thinkingMode: "enabled", reasoningEffort: "max", model: initialSettings.model });
     expect((repository.raw.prepare("SELECT settings_json FROM workspace_meta WHERE id=1").get() as { settings_json: string }).settings_json).toBe(settingsJsonBefore);
     expect((repository.raw.prepare("SELECT COUNT(*) count FROM agent_sessions WHERE history_json<>'[]' OR active_turn_id IS NOT NULL").get() as { count: number }).count).toBe(0);
+    expect((repository.raw.prepare("SELECT COUNT(*) count FROM agent_sessions").get() as { count: number }).count).toBe(2);
     expect((repository.raw.prepare("SELECT COUNT(*) count FROM attachments").get() as { count: number }).count).toBe(0);
     expect((repository.raw.prepare("SELECT COUNT(*) count FROM command_dedup").get() as { count: number }).count).toBe(dedupCountBefore + 1);
     expect(repository.hasProcessedCommand(resetCommandId)).toBe(true);
     expect(repository.hasProcessedCommand(oldMessageCommandId)).toBe(true);
     expect(repository.getRoomIds()).toEqual(["room_harbor"]);
     expect(repository.getAgentConversation("navigator")?.turns).toEqual([]);
+    expect(repository.getAgentConversation(customAgentId)).toBeNull();
     await expect(fs.stat(attachmentPath)).rejects.toThrow();
+    await expect(fs.stat(customAgentWorkspace)).rejects.toThrow();
 
     const replayedMessage = repository.executeCommand({ commandId: oldMessageCommandId, expectedVersion: -1, type: "send_message", roomId: "room_harbor", content: "旧命令不应复活", attachmentIds: [] });
     expect(replayedMessage.snapshot.rooms[0]?.messages).toHaveLength(1);

@@ -80,9 +80,10 @@ describe("工作台设置", () => {
     render(<SettingsDialog snapshot={snapshot} busy={false} sendCommand={sendCommand} onReset={onReset} onClose={onClose} />);
 
     fireEvent.click(screen.getByRole("button", { name: "数据重置" }));
-    expect(screen.getByText("Agent 注册信息、全局模型、思考模式和思考强度保持不变。")).toBeTruthy();
+    expect(screen.getByText("只保留最初的“领航员”和“执行者”；全局模型、思考模式和思考强度保持不变。")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "重置工作台" }));
     expect(screen.getByRole("alert").textContent).toContain("不可撤销");
+    expect(screen.getByRole("alert").textContent).toContain("运行期创建的 Agent 及其私有工作区也会删除");
     expect(sendCommand).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "确认重置全部历史" }));

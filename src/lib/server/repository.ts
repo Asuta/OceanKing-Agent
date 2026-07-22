@@ -17,6 +17,12 @@ type Row = Record<string, unknown>;
 
 const peerAgentSummary = "平等参与协作，独立分析、执行任务并公开可靠结论";
 const peerAgentInstruction = "你是 OceanKing 的平级协作 Agent。你与其他 Agent 具有相同的职责和权限：独立分析问题、使用工具执行任务、相互协作，并汇报可验证的可靠结论。需要公开内容时先调用 begin_message_to_room，再在下一次 assistant 回复中输出正文；普通 assistant 文本对人类不可见。";
+const initialAgentIds = ["navigator", "builder"] as const;
+
+type ResetWorkspaceCleanup = {
+  attachmentPaths: string[];
+  removedAgentIds: string[];
+};
 
 const legacyDefaultAgentDescriptions = [
   {
@@ -155,22 +161,30 @@ export class WorkspaceRepository {
       .run("msg_welcome", roomId, 1, "system", "OceanKing", "system", "system", "system", "completed", "房间是公开协作事实；Agent 的思考状态只在执行期间临时展示，工具过程仅出现在右侧 Console。", 1, null, at);
   }
 
-  private resetWorkspaceState(at: string): string[] {
+  private resetWorkspaceState(at: string): ResetWorkspaceCleanup {
     const attachmentPaths = (this.raw.prepare("SELECT storage_path FROM attachments").all() as Row[]).map((row) => str(row.storage_path));
+    const removedAgentIds = (this.raw.prepare("SELECT id FROM agents WHERE id NOT IN (?,?)").all(...initialAgentIds) as Row[]).map((row) => str(row.id));
     this.raw.prepare("DELETE FROM attachments").run();
     this.raw.prepare("DELETE FROM rooms").run();
+    this.raw.prepare("DELETE FROM agents WHERE id NOT IN (?,?)").run(...initialAgentIds);
     this.raw.prepare("UPDATE agent_sessions SET history_json='[]',active_turn_id=NULL,updated_at=?").run(at);
     this.raw.prepare("INSERT OR IGNORE INTO agent_sessions(agent_id,history_json,active_turn_id,updated_at) SELECT id,'[]',NULL,? FROM agents").run(at);
     this.insertInitialRoom(at);
-    return attachmentPaths;
+    return { attachmentPaths, removedAgentIds };
   }
 
-  private removeResetAttachments(storagePaths: string[]): void {
+  private removeResetFiles(cleanup: ResetWorkspaceCleanup): void {
     const uploadsRoot = path.resolve(this.dataDir, "uploads");
-    for (const storagePath of storagePaths) {
+    for (const storagePath of cleanup.attachmentPaths) {
       const target = path.resolve(this.dataDir, storagePath);
       if (!target.startsWith(`${uploadsRoot}${path.sep}`)) continue;
       try { fs.rmSync(target, { force: true }); } catch { /* 数据已清空；磁盘清理失败不回滚已提交的重置。 */ }
+    }
+    const agentWorkspacesRoot = path.resolve(this.dataDir, "workspaces", "agents");
+    for (const agentId of cleanup.removedAgentIds) {
+      const target = path.resolve(agentWorkspacesRoot, agentId);
+      if (!target.startsWith(`${agentWorkspacesRoot}${path.sep}`)) continue;
+      try { fs.rmSync(target, { recursive: true, force: true }); } catch { /* Agent 已删除；磁盘清理失败不回滚已提交的重置。 */ }
     }
   }
 
@@ -287,7 +301,7 @@ export class WorkspaceRepository {
 
   executeCommand(command: WorkspaceCommand): CommandResult {
     const result: Omit<CommandResult, "snapshot"> = {};
-    let resetAttachmentPaths: string[] = [];
+    let resetCleanup: ResetWorkspaceCleanup | null = null;
     const tx = this.raw.transaction(() => {
       const deduped = this.raw.prepare("SELECT 1 found FROM command_dedup WHERE command_id=?").get(command.commandId) as Row | undefined;
       if (deduped) return;
@@ -338,7 +352,7 @@ export class WorkspaceRepository {
         }
         case "delete_cron": this.raw.prepare("DELETE FROM cron_jobs WHERE id=?").run(command.jobId); result.refreshCron = true; break;
         case "run_cron": result.runCronJobId = command.jobId; break;
-        case "reset_workspace": resetAttachmentPaths = this.resetWorkspaceState(at); result.refreshCron = true; break;
+        case "reset_workspace": resetCleanup = this.resetWorkspaceState(at); result.refreshCron = true; break;
         case "update_settings": {
           const currentSettings = this.defaultSettings();
           if (!command.availableModels.includes(command.model)) throw new DomainError("默认模型必须来自全局可选模型列表");
@@ -352,7 +366,7 @@ export class WorkspaceRepository {
       this.bump();
     });
     tx();
-    if (resetAttachmentPaths.length) this.removeResetAttachments(resetAttachmentPaths);
+    if (resetCleanup) this.removeResetFiles(resetCleanup);
     return { ...result, snapshot: this.getSnapshot() };
   }
 

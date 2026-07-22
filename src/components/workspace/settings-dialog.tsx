@@ -13,11 +13,11 @@ const maximumContextThresholdK = 1_000_000 / tokensPerK;
 function ResetWorkspacePanel({ busy, sendCommand, onReset, onClose }: { busy: boolean; sendCommand: SendCommand; onReset: () => void; onClose: () => void }) {
   const [confirming, setConfirming] = useState(false);
   return <div className="reset-workspace-panel">
-    <div className="reset-workspace-heading"><span><RotateCcw size={18} /></span><div><h3>重置到初始状态</h3><p>删除全部房间、房间消息、Agent 对话、Turn、工具记录、Cron 和附件记录，然后重新创建唯一的“港湾协作室”。</p></div></div>
-    <div className="reset-preserved"><CheckCircle2 size={15} /><span>Agent 注册信息、全局模型、思考模式和思考强度保持不变。</span></div>
+    <div className="reset-workspace-heading"><span><RotateCcw size={18} /></span><div><h3>重置到初始状态</h3><p>删除全部房间、房间消息、Agent 对话、Turn、工具记录、Cron、附件记录和运行期创建的 Agent，然后重新创建唯一的“港湾协作室”。</p></div></div>
+    <div className="reset-preserved"><CheckCircle2 size={15} /><span>只保留最初的“领航员”和“执行者”；全局模型、思考模式和思考强度保持不变。</span></div>
     {!confirming
       ? <button className="danger-button" disabled={busy} onClick={() => setConfirming(true)}><RotateCcw size={13} />重置工作台</button>
-      : <div className="reset-confirmation" role="alert"><strong>确定要永久清空当前所有历史吗？</strong><p>此操作不可撤销。重置后只保留一个没有对话历史的初始房间。</p><div><button disabled={busy} onClick={() => setConfirming(false)}>取消</button><button className="danger-button" disabled={busy} onClick={async () => { if (await sendCommand({ type: "reset_workspace" })) { onReset(); onClose(); } }}><RotateCcw size={13} />确认重置全部历史</button></div></div>}
+      : <div className="reset-confirmation" role="alert"><strong>确定要永久清空当前所有历史吗？</strong><p>此操作不可撤销。运行期创建的 Agent 及其私有工作区也会删除；重置后只保留最初两个 Agent 和一个没有对话历史的初始房间。</p><div><button disabled={busy} onClick={() => setConfirming(false)}>取消</button><button className="danger-button" disabled={busy} onClick={async () => { if (await sendCommand({ type: "reset_workspace" })) { onReset(); onClose(); } }}><RotateCcw size={13} />确认重置全部历史</button></div></div>}
   </div>;
 }
 
