@@ -19,6 +19,30 @@ describe("OceanKing 领域仓库", () => {
     expect(snapshot.rooms[0]?.messages[0]?.source).toBe("system");
   }));
 
+  it("房间按最近置顶顺序排列，取消置顶不改变活动时间，归档会清除置顶", async () => withRepository((repository) => {
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "第一房间" });
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "第二房间" });
+    const initial = repository.getSnapshot();
+    const first = initial.rooms.find((room) => room.title === "第一房间")!;
+    const second = initial.rooms.find((room) => room.title === "第二房间")!;
+
+    repository.executeCommand({ ...commandBase(repository), type: "set_room_pinned", roomId: first.id, pinned: true });
+    repository.executeCommand({ ...commandBase(repository), type: "set_room_pinned", roomId: second.id, pinned: true });
+    let rooms = repository.getSnapshot().rooms;
+    expect(rooms.filter((room) => !room.archivedAt).slice(0, 2).map((room) => room.id)).toEqual([second.id, first.id]);
+    expect(rooms.find((room) => room.id === first.id)?.updatedAt).toBe(first.updatedAt);
+
+    repository.executeCommand({ ...commandBase(repository), type: "set_room_pinned", roomId: second.id, pinned: false });
+    rooms = repository.getSnapshot().rooms;
+    expect(rooms.find((room) => room.id === second.id)?.pinnedAt).toBeNull();
+    expect(rooms.find((room) => room.id === second.id)?.updatedAt).toBe(second.updatedAt);
+    expect(rooms.find((room) => !room.archivedAt)?.id).toBe(first.id);
+
+    repository.executeCommand({ ...commandBase(repository), type: "archive_room", roomId: first.id, archived: true });
+    expect(repository.getRoom(first.id)).toMatchObject({ archivedAt: expect.any(String), pinnedAt: null });
+    expect(() => repository.executeCommand({ ...commandBase(repository), type: "set_room_pinned", roomId: first.id, pinned: true })).toThrow("已归档房间不能置顶");
+  }));
+
   it("旧默认身份升级为平级描述，同时保留用户自定义身份", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oceanking-agent-migration-"));
     const handle = createDatabase(dir);
@@ -673,6 +697,19 @@ describe("OceanKing 领域仓库", () => {
       const handle = createDatabase(dir);
       const columns = (handle.raw.prepare("PRAGMA table_info(agent_turns)").all() as Array<{ name: string }>).map((column) => column.name);
       expect(columns).toEqual(expect.arrayContaining(["system_prompt", "conversation_json"]));
+      handle.raw.close();
+    } finally { await fs.rm(dir, { recursive: true, force: true }); }
+  });
+
+  it("旧数据库启动时自动补齐房间置顶字段", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oceanking-room-pin-migration-"));
+    try {
+      const legacy = new Database(path.join(dir, "oceanking.db"));
+      legacy.exec("CREATE TABLE rooms (id TEXT PRIMARY KEY, title TEXT NOT NULL, owner_participant_id TEXT, next_seq INTEGER NOT NULL DEFAULT 1, archived_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+      legacy.close();
+      const handle = createDatabase(dir);
+      const columns = (handle.raw.prepare("PRAGMA table_info(rooms)").all() as Array<{ name: string }>).map((column) => column.name);
+      expect(columns).toContain("pinned_at");
       handle.raw.close();
     } finally { await fs.rm(dir, { recursive: true, force: true }); }
   });

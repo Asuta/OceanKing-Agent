@@ -10,7 +10,7 @@ export const agents = sqliteTable("agents", {
 });
 export const rooms = sqliteTable("rooms", {
   id: text("id").primaryKey(), title: text("title").notNull(), ownerParticipantId: text("owner_participant_id"), nextSeq: integer("next_seq").notNull(),
-  archivedAt: text("archived_at"), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
+  archivedAt: text("archived_at"), pinnedAt: text("pinned_at"), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
 });
 export const participants = sqliteTable("participants", {
   id: text("id").primaryKey(), roomId: text("room_id").notNull(), kind: text("kind").notNull(), agentId: text("agent_id"), displayName: text("display_name").notNull(),

@@ -211,7 +211,7 @@ export class WorkspaceRepository {
     const meta = this.raw.prepare("SELECT * FROM workspace_meta WHERE id=1").get() as Row;
     const settings = normalizeRuntimeSettings(parseJson<Partial<ModelAndRuntimeSettings>>(meta.settings_json, {}));
     const agentRows = this.raw.prepare("SELECT * FROM agents ORDER BY created_at").all() as Row[];
-    const roomRows = this.raw.prepare("SELECT * FROM rooms ORDER BY archived_at IS NOT NULL, updated_at DESC").all() as Row[];
+    const roomRows = this.raw.prepare("SELECT * FROM rooms ORDER BY archived_at IS NOT NULL, pinned_at IS NULL, pinned_at DESC, updated_at DESC").all() as Row[];
     const participantRows = this.raw.prepare("SELECT * FROM participants ORDER BY room_id,sort_order").all() as Row[];
     const messageRows = this.raw.prepare("SELECT * FROM room_messages ORDER BY room_id,seq").all() as Row[];
     const attachmentRows = this.raw.prepare("SELECT * FROM attachments ORDER BY created_at").all() as Row[];
@@ -260,7 +260,7 @@ export class WorkspaceRepository {
       return {
         id: roomId, title: str(row.title), ownerParticipantId: nullableStr(row.owner_participant_id), participants: participants.filter((p) => p.roomId === roomId), messages: messages.filter((m) => m.roomId === roomId),
         turns: turns.filter((turn) => turn.roomId === roomId), scheduler: schedulers.get(roomId) ?? { roomId, status: "idle", nextAgentParticipantId: null, activeParticipantId: null, roundCount: 0, cursorByParticipantId: {}, receiptRevisionByParticipantId: {}, rerunRequested: false },
-        archivedAt: nullableStr(row.archived_at), createdAt: str(row.created_at), updatedAt: str(row.updated_at),
+        archivedAt: nullableStr(row.archived_at), pinnedAt: nullableStr(row.pinned_at), createdAt: str(row.created_at), updatedAt: str(row.updated_at),
       };
     });
     const cronJobs = (this.raw.prepare("SELECT * FROM cron_jobs ORDER BY created_at DESC").all() as Row[]).map((row): CronJob => ({
@@ -320,7 +320,18 @@ export class WorkspaceRepository {
           break;
         }
         case "rename_room": this.requireRoom(command.roomId); this.raw.prepare("UPDATE rooms SET title=?,updated_at=? WHERE id=?").run(command.title, at, command.roomId); break;
-        case "archive_room": this.requireRoom(command.roomId); this.raw.prepare("UPDATE rooms SET archived_at=?,updated_at=? WHERE id=?").run(command.archived ? at : null, at, command.roomId); break;
+        case "archive_room": {
+          this.requireRoom(command.roomId);
+          this.raw.prepare("UPDATE rooms SET archived_at=?,pinned_at=CASE WHEN ?=1 THEN NULL ELSE pinned_at END,updated_at=? WHERE id=?")
+            .run(command.archived ? at : null, command.archived ? 1 : 0, at, command.roomId);
+          break;
+        }
+        case "set_room_pinned": {
+          const room = this.requireRoom(command.roomId);
+          if (command.pinned && nullableStr(room.archived_at)) throw new DomainError("已归档房间不能置顶");
+          this.raw.prepare("UPDATE rooms SET pinned_at=? WHERE id=?").run(command.pinned ? this.nextRoomPinnedAt(at) : null, command.roomId);
+          break;
+        }
         case "send_message": {
           this.requireRoom(command.roomId);
           if (!command.content.trim() && command.attachmentIds.length === 0) throw new DomainError("消息或附件不能为空");
@@ -373,6 +384,13 @@ export class WorkspaceRepository {
   private requireRoom(roomId: string): Row {
     const row = this.raw.prepare("SELECT * FROM rooms WHERE id=?").get(roomId) as Row | undefined;
     if (!row) throw new DomainError("房间不存在"); return row;
+  }
+
+  private nextRoomPinnedAt(at: string): string {
+    const row = this.raw.prepare("SELECT MAX(pinned_at) latest FROM rooms").get() as Row;
+    const latest = nullableStr(row.latest);
+    if (!latest || latest < at) return at;
+    return new Date(Date.parse(latest) + 1).toISOString();
   }
 
   private insertAgent(agent: Pick<Agent, "id" | "label" | "summary" | "instruction">, at: string): void {

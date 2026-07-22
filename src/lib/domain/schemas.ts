@@ -16,6 +16,7 @@ export const workspaceCommandSchema = z.discriminatedUnion("type", [
   z.object({ ...base, type: z.literal("create_room"), title: z.string().trim().min(1).max(120), agentId: z.string().optional() }),
   z.object({ ...base, type: z.literal("rename_room"), roomId: z.string(), title: z.string().trim().min(1).max(120) }),
   z.object({ ...base, type: z.literal("archive_room"), roomId: z.string(), archived: z.boolean() }),
+  z.object({ ...base, type: z.literal("set_room_pinned"), roomId: z.string(), pinned: z.boolean() }),
   z.object({ ...base, type: z.literal("send_message"), roomId: z.string(), content: z.string().max(100_000), attachmentIds: z.array(z.string()).max(12).default([]) }),
   z.object({ ...base, type: z.literal("add_agent"), roomId: z.string(), agentId: z.string() }),
   z.object({ ...base, type: z.literal("remove_participant"), roomId: z.string(), participantId: z.string() }),

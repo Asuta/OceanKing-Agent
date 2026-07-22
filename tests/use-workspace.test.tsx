@@ -64,6 +64,7 @@ const runningSnapshot: WorkspaceSnapshot = {
     }],
     scheduler: { roomId: "room_live", status: "running", nextAgentParticipantId: null, activeParticipantId: "participant_navigator", roundCount: 0, cursorByParticipantId: {}, receiptRevisionByParticipantId: {}, rerunRequested: false },
     archivedAt: null,
+    pinnedAt: null,
     createdAt: "2026-07-17T10:00:00.000Z",
     updatedAt: "2026-07-17T10:00:00.000Z",
   }],

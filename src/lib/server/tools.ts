@@ -74,6 +74,7 @@ function pendingCreatedRooms(context: ToolContext): Room[] {
       turns: [],
       scheduler: { roomId: effect.roomId, status: "idle" as const, nextAgentParticipantId: ownerId, activeParticipantId: null, roundCount: 0, cursorByParticipantId: {}, receiptRevisionByParticipantId: {}, rerunRequested: false },
       archivedAt: null,
+      pinnedAt: null,
       createdAt,
       updatedAt: createdAt,
     }];

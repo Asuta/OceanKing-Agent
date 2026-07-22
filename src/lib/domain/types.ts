@@ -186,6 +186,7 @@ export type Room = {
   turns: AgentTurn[];
   scheduler: SchedulerState;
   archivedAt: string | null;
+  pinnedAt: string | null;
   createdAt: string;
   updatedAt: string;
 };

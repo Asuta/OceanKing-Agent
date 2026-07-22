@@ -57,6 +57,7 @@ function createRoom(id: string, turns: AgentTurn[]): Room {
     turns,
     scheduler: { roomId: id, status: turns.some((turn) => turn.status === "running") ? "running" : "idle", nextAgentParticipantId: null, activeParticipantId: turns.find((turn) => turn.status === "running")?.agentParticipantId ?? null, roundCount: 0, cursorByParticipantId: {}, receiptRevisionByParticipantId: {}, rerunRequested: false },
     archivedAt: null,
+    pinnedAt: null,
     createdAt,
     updatedAt: createdAt,
   };
