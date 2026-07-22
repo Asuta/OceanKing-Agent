@@ -189,7 +189,9 @@ describe("OpenAI 兼容协议", () => {
     const bodies: Array<{ messages: Array<{ role: string; content?: string }> }> = [];
     let currentMessageId = "";
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      bodies.push(JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content?: string }> });
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content?: string }> };
+      bodies.push(body);
+      if (body.messages.at(-1)?.content?.includes("[系统已读不回已记录]")) return sse(["[DONE]"]);
       return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: `call_read_${bodies.length}`, function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: currentMessageId }) } }] } }] }, "[DONE]"]);
     }));
     const base = repository.getAgent("navigator")!;
@@ -204,12 +206,134 @@ describe("OpenAI 兼容协议", () => {
     repository.beginTurn({ turnId: "turn_cache_prefix_2", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet: secondPacket });
     await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet: secondPacket, turnId: "turn_cache_prefix_2", signal: new AbortController().signal });
 
-    expect(bodies).toHaveLength(2);
-    expect(bodies[1]?.messages.slice(0, bodies[0]!.messages.length)).toEqual(bodies[0]?.messages);
+    expect(bodies).toHaveLength(4);
+    expect(bodies[2]?.messages.slice(0, bodies[0]!.messages.length)).toEqual(bodies[0]?.messages);
     expect(bodies[0]?.messages[0]?.content).not.toContain(firstPacket.targetMessageId);
-    expect(bodies[1]?.messages[0]?.content).not.toContain(secondPacket.targetMessageId);
+    expect(bodies[2]?.messages[0]?.content).not.toContain(secondPacket.targetMessageId);
     expect(bodies[0]?.messages.at(-1)?.content).toContain(firstPacket.targetMessageId);
-    expect(bodies[1]?.messages.at(-1)?.content).toContain(secondPacket.targetMessageId);
+    expect(bodies[2]?.messages.at(-1)?.content).toContain(secondPacket.targetMessageId);
+    expect(bodies[1]?.messages.at(-1)?.content).toContain("[系统已读不回已记录]");
+    expect(bodies[3]?.messages.at(-1)?.content).toContain("[系统已读不回已记录]");
+  }));
+
+  it("Chat 已读不回后可以在同一 Turn 继续向另一个房间发送 handoff", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "已读后继续房间", agentId: "navigator" });
+    const targetRoom = repository.getSnapshot().rooms.find((room) => room.title === "已读后继续房间")!;
+    sendUser(repository, "room_harbor", "这条消息无需回复，但请继续通知另一个房间"); const packet = packetFor(repository);
+    const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read_then_send", function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: packet.targetMessageId }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_send_after_read", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: targetRoom.id, kind: "handoff" }) } }] } }] }, "[DONE]"]);
+      if (call === 3) return sse([{ choices: [{ delta: { content: "已读当前消息后继续发送的跨房间内容。" } }] }, "[DONE]"]);
+      throw new Error("已读和跨房间消息都完成后不应继续调用模型");
+    }));
+    const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    repository.beginTurn({ turnId: "turn_chat_read_then_send", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_chat_read_then_send", signal: new AbortController().signal });
+
+    expect(bodies).toHaveLength(3);
+    expect(JSON.stringify(bodies[1]?.messages)).toContain("[系统已读不回已记录]");
+    expect(result.effects).toEqual([
+      expect.objectContaining({ type: "read_no_reply", roomId: "room_harbor", messageId: packet.targetMessageId }),
+      expect.objectContaining({ type: "send_message", roomId: targetRoom.id, kind: "handoff", content: "已读当前消息后继续发送的跨房间内容。" }),
+    ]);
+  }));
+
+  it("Chat 同一 Turn 连续两次已读不回后仍可向第三个房间发送 handoff", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "第二个待读房间", agentId: "navigator" });
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "连续已读后的发送房间", agentId: "navigator" });
+    const receiptRoom = repository.getSnapshot().rooms.find((room) => room.title === "第二个待读房间")!;
+    const targetRoom = repository.getSnapshot().rooms.find((room) => room.title === "连续已读后的发送房间")!;
+    sendUser(repository, receiptRoom.id, "第二条只需已读的消息");
+    const receiptMessageId = repository.getRoom(receiptRoom.id)!.messages.at(-1)!.id;
+    sendUser(repository, "room_harbor", "第一条只需已读的消息，之后继续处理其他房间"); const packet = packetFor(repository);
+    const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read_first", function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: packet.targetMessageId }) } }] } }] }, "[DONE]"]);
+      if (call === 2) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read_second", function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: receiptRoom.id, messageId: receiptMessageId }) } }] } }] }, "[DONE]"]);
+      if (call === 3) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_send_after_two_reads", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: targetRoom.id, kind: "handoff" }) } }] } }] }, "[DONE]"]);
+      if (call === 4) return sse([{ choices: [{ delta: { content: "连续处理两条已读不回后发送的内容。" } }] }, "[DONE]"]);
+      throw new Error("连续已读和跨房间消息完成后不应继续调用模型");
+    }));
+    const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const } };
+    repository.beginTurn({ turnId: "turn_chat_two_reads_then_send", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_chat_two_reads_then_send", signal: new AbortController().signal });
+
+    expect(bodies).toHaveLength(4);
+    expect(JSON.stringify(bodies[2]?.messages)).toContain("[系统已读不回已记录]");
+    expect(result.effects).toEqual([
+      expect.objectContaining({ type: "read_no_reply", roomId: "room_harbor", messageId: packet.targetMessageId }),
+      expect.objectContaining({ type: "read_no_reply", roomId: receiptRoom.id, messageId: receiptMessageId }),
+      expect.objectContaining({ type: "send_message", roomId: targetRoom.id, kind: "handoff", content: "连续处理两条已读不回后发送的内容。" }),
+    ]);
+  }));
+
+  it("Responses 已读不回后也可以在同一 Turn 继续向另一个房间发送 handoff", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "Responses 已读后继续房间", agentId: "navigator" });
+    const targetRoom = repository.getSnapshot().rooms.find((room) => room.title === "Responses 已读后继续房间")!;
+    sendUser(repository, "room_harbor", "这条消息无需回复，但请继续通知 Responses 房间"); const packet = packetFor(repository);
+    const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) {
+        const item = { id: "item_read_then_send", call_id: "call_read_then_send_responses", type: "function_call", name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: packet.targetMessageId }) };
+        return sse([{ type: "response.output_item.added", item }, { type: "response.output_item.done", item }, { type: "response.completed", response: { id: "resp_read_then_send" } }, "[DONE]"]);
+      }
+      if (call === 2) {
+        const item = { id: "item_send_after_read", call_id: "call_send_after_read_responses", type: "function_call", name: "begin_message_to_room", arguments: JSON.stringify({ roomId: targetRoom.id, kind: "handoff" }) };
+        return sse([{ type: "response.output_item.added", item }, { type: "response.output_item.done", item }, { type: "response.completed", response: { id: "resp_send_after_read" } }, "[DONE]"]);
+      }
+      if (call === 3) return sse([{ type: "response.output_text.delta", delta: "Responses 已读后继续发送的跨房间内容。" }, { type: "response.completed", response: { id: "resp_read_then_send_done" } }, "[DONE]"]);
+      throw new Error("Responses 已读和跨房间消息都完成后不应继续调用模型");
+    }));
+    const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const, thinkingMode: "disabled" as const } };
+    repository.beginTurn({ turnId: "turn_responses_read_then_send", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses_read_then_send", signal: new AbortController().signal });
+
+    expect(bodies).toHaveLength(3);
+    expect(JSON.stringify(bodies[1]?.input)).toContain("[系统已读不回已记录]");
+    expect(result.effects).toEqual([
+      expect.objectContaining({ type: "read_no_reply", roomId: "room_harbor", messageId: packet.targetMessageId }),
+      expect.objectContaining({ type: "send_message", roomId: targetRoom.id, kind: "handoff", content: "Responses 已读后继续发送的跨房间内容。" }),
+    ]);
+  }));
+
+  it("Responses 的 delivery packet 已读不回后仍可在同一 Turn 继续发送 handoff", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "投递包续发房间", agentId: "navigator" });
+    const targetRoom = repository.getSnapshot().rooms.find((room) => room.title === "投递包续发房间")!;
+    sendUser(repository, "room_harbor", "投递恢复时先记录已读，再发送另一项结果");
+    const sourcePacket = packetFor(repository);
+    const packet = { ...sourcePacket, type: "delivery_packet" as const, messages: [], sender: { id: "scheduler:delivery", name: "结果投递恢复器" } };
+    const bodies: Array<Record<string, unknown>> = []; let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(requestBody(init)); call += 1;
+      if (call === 1) {
+        const item = { id: "item_delivery_read", call_id: "call_delivery_read", type: "function_call", name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: packet.targetMessageId }) };
+        return sse([{ type: "response.output_item.added", item }, { type: "response.output_item.done", item }, { type: "response.completed", response: { id: "resp_delivery_read" } }, "[DONE]"]);
+      }
+      if (call === 2) {
+        const item = { id: "item_delivery_send", call_id: "call_delivery_send", type: "function_call", name: "begin_message_to_room", arguments: JSON.stringify({ roomId: targetRoom.id, kind: "handoff" }) };
+        return sse([{ type: "response.output_item.added", item }, { type: "response.output_item.done", item }, { type: "response.completed", response: { id: "resp_delivery_send" } }, "[DONE]"]);
+      }
+      if (call === 3) return sse([{ type: "response.output_text.delta", delta: "投递包已读后继续发送的结果。" }, { type: "response.completed", response: { id: "resp_delivery_done" } }, "[DONE]"]);
+      throw new Error("delivery packet 的已读和发送都完成后不应继续调用模型");
+    }));
+    const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "responses" as const, thinkingMode: "disabled" as const } };
+    repository.beginTurn({ turnId: "turn_responses_delivery_read_then_send", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses_delivery_read_then_send", signal: new AbortController().signal });
+
+    expect(bodies).toHaveLength(3);
+    expect(JSON.stringify(bodies[1]?.input)).toContain("[系统已读不回已记录]");
+    expect(result.effects).toEqual([
+      expect.objectContaining({ type: "read_no_reply", roomId: "room_harbor", messageId: packet.targetMessageId }),
+      expect.objectContaining({ type: "send_message", roomId: targetRoom.id, kind: "handoff", content: "投递包已读后继续发送的结果。" }),
+    ]);
   }));
 
   it("发送新协议请求前把旧公开消息工具转换为普通历史正文", async () => withRepository(async (repository) => {
@@ -225,8 +349,11 @@ describe("OpenAI 兼容协议", () => {
       tools: [], timeline: [], effects: [], modelMeta: {}, cutoffSeq: oldPacket.cutoffSeq, nextParticipantId: null,
     });
     sendUser(repository, "room_harbor", "使用新协议继续"); const packet = packetFor(repository); const requestBodies: Array<Record<string, unknown>> = [];
+    let call = 0;
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       requestBodies.push(requestBody(init));
+      call += 1;
+      if (call > 1) return sse(["[DONE]"]);
       return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read_new", function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: packet.targetMessageId }) } }] } }] }, "[DONE]"]);
     }));
     const base = repository.getAgent("navigator")!; const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const } };
@@ -255,18 +382,20 @@ describe("OpenAI 兼容协议", () => {
       const body = JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }>; tools?: unknown; tool_choice?: string };
       requestBodies.push(body);
       if (requestBodies.length === 1) return sse([{ choices: [{ delta: { content: "用户要求继续旧任务；关键事实必须保留；当前尚未完成。" } }] }, "[DONE]"]);
-      return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_compacted_delivery", function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: packet.targetMessageId }) } }] } }] }, "[DONE]"]);
+      if (requestBodies.length === 2) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_compacted_delivery", function: { name: "read_no_reply", arguments: JSON.stringify({ roomId: "room_harbor", messageId: packet.targetMessageId }) } }] } }] }, "[DONE]"]);
+      return sse(["[DONE]"]);
     }));
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_compacted", signal: new AbortController().signal });
     repository.finishTurn({ turnId: "turn_compacted", assistantContent: result.assistantContent, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: "participant_navigator_harbor" });
-    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies).toHaveLength(3);
     expect(requestBodies[0]?.messages[0]?.content).toContain("OceanKing 多 Agent 工作台");
     expect(requestBodies[0]?.messages.at(-2)?.content).toContain("上下文压缩器");
     expect(requestBodies[0]?.tool_choice).toBe("auto");
     expect(requestBodies[1]?.messages).toHaveLength(2);
     expect(requestBodies[1]?.messages[1]?.content).toContain("用户要求继续旧任务");
+    expect(requestBodies[2]?.messages.at(-1)?.content).toContain("[系统已读不回已记录]");
     expect(result.contextCompaction).toMatchObject({ threshold: 8_000, sourceEntries: 3 });
-    expect((result.modelMeta.modelCalls as Array<{ purpose: string }>).map((call) => call.purpose)).toEqual(["compaction", "generation"]);
+    expect((result.modelMeta.modelCalls as Array<{ purpose: string }>).map((call) => call.purpose)).toEqual(["compaction", "generation", "generation"]);
     const session = repository.getAgentSession("navigator");
     expect(session).toHaveLength(2);
     expect(session[0]?.content).toContain("此前完整 Agent 会话的压缩上下文");
@@ -580,7 +709,7 @@ describe("OpenAI 兼容协议", () => {
     expect(repository.raw.prepare("SELECT target_room_id,awaiting_reply FROM turn_handoffs WHERE source_turn_id='turn_create_and_send'").get()).toEqual({ target_room_id: createdRoomId, awaiting_reply: 1 });
   }));
 
-  it("Chat 在公开正文中切换通道时先提交 handoff 并自动等待", async () => withRepository(async (repository) => {
+  it("Chat 在公开正文中提交 handoff 后可以继续切换到下一个房间", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
     const bodies: Array<Record<string, unknown>> = []; let call = 0; let createdRoomId = "";
     vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -599,10 +728,11 @@ describe("OpenAI 兼容协议", () => {
       }
       if (call === 6) return sse([
         { choices: [{ delta: { content: "请完成协作任务并在完成后回复。" } }] },
-        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_switch_ignored_route", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "notify" }) } }] } }] },
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_switch_final_route", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "handoff" }) } }] } }] },
         "[DONE]",
       ]);
-        throw new Error("handoff 提交后不应继续调用模型");
+      if (call === 7) return sse([{ choices: [{ delta: { content: "协作任务已经分发。" } }] }, "[DONE]"]);
+      throw new Error("最终 handoff 提交后不应继续调用模型");
     }));
 
     sendUser(repository, "room_harbor", "创建协作任务，完成后回来汇报"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
@@ -610,21 +740,73 @@ describe("OpenAI 兼容协议", () => {
     repository.beginTurn({ turnId: "turn_chat_route_switch_await", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_chat_route_switch_await", signal: new AbortController().signal });
 
-    expect(bodies).toHaveLength(6);
+    expect(bodies).toHaveLength(7);
     expect(createdRoomId).not.toBe("");
-    expect(result.awaitingRoomId).toBe(createdRoomId);
+    expect(result.awaitingRoomId).toBeNull();
     expect(result.effects).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "send_message", roomId: "room_harbor", kind: "notify", content: "任务已经启动，完成后再汇报。" }),
       expect.objectContaining({ type: "send_message", roomId: createdRoomId, kind: "handoff", content: "请完成协作任务并在完成后回复。" }),
+      expect.objectContaining({ type: "send_message", roomId: "room_harbor", kind: "handoff", content: "协作任务已经分发。" }),
     ]));
-    expect(result.effects.filter((effect) => effect.type === "send_message" && effect.roomId === "room_harbor")).toHaveLength(2);
-    expect(JSON.stringify(result.auditMessages)).toContain("没有生效；任务恢复后");
+    expect(result.effects.filter((effect) => effect.type === "send_message" && effect.roomId === "room_harbor")).toHaveLength(3);
+    expect(JSON.stringify(result.auditMessages)).not.toContain("没有生效；任务恢复后");
     const applied = repository.finishTurn({ turnId: "turn_chat_route_switch_await", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, awaitingRoomId: result.awaitingRoomId, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
-    expect(applied.unresolvedRoomIds).toContain("room_harbor");
-    expect(repository.raw.prepare("SELECT target_room_id,awaiting_reply FROM turn_handoffs WHERE source_turn_id='turn_chat_route_switch_await'").get()).toEqual({ target_room_id: createdRoomId, awaiting_reply: 1 });
+    expect(applied.unresolvedRoomIds).not.toContain("room_harbor");
+    expect(repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs WHERE source_turn_id='turn_chat_route_switch_await'").get()).toEqual({ count: 0 });
   }));
 
-  it("Responses 在公开正文中切换通道时也会先提交 handoff 并自动等待", async () => withRepository(async (repository) => {
+  it("Chat 同一 Turn 可以向六个房间分别发送 handoff 并全部触发", async () => withRepository(async (repository) => {
+    process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    const targetRoomIds = Array.from({ length: 6 }, (_, index) => `room_multi_handoff_${index + 1}`);
+    sendUser(repository, "room_harbor", "准备六个协作房间"); const setupPacket = packetFor(repository);
+    repository.beginTurn({ turnId: "turn_multi_handoff_setup", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet: setupPacket });
+    repository.finishTurn({
+      turnId: "turn_multi_handoff_setup", assistantContent: "准备完成", tools: [], timeline: [], effects: [
+        ...targetRoomIds.map((roomId, index) => ({ type: "create_room" as const, roomId, title: `协作房间 ${index + 1}`, invitedAgentIds: ["builder"] })),
+        { type: "send_message", roomId: "room_harbor", messageId: "msg_multi_handoff_setup", messageKey: "multi-handoff-setup", content: "准备完成", kind: "handoff" },
+      ], modelMeta: {}, cutoffSeq: setupPacket.cutoffSeq, nextParticipantId: null,
+    });
+
+    let call = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      call += 1;
+      if (call === 1) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_multi_handoff_1", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: targetRoomIds[0], kind: "handoff" }) } }] } }] }, "[DONE]"]);
+      if (call >= 2 && call <= 6) {
+        const currentIndex = call - 2;
+        const nextIndex = currentIndex + 1;
+        return sse([
+          { choices: [{ delta: { content: `独立任务 ${currentIndex + 1}` } }] },
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: `call_multi_handoff_${nextIndex + 1}`, function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: targetRoomIds[nextIndex], kind: "handoff" }) } }] } }] },
+          "[DONE]",
+        ]);
+      }
+      if (call === 7) return sse([
+        { choices: [{ delta: { content: "独立任务 6" } }] },
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_multi_handoff_final", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "handoff" }) } }] } }] },
+        "[DONE]",
+      ]);
+      if (call === 8) return sse([{ choices: [{ delta: { content: "六项独立任务已经全部分发。" } }] }, "[DONE]"]);
+      throw new Error("六个目标房间和来源房间都提交后不应继续调用模型");
+    }));
+
+    sendUser(repository, "room_harbor", "分别向六个房间发送独立任务"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
+    const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const, maxToolSteps: 1 } };
+    repository.beginTurn({ turnId: "turn_multi_handoff", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
+    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_multi_handoff", signal: new AbortController().signal });
+
+    expect(call).toBe(8);
+    expect(result.awaitingRoomId).toBeNull();
+    expect(result.modelMeta.toolSteps).toBe(0);
+    expect(result.effects.filter((effect) => effect.type === "send_message" && targetRoomIds.includes(effect.roomId))).toEqual(
+      targetRoomIds.map((roomId, index) => expect.objectContaining({ type: "send_message", roomId, kind: "handoff", content: `独立任务 ${index + 1}` })),
+    );
+    const applied = repository.finishTurn({ turnId: "turn_multi_handoff", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, awaitingRoomId: result.awaitingRoomId, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+    expect(applied.triggerRoomIds).toEqual(expect.arrayContaining(targetRoomIds));
+    for (const [index, roomId] of targetRoomIds.entries()) expect(repository.getRoom(roomId)?.messages.at(-1)?.content).toBe(`独立任务 ${index + 1}`);
+    expect(repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs WHERE source_turn_id='turn_multi_handoff'").get()).toEqual({ count: 0 });
+  }));
+
+  it("Responses 在公开正文中提交 handoff 后也可以继续切换到下一个房间", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
     const targetRoomId = "room_responses_route_switch";
     sendUser(repository, "room_harbor", "预置 Responses 协作房间"); const setupPacket = packetFor(repository);
@@ -649,10 +831,11 @@ describe("OpenAI 兼容协议", () => {
         return sse([{ type: "response.output_item.added", item }, { type: "response.output_item.done", item }, { type: "response.completed", response: { id: "resp_switch_target" } }, "[DONE]"]);
       }
       if (call === 4) {
-        const item = { id: "item_responses_switch_source", call_id: "call_responses_switch_source", type: "function_call", name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "notify" }) };
+        const item = { id: "item_responses_switch_source", call_id: "call_responses_switch_source", type: "function_call", name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "handoff" }) };
         return sse([{ type: "response.output_text.delta", delta: "请处理任务并回复。" }, { type: "response.output_item.added", item }, { type: "response.output_item.done", item }, { type: "response.completed", response: { id: "resp_switch_source" } }, "[DONE]"]);
       }
-      throw new Error("Responses handoff 提交后不应继续调用模型");
+      if (call === 5) return sse([{ type: "response.output_text.delta", delta: "协作任务已经分发。" }, { type: "response.completed", response: { id: "resp_switch_final" } }, "[DONE]"]);
+      throw new Error("Responses 最终 handoff 提交后不应继续调用模型");
     }));
 
     sendUser(repository, "room_harbor", "通过 Responses 发起协作"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
@@ -660,12 +843,13 @@ describe("OpenAI 兼容协议", () => {
     repository.beginTurn({ turnId: "turn_responses_route_switch", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
     const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_responses_route_switch", signal: new AbortController().signal });
 
-    expect(bodies).toHaveLength(4);
-    expect(result.awaitingRoomId).toBe(targetRoomId);
+    expect(bodies).toHaveLength(5);
+    expect(result.awaitingRoomId).toBeNull();
     expect(result.effects).toContainEqual(expect.objectContaining({ type: "send_message", roomId: targetRoomId, kind: "handoff", content: "请处理任务并回复。" }));
-    expect(JSON.stringify(result.auditMessages)).toContain("没有生效；任务恢复后");
+    expect(result.effects).toContainEqual(expect.objectContaining({ type: "send_message", roomId: "room_harbor", kind: "handoff", content: "协作任务已经分发。" }));
+    expect(JSON.stringify(result.auditMessages)).not.toContain("没有生效；任务恢复后");
     repository.finishTurn({ turnId: "turn_responses_route_switch", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, awaitingRoomId: result.awaitingRoomId, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
-    expect(repository.raw.prepare("SELECT target_room_id,awaiting_reply FROM turn_handoffs WHERE source_turn_id='turn_responses_route_switch'").get()).toEqual({ target_room_id: targetRoomId, awaiting_reply: 1 });
+    expect(repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs WHERE source_turn_id='turn_responses_route_switch'").get()).toEqual({ count: 0 });
   }));
 
   it("同一 Turn 向已有房间邀请 Agent 后发送 handoff 也会自动等待", async () => withRepository(async (repository) => {
@@ -1085,7 +1269,7 @@ describe("OpenAI 兼容协议", () => {
       expect.objectContaining({ role: "tool", tool_call_id: "call_reasoning" }),
       expect.objectContaining({ role: "assistant", content: "推理工具消息" }),
     ]));
-    expect(firstResult.modelMeta).toMatchObject({ toolSteps: 1, reasoningCharacters: 18 });
+    expect(firstResult.modelMeta).toMatchObject({ toolSteps: 0, reasoningCharacters: 18 });
     expect(reasoningEvents).toEqual([
       { step: 0, delta: "需要先公开工具" },
       { step: 1, delta: "工具已经执行，可以结束" },

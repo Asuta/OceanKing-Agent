@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { TurnEffect } from "@/lib/domain/types";
 import { runAgentModel } from "@/lib/server/model-runtime";
 import { eventsAfterId, resetWorkspaceEventHistory } from "@/lib/server/events";
 import { getToolDefinition, listToolDefinitions } from "@/lib/server/tools";
@@ -57,7 +58,7 @@ describe("Agent runtime 与 canonical tools", () => {
 
   it("工具注册表包含房间、工作区、基础与 Cron 能力", () => {
     const names = new Set(listToolDefinitions().map((tool) => tool.name));
-    for (const name of ["begin_message_to_room", "send_message_to_room", "read_no_reply", "list_available_agents", "read_room_history", "workspace_read", "workspace_write", "shell", "web_search", "web_fetch", "create_cron_job"]) expect(names.has(name)).toBe(true);
+    for (const name of ["begin_message_to_room", "send_message_to_room", "read_no_reply", "list_available_agents", "create_agent", "read_room_history", "workspace_read", "workspace_write", "shell", "web_search", "web_fetch", "create_cron_job"]) expect(names.has(name)).toBe(true);
     expect(names.has("continue_task_in_room")).toBe(false);
   });
 
@@ -74,6 +75,95 @@ describe("Agent runtime 与 canonical tools", () => {
       expect.objectContaining({ id: "navigator", label: "领航员", current: true }),
       expect.objectContaining({ id: "builder", label: "执行者", current: false }),
     ]);
+  }));
+
+  it("Agent 创建的新 Agent 可在同一 Turn 加入非 owner 的已连接房间", async () => withRepository(async (repository) => {
+    const packet = packetFor(repository);
+    const agent = repository.getAgent("navigator")!;
+    const context = { agent, roomId: "room_harbor", agentParticipantId: "participant_navigator_harbor", packet, repository, signal: new AbortController().signal };
+    const created = await getToolDefinition("create_agent")!.execute(context, {
+      label: "资料研究员",
+      summary: "负责检索和整理资料",
+      instruction: "独立检索资料并给出来源。",
+    }, "tool_create_agent");
+    const createEffect = created.effects[0];
+    if (!createEffect || createEffect.type !== "create_agent") throw new Error("create_agent 未返回预期 effect");
+    expect(repository.hasAgent(createEffect.agentId)).toBe(false);
+
+    const pendingContext = { ...context, pendingEffects: created.effects };
+    const listed = await getToolDefinition("list_available_agents")!.execute(pendingContext, {}, "tool_list_pending_agent");
+    expect(listed.structured).toContainEqual(expect.objectContaining({ id: createEffect.agentId, label: "资料研究员", pending: true }));
+    const invited = await getToolDefinition("invite_agent")!.execute(pendingContext, { roomId: "room_harbor", agentId: createEffect.agentId }, "tool_invite_created_agent");
+
+    repository.beginTurn({ turnId: "turn_create_and_invite_agent", roomId: "room_harbor", agentId: agent.id, agentParticipantId: context.agentParticipantId, packet });
+    repository.finishTurn({ turnId: "turn_create_and_invite_agent", assistantContent: "internal", tools: [], timeline: [], effects: [...created.effects, ...invited.effects], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+
+    expect(repository.getAgent(createEffect.agentId)).toMatchObject({
+      label: "资料研究员",
+      summary: "负责检索和整理资料",
+      instruction: "独立检索资料并给出来源。",
+      settings: agent.settings,
+    });
+    expect(repository.getAgentSession(createEffect.agentId)).toEqual([]);
+    expect(repository.getRoom("room_harbor")!.participants.some((participant) => participant.agentId === createEffect.agentId)).toBe(true);
+  }));
+
+  it("Agent 创建的新 Agent 可在同一 Turn 用于创建协作房间", async () => withRepository(async (repository) => {
+    const packet = packetFor(repository);
+    const agent = repository.getAgent("navigator")!;
+    const context = { agent, roomId: "room_harbor", agentParticipantId: "participant_navigator_harbor", packet, repository, signal: new AbortController().signal };
+    const created = await getToolDefinition("create_agent")!.execute(context, {
+      label: "方案评审员",
+      summary: "负责独立评审方案",
+      instruction: "检查方案风险并给出结论。",
+    }, "tool_create_agent_for_room");
+    const createEffect = created.effects[0];
+    if (!createEffect || createEffect.type !== "create_agent") throw new Error("create_agent 未返回预期 effect");
+    const roomResult = await getToolDefinition("create_room")!.execute(
+      { ...context, pendingEffects: created.effects },
+      { title: "方案评审室", agentIds: [createEffect.agentId] },
+      "tool_create_room_with_pending_agent",
+    );
+    const roomEffect = roomResult.effects[0];
+    if (!roomEffect || roomEffect.type !== "create_room") throw new Error("create_room 未返回预期 effect");
+
+    repository.beginTurn({ turnId: "turn_create_agent_room", roomId: "room_harbor", agentId: agent.id, agentParticipantId: context.agentParticipantId, packet });
+    repository.finishTurn({ turnId: "turn_create_agent_room", assistantContent: "internal", tools: [], timeline: [], effects: [...created.effects, ...roomResult.effects], modelMeta: {}, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
+
+    expect(repository.getRoom(roomEffect.roomId)!.participants.filter((participant) => participant.agentId).map((participant) => participant.agentId)).toEqual(["navigator", createEffect.agentId]);
+  }));
+
+  it("每个 Turn 最多创建 16 个 Agent，仓库提交层也执行相同限制", async () => withRepository(async (repository) => {
+    const packet = packetFor(repository);
+    const agent = repository.getAgent("navigator")!;
+    const context = { agent, roomId: "room_harbor", agentParticipantId: "participant_navigator_harbor", packet, repository, signal: new AbortController().signal };
+    const effects: TurnEffect[] = [];
+    for (let index = 0; index < 16; index += 1) {
+      const result = await getToolDefinition("create_agent")!.execute(
+        { ...context, pendingEffects: effects },
+        { label: `临时编组 ${index + 1}`, summary: "执行分配任务", instruction: "完成收到的任务。" },
+        `tool_create_agent_${index}`,
+      );
+      effects.push(...result.effects);
+    }
+    await expect(getToolDefinition("create_agent")!.execute(
+      { ...context, pendingEffects: effects },
+      { label: "超额 Agent", summary: "不应创建", instruction: "不应执行。" },
+      "tool_create_agent_over_limit",
+    )).rejects.toThrow("每个 Turn 最多创建 16 个 Agent");
+
+    repository.beginTurn({ turnId: "turn_create_agent_limit", roomId: "room_harbor", agentId: agent.id, agentParticipantId: context.agentParticipantId, packet });
+    expect(() => repository.finishTurn({
+      turnId: "turn_create_agent_limit",
+      assistantContent: "internal",
+      tools: [],
+      timeline: [],
+      effects: [...effects, { type: "create_agent", agentId: "agent_over_limit", label: "超额 Agent", summary: "不应创建", instruction: "不应执行。" }],
+      modelMeta: {},
+      cutoffSeq: packet.cutoffSeq,
+      nextParticipantId: null,
+    })).toThrow("每个 Turn 最多创建 16 个 Agent");
+    expect(repository.getSnapshot().agents).toHaveLength(2);
   }));
 
   it("创建房间时当前 Agent 自动连接并原子邀请多个 Agent", async () => withRepository(async (repository) => {
@@ -103,7 +193,7 @@ describe("Agent runtime 与 canonical tools", () => {
     expect(repository.getSnapshot().rooms.some((room) => room.title === "无效邀请")).toBe(false);
   }));
 
-  it("owner Agent 可从其他房间上下文继续邀请成员", async () => withRepository(async (repository) => {
+  it("已连接 Agent 可从其他房间上下文继续邀请成员", async () => withRepository(async (repository) => {
     sendUser(repository, "room_harbor", "先创建房间");
     const packet = packetFor(repository);
     const agent = repository.getAgent("navigator")!;

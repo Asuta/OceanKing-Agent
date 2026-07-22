@@ -243,9 +243,12 @@ export type SchedulerPacket = {
   availableAgents: Array<{ id: Id; label: string; summary: string }>;
 };
 
+export const maxAgentsCreatedPerTurn = 16;
+
 export type TurnEffect =
   | { type: "send_message"; roomId: Id; messageId: Id; messageKey: string; content: string; kind: PublicAgentMessageKind }
   | { type: "read_no_reply"; roomId: Id; messageId: Id; receiptId: Id }
+  | { type: "create_agent"; agentId: Id; label: string; summary: string; instruction: string }
   | { type: "create_room"; roomId: Id; title: string; invitedAgentIds: Id[] }
   | { type: "invite_agent"; roomId: Id; agentId: Id; participantId: Id }
   | { type: "remove_participant"; roomId: Id; participantId: Id }

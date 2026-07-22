@@ -3,8 +3,8 @@ import dns from "node:dns/promises";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import { publicAgentMessageKinds, type Agent, type CronJob, type Room, type SchedulerPacket, type ToolExecutionResult, type TurnEffect } from "@/lib/domain/types";
-import { beginMessageToolSchema, readNoReplyToolSchema, sendMessageToolSchema } from "@/lib/domain/schemas";
+import { maxAgentsCreatedPerTurn, publicAgentMessageKinds, type Agent, type CronJob, type Room, type SchedulerPacket, type ToolExecutionResult, type TurnEffect } from "@/lib/domain/types";
+import { agentIdentitySchema, beginMessageToolSchema, readNoReplyToolSchema, sendMessageToolSchema } from "@/lib/domain/schemas";
 import { WorkspaceRepository } from "@/lib/server/repository";
 import { extractWebContent, isSupportedWebContentType, limitWebContentTokens, readLimitedResponseText } from "@/lib/server/web-content";
 import { formatWebSearchResponse, runWebSearch, webSearchSchema } from "@/lib/server/web-search";
@@ -39,15 +39,27 @@ const createRoomToolSchema = z.object({
 
 const inviteAgentToolSchema = z.object({ roomId: z.string().min(1), agentId: z.string().min(1) });
 
+function pendingCreatedAgents(context: ToolContext): Array<Extract<TurnEffect, { type: "create_agent" }>> {
+  return (context.pendingEffects ?? []).filter((effect): effect is Extract<TurnEffect, { type: "create_agent" }> => effect.type === "create_agent");
+}
+
+function hasAvailableAgent(context: ToolContext, agentId: string): boolean {
+  return context.repository.hasAgent(agentId) || pendingCreatedAgents(context).some((effect) => effect.agentId === agentId);
+}
+
 function pendingCreatedRooms(context: ToolContext): Room[] {
   const snapshot = context.repository.getSnapshot();
   const createdAt = context.agent.updatedAt;
+  const agentLabels = new Map([
+    ...snapshot.agents.map((agent) => [agent.id, agent.label] as const),
+    ...pendingCreatedAgents(context).map((effect) => [effect.agentId, effect.label] as const),
+  ]);
   return (context.pendingEffects ?? []).flatMap((effect) => {
     if (effect.type !== "create_room") return [];
     const ownerId = `pending_owner_${effect.roomId}`;
     const invited = effect.invitedAgentIds.flatMap((agentId, index) => {
-      const agent = snapshot.agents.find((entry) => entry.id === agentId);
-      return agent ? [{ id: `pending_agent_${effect.roomId}_${agentId}`, roomId: effect.roomId, kind: "agent" as const, agentId, displayName: agent.label, enabled: true, sortOrder: index + 2, createdAt }] : [];
+      const label = agentLabels.get(agentId);
+      return label ? [{ id: `pending_agent_${effect.roomId}_${agentId}`, roomId: effect.roomId, kind: "agent" as const, agentId, displayName: label, enabled: true, sortOrder: index + 2, createdAt }] : [];
     });
     return [{
       id: effect.roomId,
@@ -137,9 +149,9 @@ async function runShell(command: string, signal: AbortSignal): Promise<{ stdout:
 const tools: ToolDefinition[] = [
   {
     name: "begin_message_to_room",
-    description: "打开一个房间的公开消息通道。调用成功后，后续 assistant 正文会实时显示并正式提交到该房间；一次只打开一个房间。kind=notify 是过程消息，提交后当前 Agent 继续执行且不会触发其他 Agent；kind=handoff 是结束消息，提交后当前 Turn 结束并触发房间中的下一个 Agent。",
+    description: "打开一个房间的公开消息通道。调用成功后，后续 assistant 正文会实时显示并正式提交到该房间；一次只打开一个房间，但同一 Turn 可以依次打开多个房间。kind=notify 是过程消息，提交后当前 Agent 继续执行且不会触发其他 Agent；kind=handoff 是结束消息，提交后触发房间中的下一个 Agent，当前 Turn 仍可继续向其他房间发送 handoff。",
     schema: beginMessageToolSchema,
-    parameters: { type: "object", additionalProperties: false, required: ["roomId", "kind"], properties: { roomId: { type: "string" }, kind: { type: "string", enum: [...publicAgentMessageKinds], description: "notify 继续当前 Turn；handoff 结束当前 Turn并把控制权交给下一个 Agent" } } },
+    parameters: { type: "object", additionalProperties: false, required: ["roomId", "kind"], properties: { roomId: { type: "string" }, kind: { type: "string", enum: [...publicAgentMessageKinds], description: "notify 继续当前 Turn 且不触发 Agent；handoff 触发目标房间的下一个 Agent，当前 Turn 可继续发送更多 handoff" } } },
     execute: async (context, raw, callId, invocationKey) => {
       const args = beginMessageToolSchema.parse(raw); requireConnectedRoom(context, args.roomId);
       const route = { type: "begin_room_message" as const, roomId: args.roomId, kind: args.kind, messageKey: invocationKey ?? callId };
@@ -167,7 +179,7 @@ const tools: ToolDefinition[] = [
     },
   },
   {
-    name: "read_no_reply", description: "明确标记某条参与者消息已读但无需回复，不产生空消息气泡。", schema: readNoReplyToolSchema,
+    name: "read_no_reply", description: "明确标记某条参与者消息已读但无需回复，不产生空消息气泡，也不会结束当前 Turn；如有其他房间需要处理，可以继续发言。", schema: readNoReplyToolSchema,
     parameters: { type: "object", additionalProperties: false, required: ["roomId", "messageId"], properties: { roomId: { type: "string" }, messageId: { type: "string" } } },
     execute: async (context, raw) => {
       const args = readNoReplyToolSchema.parse(raw); const room = requireConnectedRoom(context, args.roomId);
@@ -183,8 +195,42 @@ const tools: ToolDefinition[] = [
   {
     name: "list_available_agents", description: "按需列出可邀请或协作的 Agent 信息卡。", schema: z.object({}), parameters: { type: "object", additionalProperties: false, properties: {} },
     execute: async (context) => {
-      const result = context.repository.getSnapshot().agents.map(({ id, label, summary }) => ({ id, label, summary, current: id === context.agent.id }));
+      const persisted = context.repository.getSnapshot().agents.map(({ id, label, summary }) => ({ id, label, summary, current: id === context.agent.id }));
+      const persistedIds = new Set(persisted.map((agent) => agent.id));
+      const pending = pendingCreatedAgents(context).filter((effect) => !persistedIds.has(effect.agentId)).map((effect) => ({
+        id: effect.agentId,
+        label: effect.label,
+        summary: effect.summary,
+        current: false,
+        pending: true,
+      }));
+      const result = [...persisted, ...pending];
       return noEffects(JSON.stringify(result), result);
+    },
+  },
+  {
+    name: "create_agent",
+    description: `创建一个永久存在的新 Agent，并返回可立即用于 create_room 或 invite_agent 的 Agent ID。创建动作随当前 Turn 原子提交；每个 Turn 最多创建 ${maxAgentsCreatedPerTurn} 个。`,
+    schema: agentIdentitySchema,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["label", "summary", "instruction"],
+      properties: {
+        label: { type: "string", description: "Agent 名称，最多 80 字符" },
+        summary: { type: "string", description: "Agent 简介，最多 300 字符" },
+        instruction: { type: "string", description: "Agent 系统提示词，最多 20000 字符" },
+      },
+    },
+    execute: async (context, raw) => {
+      const args = agentIdentitySchema.parse(raw);
+      if (pendingCreatedAgents(context).length >= maxAgentsCreatedPerTurn) throw new Error(`每个 Turn 最多创建 ${maxAgentsCreatedPerTurn} 个 Agent`);
+      const effect: Extract<TurnEffect, { type: "create_agent" }> = { type: "create_agent", agentId: createId("agent"), ...args };
+      return {
+        text: `Agent ${effect.label} 已加入本轮事务：${effect.agentId}。现在可以立即用该 ID 创建房间或邀请它加入已连接房间；本轮成功后统一提交。`,
+        structured: { id: effect.agentId, label: effect.label, summary: effect.summary },
+        effects: [effect],
+      };
     },
   },
   {
@@ -198,7 +244,7 @@ const tools: ToolDefinition[] = [
     execute: async (context, raw) => {
       const args = createRoomToolSchema.parse(raw);
       const invitedAgentIds = [...new Set(args.agentIds)].filter((agentId) => agentId !== context.agent.id);
-      for (const agentId of invitedAgentIds) if (!context.repository.hasAgent(agentId)) throw new Error(`Agent 不存在：${agentId}`);
+      for (const agentId of invitedAgentIds) if (!hasAvailableAgent(context, agentId)) throw new Error(`Agent 不存在：${agentId}`);
       const effect: TurnEffect = { type: "create_room", roomId: createId("room"), title: args.title, invitedAgentIds };
       return {
         text: `房间 ${effect.roomId} 已加入本轮事务；当前 Agent 将自动成为 owner 并连接${invitedAgentIds.length ? `，同时邀请 ${invitedAgentIds.join("、")}` : ""}。现在可以立即用该 roomId 发送消息；本轮成功后统一提交，失败时不会留下半成品。`,
@@ -208,9 +254,9 @@ const tools: ToolDefinition[] = [
     },
   },
   {
-    name: "invite_agent", description: "向当前 Agent 拥有的已连接房间邀请任意可用 Agent。新建房间时优先直接使用 create_room.agentIds。", schema: inviteAgentToolSchema,
+    name: "invite_agent", description: "向当前 Agent 已连接的房间邀请任意可用 Agent，不要求当前 Agent 是房间 owner。新建房间时优先直接使用 create_room.agentIds。", schema: inviteAgentToolSchema,
     parameters: { type: "object", additionalProperties: false, required: ["roomId", "agentId"], properties: { roomId: { type: "string" }, agentId: { type: "string" } } },
-    execute: async (context, raw) => { const args = inviteAgentToolSchema.parse(raw); requireOwnedRoom(context, args.roomId); if (!context.repository.hasAgent(args.agentId)) throw new Error("Agent 不存在"); const effect: TurnEffect = { type: "invite_agent", roomId: args.roomId, agentId: args.agentId, participantId: createId("participant") }; return { text: "邀请动作已准备提交", structured: effect, effects: [effect] }; },
+    execute: async (context, raw) => { const args = inviteAgentToolSchema.parse(raw); requireConnectedRoom(context, args.roomId); if (!hasAvailableAgent(context, args.agentId)) throw new Error("Agent 不存在"); const effect: TurnEffect = { type: "invite_agent", roomId: args.roomId, agentId: args.agentId, participantId: createId("participant") }; return { text: "邀请动作已准备提交", structured: effect, effects: [effect] }; },
   },
   {
     name: "remove_room_participant", description: "房间 owner 移除一个成员。", schema: z.object({ roomId: z.string(), participantId: z.string() }),

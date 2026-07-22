@@ -6,6 +6,12 @@ const base = {
   expectedVersion: z.number().int().nonnegative(),
 };
 
+export const agentIdentitySchema = z.object({
+  label: z.string().trim().min(1).max(80),
+  summary: z.string().trim().max(300),
+  instruction: z.string().trim().min(1).max(20_000),
+});
+
 export const workspaceCommandSchema = z.discriminatedUnion("type", [
   z.object({ ...base, type: z.literal("create_room"), title: z.string().trim().min(1).max(120), agentId: z.string().optional() }),
   z.object({ ...base, type: z.literal("rename_room"), roomId: z.string(), title: z.string().trim().min(1).max(120) }),
@@ -15,8 +21,8 @@ export const workspaceCommandSchema = z.discriminatedUnion("type", [
   z.object({ ...base, type: z.literal("remove_participant"), roomId: z.string(), participantId: z.string() }),
   z.object({ ...base, type: z.literal("toggle_participant"), roomId: z.string(), participantId: z.string(), enabled: z.boolean() }),
   z.object({ ...base, type: z.literal("stop_room"), roomId: z.string() }),
-  z.object({ ...base, type: z.literal("create_agent"), label: z.string().trim().min(1).max(80), summary: z.string().trim().max(300), instruction: z.string().trim().min(1).max(20_000) }),
-  z.object({ ...base, type: z.literal("update_agent"), agentId: z.string(), label: z.string().trim().min(1).max(80), summary: z.string().trim().max(300), instruction: z.string().trim().min(1).max(20_000) }),
+  z.object({ ...base, type: z.literal("create_agent"), ...agentIdentitySchema.shape }),
+  z.object({ ...base, type: z.literal("update_agent"), agentId: z.string(), ...agentIdentitySchema.shape }),
   z.object({ ...base, type: z.literal("create_cron"), roomId: z.string(), agentId: z.string(), name: z.string().trim().min(1).max(100), schedule: z.string().trim().min(1).max(100), timezone: z.string().trim().min(1).max(80), prompt: z.string().trim().min(1).max(20_000) }),
   z.object({ ...base, type: z.literal("update_cron"), jobId: z.string(), enabled: z.boolean().optional(), name: z.string().trim().min(1).max(100).optional(), schedule: z.string().trim().min(1).max(100).optional(), timezone: z.string().trim().min(1).max(80).optional(), prompt: z.string().trim().min(1).max(20_000).optional() }),
   z.object({ ...base, type: z.literal("delete_cron"), jobId: z.string() }),

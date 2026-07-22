@@ -1,4 +1,4 @@
-import { publicAgentMessageKinds, type Agent, type AgentSessionMessage, type ContextCompaction, type ModelCallRecord, type SchedulerPacket, type TimelineEvent, type ToolExecution, type TurnEffect } from "@/lib/domain/types";
+import { maxAgentsCreatedPerTurn, publicAgentMessageKinds, type Agent, type AgentSessionMessage, type ContextCompaction, type ModelCallRecord, type SchedulerPacket, type TimelineEvent, type ToolExecution, type TurnEffect } from "@/lib/domain/types";
 import { publishWorkspaceEvent } from "@/lib/server/events";
 import { getToolDefinition, listToolDefinitions, toolDefinitionsForChat, toolDefinitionsForResponses, type ToolContext } from "@/lib/server/tools";
 import { WorkspaceRepository } from "@/lib/server/repository";
@@ -180,15 +180,16 @@ function systemPrompt(args: RunArgs): string {
     "begin_message_to_room 之后可以按需继续调用工具；结构化工具调用本身不会成为公开正文。此阶段的 assistant content 会实时公开，只能写给房间成员阅读的正文，不得夹带私有构思、路由解释或 JSON。不要为了看起来有回复而伪造消息；无需回复时调用 read_no_reply。",
     "历史记录里可能出现旧工具 send_message_to_room；它已经停用，绝不能继续调用，也不要把公开正文放进任何工具参数。",
     "每个待处理房间都是独立交付义务；一次 begin_message_to_room 后的公开正文，或一次 read_no_reply，只处理它明确指定的那个房间。结束本轮前必须逐一处理下面列出的全部义务。",
-    "公开消息只有两种：kind=notify 是过程消息，只公开内容，当前 Agent 必须继续执行，不触发其他 Agent，也不能完成本轮交付义务；kind=handoff 是结束消息，公开内容后结束当前 Turn，并把控制权交给房间中的下一个 Agent。read_no_reply 不产生公开消息，只能用于确实无需回复的精确 messageId。",
+    "公开消息只有两种：kind=notify 是过程消息，只公开内容，当前 Agent 必须继续执行，不触发其他 Agent，也不能完成本轮交付义务；kind=handoff 是结束消息，公开内容并触发房间中的下一个 Agent，但不会阻止当前 Turn 继续向其他房间发送 handoff。read_no_reply 不产生公开消息，只能用于确实无需回复的精确 messageId。",
     "对需要调用工具或分阶段完成的任务，在开始实质工作前，先向当前房间发送一条 kind=notify，简要说明准备怎样处理；短小且可直接回答的任务不必发送过程通知。",
     "执行过程中可以多次发送 kind=notify，但只在完成有意义的阶段、得到关键发现、遇到阻塞或计划变化时发送。notify 提交后必须继续当前工作；它不能作为最终答复，也不能自然结束当前 Turn。",
-    "不要发送定时心跳、等待状态、重复内容、没有新信息的通知、敏感信息或完整工具参数。完成、警告、错误、澄清等结束正文统一使用 kind=handoff；收到 handoff 后若确实无需公开回复，则调用 read_no_reply 结束，不要再发送消息。",
+    "不要发送定时心跳、等待状态、重复内容、没有新信息的通知、敏感信息或完整工具参数。完成、警告、错误、澄清等结束正文统一使用 kind=handoff；收到 handoff 后若确实无需公开回复，则调用 read_no_reply 结清该精确消息。read_no_reply 不会结束当前 Turn，仍需处理其他房间时继续调用 begin_message_to_room。",
     "需要联网检索时优先使用 web_search，禁止用 shell 抓取搜索引擎结果页。web_search 只负责发现来源；涉及最新消息、重要事实或需要引用的结论时，继续用 web_fetch 打开具体结果，至少核对两个独立来源，并在公开答案中保留来源 URL。搜索证据不足时明确说明，不得补写未实际访问的来源或细节。",
-    "房间不是默认隐私边界，但只能读取和发送到当前 Agent 已连接的房间。房间管理权限由工具执行层校验。",
+    "房间不是默认隐私边界，但只能读取和发送到当前 Agent 已连接的房间。邀请 Agent 加入已连接房间不要求 owner 权限；移除成员等其他管理操作仍由工具执行层校验。",
+    `需要扩充协作人数时可以调用 create_agent，指定名称、简介和系统提示词；新 Agent 永久存在，每个 Turn 最多创建 ${maxAgentsCreatedPerTurn} 个。工具返回的 Agent ID 可在同一 Turn 立即用于 create_room 或 invite_agent。`,
     "创建房间时，create_room 会让你自动成为 owner 并连接；如需拉人，直接在同一次调用的 agentIds 中列出所有目标 Agent，不要要求人类手动操作。",
     "在新房间启动交接的第一条 handoff 必须包含足够独立执行的任务目标、分工、终止条件和当前进度；其他 Agent 看不到来源房间，不要只发送孤立的数字或片段。",
-    "需要另一个 Agent 后续回复或接手，以及提交最终结果时，都使用 kind=handoff；运行时会提交消息、结束当前 Turn，并触发目标房间的下一个 Agent。单向过程信息使用 kind=notify。不要调用 read_room_history 轮询，不要发送重复等待通知，也不要用 read_no_reply 放弃仍需最终汇报的来源任务。",
+    "需要另一个 Agent 后续回复或接手，以及提交最终结果时，都使用 kind=handoff；运行时会提交消息并触发目标房间的下一个 Agent。同一 Turn 可以依次向任意多个已连接房间发送 handoff；还有目标房间时，在当前公开正文中继续调用 begin_message_to_room 打开下一个房间。单向过程信息使用 kind=notify。不要调用 read_room_history 轮询，不要发送重复等待通知，也不要用 read_no_reply 放弃仍需最终汇报的来源任务。",
     "恢复跨房间任务后：若目标尚未完成并且需要对方继续工作，向当前房间发送 kind=handoff；若目标已经完成，必须向系统列出的来源房间发送 kind=handoff 最终结果。",
     "每轮输入只携带尚未处理的房间增量；需要房间清单或可用 Agent 清单时，分别调用 list_connected_rooms 或 list_available_agents。",
     ...interruptedTurnSystemInstructions,
@@ -392,13 +393,6 @@ function publicMessageRouteSwitchRetry(current: PublicMessageRoute, attempted: P
   };
 }
 
-function publicMessageRouteCancelledForAwaiting(committed: PublicMessageRoute, attempted: PublicMessageRoute): AgentSessionMessage {
-  return {
-    role: "user",
-    content: `[系统跨房间交接]\n房间 ${committed.roomId} 的 handoff 已经提交，当前 Turn 已把控制权交给该房间的下一个 Agent。刚才请求打开的房间 ${attempted.roomId} 没有生效；任务恢复后如仍需发言，请重新调用 begin_message_to_room。`,
-  };
-}
-
 function publicMessageControl(route: PublicMessageRoute): AgentSessionMessage {
   return {
     role: "user",
@@ -424,8 +418,19 @@ function notifyContinuation(route: PublicMessageRoute): AgentSessionMessage {
   };
 }
 
+function readNoReplyContinuation(): AgentSessionMessage {
+  return {
+    role: "user",
+    content: [
+      "[系统已读不回已记录]",
+      "read_no_reply 只结清了指定消息，没有结束当前 Turn。",
+      "如果还需要向其他房间发言，继续调用 begin_message_to_room；如果没有其他动作，直接结束本轮，不要输出无意义的私有说明。",
+    ].join("\n"),
+  };
+}
+
 function consumesToolStep(calls: ToolCall[], openedRoute: PublicMessageRoute | null): boolean {
-  return !(openedRoute?.kind === "notify" && calls.length === 1 && calls[0]?.name === "begin_message_to_room");
+  return !(openedRoute && calls.length === 1 && calls[0]?.name === "begin_message_to_room");
 }
 
 function needsInitialProgress(args: RunArgs, effects: TurnEffect[], calls: ToolCall[]): boolean {
@@ -933,6 +938,7 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       messages.push(toolMessage); sessionMessages.push(toolMessage); auditMessages.push(toolMessage);
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
     });
+    const recordedReadNoReply = outputs.some((output) => output.name === "read_no_reply" && !output.error);
     const openedRoute = routeFromToolOutputs(outputs);
     if (regularToolsAllowed && consumesToolStep(calls, openedRoute)) toolSteps += 1;
     if (openedRoute) {
@@ -947,17 +953,10 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
           continue;
         }
         const committed = commitPublicMessage(args, effects, publicRouteForStep, previousPublicContent);
-        const { effect, awaitingRoomId: crossRoomAwaitingTarget } = committed;
+        const { effect } = committed;
         addTimeline("message_emitted", { roomId: effect.roomId, messageId: effect.messageId, messageKey: effect.messageKey, kind: effect.kind });
         activePublicRoute = null; activePublicContent = ""; activePublicTools = []; publicMessageRepairAttempts = 0;
         checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-        if (publicRouteForStep.kind === "handoff") {
-          const cancelledRouteMessage = publicMessageRouteCancelledForAwaiting(publicRouteForStep, openedRoute);
-          messages.push(cancelledRouteMessage); sessionMessages.push(cancelledRouteMessage); auditMessages.push(cancelledRouteMessage);
-          awaitingRoomId = crossRoomAwaitingTarget;
-          checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-          break;
-        }
       }
       activePublicRoute = openedRoute; activePublicContent = ""; activePublicTools = requestTools; publicMessageRepairAttempts = 0;
       const controlMessage = publicMessageControl(openedRoute);
@@ -975,6 +974,12 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
       awaitingDecisionAttempts = 0;
       const decisionMessage = awaitingTaskDecisionMessage(args, pendingAwaitingTasks);
       messages.push(decisionMessage); sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage);
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
+    }
+    if (recordedReadNoReply) {
+      const continuationMessage = readNoReplyContinuation();
+      messages.push(continuationMessage); sessionMessages.push(continuationMessage); auditMessages.push(continuationMessage);
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
       continue;
     }
@@ -1235,6 +1240,7 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       sessionMessages.push(toolMessage); auditMessages.push(toolMessage); continuationMessages.push(responseContextMessage(toolMessage));
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
     });
+    const recordedReadNoReply = outputs.some((output) => output.name === "read_no_reply" && !output.error);
     const outputItems = outputs.map((output) => ({ type: "function_call_output", call_id: output.callId, output: output.text }));
     input = outputItems;
     const openedRoute = routeFromToolOutputs(outputs);
@@ -1252,17 +1258,10 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
           continue;
         }
         const committed = commitPublicMessage(args, effects, publicRouteForStep, previousPublicContent);
-        const { effect, awaitingRoomId: crossRoomAwaitingTarget } = committed;
+        const { effect } = committed;
         addTimeline("message_emitted", { roomId: effect.roomId, messageId: effect.messageId, messageKey: effect.messageKey, kind: effect.kind });
         activePublicRoute = null; activePublicContent = ""; activePublicTools = []; publicMessageRepairAttempts = 0;
         checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-        if (publicRouteForStep.kind === "handoff") {
-          const cancelledRouteMessage = publicMessageRouteCancelledForAwaiting(publicRouteForStep, openedRoute);
-          sessionMessages.push(cancelledRouteMessage); auditMessages.push(cancelledRouteMessage); continuationMessages.push(responseContextMessage(cancelledRouteMessage));
-          awaitingRoomId = crossRoomAwaitingTarget;
-          checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
-          break;
-        }
       }
       activePublicRoute = openedRoute; activePublicContent = ""; activePublicTools = requestTools; publicMessageRepairAttempts = 0;
       const controlMessage = publicMessageControl(openedRoute);
@@ -1282,6 +1281,13 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
       const decisionMessage = awaitingTaskDecisionMessage(args, pendingAwaitingTasks);
       sessionMessages.push(decisionMessage); auditMessages.push(decisionMessage); continuationMessages.push(responseContextMessage(decisionMessage));
       input = [...outputItems, responseContextMessage(decisionMessage)];
+      checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
+      continue;
+    }
+    if (recordedReadNoReply) {
+      const continuationMessage = readNoReplyContinuation();
+      sessionMessages.push(continuationMessage); auditMessages.push(continuationMessage); continuationMessages.push(responseContextMessage(continuationMessage));
+      input = [...outputItems, responseContextMessage(continuationMessage)];
       checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
       continue;
     }
