@@ -12,9 +12,40 @@ describe("OceanKing 领域仓库", () => {
   it("种子状态包含房间、Agent 与独立 scheduler", async () => withRepository((repository) => {
     const snapshot = repository.getSnapshot();
     expect(snapshot.agents.map((agent) => agent.id)).toEqual(["navigator", "builder"]);
+    expect(new Set(snapshot.agents.map((agent) => agent.summary))).toHaveProperty("size", 1);
+    expect(new Set(snapshot.agents.map((agent) => agent.instruction))).toHaveProperty("size", 1);
+    expect(snapshot.agents[0]?.instruction).toContain("平级协作 Agent");
     expect(snapshot.rooms[0]?.scheduler.status).toBe("idle");
     expect(snapshot.rooms[0]?.messages[0]?.source).toBe("system");
   }));
+
+  it("旧默认身份升级为平级描述，同时保留用户自定义身份", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oceanking-agent-migration-"));
+    const handle = createDatabase(dir);
+    try {
+      const repository = new WorkspaceRepository(handle);
+      const peerDefaults = repository.getSnapshot().agents[0]!;
+      repository.raw.prepare("UPDATE agents SET summary=?,instruction=? WHERE id='navigator'").run(
+        "梳理目标、协调房间并公开可靠结论",
+        "你是 OceanKing 领航员。先调查和协调，再通过房间工具明确公开经过整理的结论。普通 assistant 文本对人类不可见。",
+      );
+      repository.raw.prepare("UPDATE agents SET summary=?,instruction=? WHERE id='builder'").run("我的自定义简介", "我的自定义指令");
+
+      const migrated = new WorkspaceRepository(handle).getSnapshot().agents;
+
+      expect(migrated.find((agent) => agent.id === "navigator")).toMatchObject({
+        summary: peerDefaults.summary,
+        instruction: peerDefaults.instruction,
+      });
+      expect(migrated.find((agent) => agent.id === "builder")).toMatchObject({
+        summary: "我的自定义简介",
+        instruction: "我的自定义指令",
+      });
+    } finally {
+      handle.raw.close();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
 
   it("重置工作台会清空全部历史并只重建初始房间，同时保留 Agent 与模型思考配置", async () => withRepository(async (repository) => {
     const initialSettings = repository.getSnapshot().settings;

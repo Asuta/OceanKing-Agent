@@ -15,6 +15,22 @@ import { normalizeOpenAiBaseUrl, normalizeRuntimeSettings } from "@/lib/server/p
 
 type Row = Record<string, unknown>;
 
+const peerAgentSummary = "平等参与协作，独立分析、执行任务并公开可靠结论";
+const peerAgentInstruction = "你是 OceanKing 的平级协作 Agent。你与其他 Agent 具有相同的职责和权限：独立分析问题、使用工具执行任务、相互协作，并汇报可验证的可靠结论。需要公开内容时先调用 begin_message_to_room，再在下一次 assistant 回复中输出正文；普通 assistant 文本对人类不可见。";
+
+const legacyDefaultAgentDescriptions = [
+  {
+    id: "navigator",
+    summary: "梳理目标、协调房间并公开可靠结论",
+    instruction: "你是 OceanKing 领航员。先调查和协调，再通过房间工具明确公开经过整理的结论。普通 assistant 文本对人类不可见。",
+  },
+  {
+    id: "builder",
+    summary: "执行具体任务并汇报可验证结果",
+    instruction: "你是 OceanKing 执行者。聚焦实际执行、工具使用和验证。需要公开内容时先调用 begin_message_to_room，再在下一次 assistant 回复中输出正文。",
+  },
+] as const;
+
 export class VersionConflictError extends Error {
   constructor(public readonly currentVersion: number) {
     super(`工作区版本冲突：当前版本为 ${currentVersion}`);
@@ -82,6 +98,7 @@ export class WorkspaceRepository {
     this.raw = handle.raw;
     this.dataDir = handle.dataDir;
     this.ensureSeed();
+    this.migrateLegacyDefaultAgentDescriptions();
   }
 
   private defaultSettings(): ModelAndRuntimeSettings {
@@ -96,8 +113,8 @@ export class WorkspaceRepository {
       const at = nowIso();
       const settings = JSON.stringify(this.defaultSettings());
       const insertAgent = this.raw.prepare("INSERT INTO agents(id,label,summary,instruction,skills_json,settings_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)");
-      insertAgent.run("navigator", "领航员", "梳理目标、协调房间并公开可靠结论", "你是 OceanKing 领航员。先调查和协调，再通过房间工具明确公开经过整理的结论。普通 assistant 文本对人类不可见。", "[]", settings, at, at);
-      insertAgent.run("builder", "执行者", "执行具体任务并汇报可验证结果", "你是 OceanKing 执行者。聚焦实际执行、工具使用和验证。需要公开内容时先调用 begin_message_to_room，再在下一次 assistant 回复中输出正文。", "[]", settings, at, at);
+      insertAgent.run("navigator", "领航员", peerAgentSummary, peerAgentInstruction, "[]", settings, at, at);
+      insertAgent.run("builder", "执行者", peerAgentSummary, peerAgentInstruction, "[]", settings, at, at);
       this.raw.prepare("INSERT INTO agent_sessions(agent_id,history_json,active_turn_id,updated_at) VALUES(?,?,NULL,?)").run("navigator", "[]", at);
       this.raw.prepare("INSERT INTO agent_sessions(agent_id,history_json,active_turn_id,updated_at) VALUES(?,?,NULL,?)").run("builder", "[]", at);
 
@@ -105,6 +122,23 @@ export class WorkspaceRepository {
       this.bump();
     });
     tx();
+  }
+
+  private migrateLegacyDefaultAgentDescriptions(): void {
+    const migrate = this.raw.transaction(() => {
+      const at = nowIso();
+      const update = this.raw.prepare("UPDATE agents SET summary=?,instruction=?,updated_at=? WHERE id=? AND summary=? AND instruction=?");
+      const changes = legacyDefaultAgentDescriptions.reduce((total, legacy) => total + update.run(
+        peerAgentSummary,
+        peerAgentInstruction,
+        at,
+        legacy.id,
+        legacy.summary,
+        legacy.instruction,
+      ).changes, 0);
+      if (changes > 0) this.bump();
+    });
+    migrate();
   }
 
   private insertInitialRoom(at: string): void {
