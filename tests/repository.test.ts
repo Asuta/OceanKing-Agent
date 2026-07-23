@@ -746,6 +746,38 @@ describe("OceanKing 领域仓库", () => {
     } finally { await fs.rm(dir, { recursive: true, force: true }); }
   });
 
+  it("旧即时提交数据库启动时会补齐 Turn 使用关系和待投递房间", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oceanking-effect-outbox-migration-"));
+    try {
+      const firstHandle = createDatabase(dir);
+      const first = new WorkspaceRepository(firstHandle);
+      first.executeCommand({ ...commandBase(first), type: "create_room", title: "迁移待唤醒房间", agentId: "navigator" });
+      const targetRoom = first.getSnapshot().rooms.find((room) => room.title === "迁移待唤醒房间")!;
+      sendUser(first, "room_harbor", "迁移即时提交记录");
+      const packet = packetFor(first);
+      first.beginTurn({ turnId: "turn_effect_migration", roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+      first.commitTurnEffect({
+        invocationKey: "task:effect-migration:invite",
+        turnId: "turn_effect_migration",
+        agentId: "navigator",
+        participantId: "participant_navigator_harbor",
+        toolName: "invite_agent",
+        effect: { type: "invite_agent", roomId: targetRoom.id, agentId: "builder", participantId: "participant_effect_migration" },
+      });
+      firstHandle.raw.exec("DROP TABLE turn_effect_dispatches; DROP TABLE turn_effect_uses;");
+      firstHandle.raw.close();
+
+      const secondHandle = createDatabase(dir);
+      expect(secondHandle.raw.prepare("SELECT turn_id,invocation_key FROM turn_effect_uses").all()).toEqual([
+        { turn_id: "turn_effect_migration", invocation_key: "task:effect-migration:invite" },
+      ]);
+      expect(secondHandle.raw.prepare("SELECT room_id,message_room,dispatched_at FROM turn_effect_dispatches").all()).toEqual([
+        { room_id: targetRoom.id, message_room: 0, dispatched_at: null },
+      ]);
+      secondHandle.raw.close();
+    } finally { await fs.rm(dir, { recursive: true, force: true }); }
+  });
+
   it("旧数据库启动时自动补齐 Turn 对话审计字段", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oceanking-agent-history-migration-"));
     try {

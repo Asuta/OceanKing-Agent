@@ -260,9 +260,18 @@ export type TurnEffect =
   | { type: "update_cron"; jobId: Id; patch: Partial<Pick<CronJob, "name" | "schedule" | "timezone" | "prompt" | "enabled">> }
   | { type: "delete_cron"; jobId: Id };
 
+export type TurnEffectCommit = {
+  effect: TurnEffect;
+  emittedMessageIds: Id[];
+  triggerRoomIds: Id[];
+  messageRoomIds: Id[];
+  replayed: boolean;
+};
+
 export type ToolExecutionResult = {
   text: string;
   structured: unknown;
+  /** 已在工具返回前提交到 SQLite 的命令记录；effects 仅用于 Turn 协议判定，不再代表待提交状态。 */
   effects: TurnEffect[];
 };
 

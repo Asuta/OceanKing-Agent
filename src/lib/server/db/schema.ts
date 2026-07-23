@@ -40,6 +40,18 @@ export const toolExecutions = sqliteTable("tool_executions", {
   id: text("id").primaryKey(), turnId: text("turn_id").notNull(), name: text("name").notNull(), inputJson: text("input_json").notNull(), outputText: text("output_text").notNull(),
   structuredResultJson: text("structured_result_json").notNull(), status: text("status").notNull(), durationMs: integer("duration_ms").notNull(), error: text("error"), createdAt: text("created_at").notNull(),
 });
+export const turnEffectCommits = sqliteTable("turn_effect_commits", {
+  invocationKey: text("invocation_key").primaryKey(), turnId: text("turn_id").notNull(), agentId: text("agent_id").notNull(), participantId: text("participant_id").notNull(),
+  toolName: text("tool_name").notNull(), effectType: text("effect_type").notNull(), intentJson: text("intent_json").notNull(), effectJson: text("effect_json").notNull(),
+  emittedMessageIdsJson: text("emitted_message_ids_json").notNull(), triggerRoomIdsJson: text("trigger_room_ids_json").notNull(), messageRoomIdsJson: text("message_room_ids_json").notNull(), createdAt: text("created_at").notNull(),
+});
+export const turnEffectUses = sqliteTable("turn_effect_uses", {
+  turnId: text("turn_id").notNull(), invocationKey: text("invocation_key").notNull(), createdAt: text("created_at").notNull(),
+});
+export const turnEffectDispatches = sqliteTable("turn_effect_dispatches", {
+  invocationKey: text("invocation_key").notNull(), roomId: text("room_id").notNull(), messageRoom: integer("message_room", { mode: "boolean" }).notNull(),
+  dispatchedAt: text("dispatched_at"), createdAt: text("created_at").notNull(),
+});
 export const timelineEvents = sqliteTable("timeline_events", {
   id: text("id").primaryKey(), turnId: text("turn_id").notNull(), ordinal: integer("ordinal").notNull(), type: text("type").notNull(), payloadJson: text("payload_json").notNull(), createdAt: text("created_at").notNull(),
 });

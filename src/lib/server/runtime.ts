@@ -7,7 +7,11 @@ const runtimeState = globalThis as typeof globalThis & { __oceanKingRuntimeStart
 export function ensureRuntimeStarted(): void {
   if (runtimeState.__oceanKingRuntimeStarted) return;
   runtimeState.__oceanKingRuntimeStarted = true;
-  const interruptedRooms = getRepository().recoverInterruptedRuns();
+  const repository = getRepository();
+  const interruptedRooms = repository.recoverInterruptedRuns();
   getCronDispatcher().refresh();
-  for (const roomId of interruptedRooms) getRoomScheduler().enqueue(roomId);
+  for (const roomId of interruptedRooms) {
+    getRoomScheduler().enqueue(roomId);
+    repository.markRoomEffectDispatchesDispatched(roomId);
+  }
 }

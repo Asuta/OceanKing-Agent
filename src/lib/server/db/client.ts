@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS agent_turns (id TEXT PRIMARY KEY, room_id TEXT NOT NU
 CREATE INDEX IF NOT EXISTS turns_room_idx ON agent_turns(room_id, created_at);
 CREATE INDEX IF NOT EXISTS turns_agent_idx ON agent_turns(agent_id, created_at);
 CREATE TABLE IF NOT EXISTS tool_executions (id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES agent_turns(id) ON DELETE CASCADE, name TEXT NOT NULL, input_json TEXT NOT NULL, output_text TEXT NOT NULL, structured_result_json TEXT NOT NULL, status TEXT NOT NULL, duration_ms INTEGER NOT NULL, error TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS turn_effect_commits (invocation_key TEXT PRIMARY KEY, turn_id TEXT NOT NULL, agent_id TEXT NOT NULL, participant_id TEXT NOT NULL, tool_name TEXT NOT NULL, effect_type TEXT NOT NULL, intent_json TEXT NOT NULL, effect_json TEXT NOT NULL, emitted_message_ids_json TEXT NOT NULL, trigger_room_ids_json TEXT NOT NULL, message_room_ids_json TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS turn_effect_commits_turn_idx ON turn_effect_commits(turn_id, created_at);
+CREATE TABLE IF NOT EXISTS turn_effect_uses (turn_id TEXT NOT NULL, invocation_key TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(turn_id, invocation_key));
+CREATE INDEX IF NOT EXISTS turn_effect_uses_turn_idx ON turn_effect_uses(turn_id, created_at);
+CREATE TABLE IF NOT EXISTS turn_effect_dispatches (invocation_key TEXT NOT NULL, room_id TEXT NOT NULL, message_room INTEGER NOT NULL, dispatched_at TEXT, created_at TEXT NOT NULL, PRIMARY KEY(invocation_key, room_id));
+CREATE INDEX IF NOT EXISTS turn_effect_dispatches_pending_idx ON turn_effect_dispatches(dispatched_at, room_id);
 CREATE TABLE IF NOT EXISTS timeline_events (id TEXT PRIMARY KEY, turn_id TEXT NOT NULL REFERENCES agent_turns(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS scheduler_states (room_id TEXT PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE, status TEXT NOT NULL, next_agent_participant_id TEXT, active_participant_id TEXT, round_count INTEGER NOT NULL, cursor_json TEXT NOT NULL, receipt_revision_json TEXT NOT NULL, rerun_requested INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS agent_sessions (agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE, history_json TEXT NOT NULL, active_turn_id TEXT, updated_at TEXT NOT NULL);
@@ -133,6 +139,17 @@ export function createDatabase(explicitDataDir?: string): DatabaseHandle {
     raw.exec("ALTER TABLE turn_handoffs DROP COLUMN deferred");
   }
   raw.exec("CREATE INDEX IF NOT EXISTS handoffs_awaiting_message_idx ON turn_handoffs(awaiting_message_id)");
+  const effectCommitColumns = new Set((raw.prepare("PRAGMA table_info(turn_effect_commits)").all() as Array<{ name: string }>).map((column) => column.name));
+  if (!effectCommitColumns.has("intent_json")) raw.exec("ALTER TABLE turn_effect_commits ADD COLUMN intent_json TEXT NOT NULL DEFAULT '{}'");
+  raw.exec("INSERT OR IGNORE INTO turn_effect_uses(turn_id,invocation_key,created_at) SELECT turn_id,invocation_key,created_at FROM turn_effect_commits");
+  raw.exec(`INSERT OR IGNORE INTO turn_effect_dispatches(invocation_key,room_id,message_room,dispatched_at,created_at)
+    SELECT commit_row.invocation_key,trigger_room.value,
+      CASE WHEN EXISTS (SELECT 1 FROM json_each(commit_row.message_room_ids_json) message_room WHERE message_room.value=trigger_room.value) THEN 1 ELSE 0 END,
+      CASE WHEN turn.status='running' THEN NULL ELSE commit_row.created_at END,
+      commit_row.created_at
+    FROM turn_effect_commits commit_row
+    JOIN json_each(commit_row.trigger_room_ids_json) trigger_room
+    LEFT JOIN agent_turns turn ON turn.id=commit_row.turn_id`);
   const environmentDefaults = environmentRuntimeDefaults();
   const defaults = JSON.stringify(environmentDefaults);
   raw.prepare("INSERT OR IGNORE INTO workspace_meta(id,version,revision,settings_json) VALUES(1,0,0,?)").run(defaults);

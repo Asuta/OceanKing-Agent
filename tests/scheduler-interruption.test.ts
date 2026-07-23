@@ -79,6 +79,17 @@ function toolResponse(name: string, args: Record<string, unknown>, responseId: s
   return new Response(events, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
+function chatToolResponse(name: string, args: Record<string, unknown>, callId: string): Response {
+  return responseEvents([
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: callId, function: { name, arguments: JSON.stringify(args) } }] } }] },
+    "[DONE]",
+  ]);
+}
+
+function chatContentResponse(content: string): Response {
+  return responseEvents([{ choices: [{ delta: { content } }] }, "[DONE]"]);
+}
+
 function setMaxRoomRounds(repository: Parameters<typeof commandBase>[0], maxRoomRounds: number): void {
   const settings = repository.getSnapshot().settings;
   repository.executeCommand({
@@ -131,6 +142,180 @@ describe("房间消息自动打断", () => {
       expect(room.turns[0]).toMatchObject({ agentId: "navigator", status: "completed" });
       expect(room.messages.map((message) => [message.source, message.content])).toEqual([["user", "开始单聊"], ["agent_emit", "这是单聊回复"]]);
       expect(JSON.stringify(requestBodies[0]?.input)).toContain("共享房间里的旧上下文");
+    });
+  });
+
+  it("新 handoff 只抢占轮询选中的下一个 Agent", async () => withRepository(async (repository) => {
+    repository.executeCommand({ ...commandBase(repository), type: "create_agent", label: "未轮到的复核者", summary: "验证定向抢占", instruction: "等待明确轮到自己。" });
+    const reviewerId = repository.getSnapshot().agents.find((agent) => agent.label === "未轮到的复核者")!.id;
+    repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "严格轮询抢占", agentId: "navigator" });
+    const targetRoom = repository.getSnapshot().rooms.find((room) => room.title === "严格轮询抢占")!;
+    repository.executeCommand({ ...commandBase(repository), type: "add_agent", roomId: targetRoom.id, agentId: "builder" });
+    repository.executeCommand({ ...commandBase(repository), type: "add_agent", roomId: targetRoom.id, agentId: reviewerId });
+    sendUser(repository, "room_harbor", "准备定向抢占测试");
+    const packet = packetFor(repository);
+    const turnId = "turn_targeted_round_robin_interrupt";
+    repository.beginTurn({ turnId, roomId: "room_harbor", agentId: "navigator", agentParticipantId: "participant_navigator_harbor", packet });
+    repository.commitTurnEffect({
+      invocationKey: "task:targeted-round-robin:message",
+      turnId,
+      agentId: "navigator",
+      participantId: "participant_navigator_harbor",
+      toolName: "public_message",
+      effect: { type: "send_message", roomId: targetRoom.id, messageId: "message_targeted_round_robin", messageKey: "targeted-round-robin", content: "只唤醒轮到的下一位。", kind: "handoff" },
+    });
+
+    const executor = new AgentExecutor();
+    const interrupt = vi.spyOn(executor, "interruptAgentsForNewMessage");
+    const scheduler = new RoomScheduler(repository, executor);
+    scheduler.enqueue(targetRoom.id, { interruptActive: true });
+
+    expect(interrupt).toHaveBeenCalledOnce();
+    expect(interrupt).toHaveBeenCalledWith(targetRoom.id, ["builder"]);
+    await scheduler.stopRoomsAndWait([targetRoom.id]);
+  }));
+
+  it("handoff 提交后会在来源 Turn 收尾前启动目标房间", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    process.env.OPENAI_API_FORMAT = "chat_completions";
+    let targetRoomId = "";
+    let sourceWaitingForNextBody = false;
+    let markTargetStarted!: () => void;
+    const targetStarted = new Promise<void>((resolve) => { markTargetStarted = resolve; });
+    let callCount = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      callCount += 1;
+      if (callCount === 1) return chatToolResponse("begin_message_to_room", { roomId: "room_harbor", kind: "notify" }, "immediate_progress");
+      if (callCount === 2) return responseEvents([
+        { choices: [{ delta: { content: "开始派发任务。", tool_calls: [{ index: 0, id: "immediate_target", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: targetRoomId, kind: "handoff" }) } }] } }] },
+        "[DONE]",
+      ]);
+      if (callCount === 3) return responseEvents([
+        { choices: [{ delta: { content: "请立即执行目标任务。", tool_calls: [{ index: 0, id: "immediate_source", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "handoff" }) } }] } }] },
+        "[DONE]",
+      ]);
+      if (callCount === 4) {
+        sourceWaitingForNextBody = true;
+        return await new Promise<Response>((_, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) reject(signal.reason);
+          else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      if (callCount === 5) {
+        markTargetStarted();
+        return await new Promise<Response>((_, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) reject(signal.reason);
+          else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      throw new Error(`即时 handoff 测试出现非预期模型调用：${callCount}`);
+    }));
+
+    await withRepository(async (repository) => {
+      repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "即时派发目标", agentId: "builder" });
+      const targetRoom = repository.getSnapshot().rooms.find((room) => room.title === "即时派发目标")!;
+      targetRoomId = targetRoom.id;
+      repository.executeCommand({ ...commandBase(repository), type: "add_agent", roomId: targetRoom.id, agentId: "navigator" });
+      const scheduler = new RoomScheduler(repository, new AgentExecutor());
+      sendUser(repository, "room_harbor", "向目标房间派发后继续执行来源任务");
+      scheduler.enqueue("room_harbor", { interruptActive: true });
+
+      await targetStarted;
+      const source = repository.getRoom("room_harbor")!;
+      const target = repository.getRoom(targetRoom.id)!;
+      expect(sourceWaitingForNextBody).toBe(true);
+      expect(source.messages.some((message) => message.content === "向目标房间派发后继续执行来源任务")).toBe(true);
+      expect(source.turns.at(-1)?.status).toBe("running");
+      expect(target.messages.some((message) => message.content === "请立即执行目标任务。")).toBe(true);
+      expect(target.turns.some((turn) => turn.agentId === "builder" && turn.status === "running")).toBe(true);
+
+      await scheduler.stopRoomsAndWait(["room_harbor", targetRoom.id]);
+    });
+  });
+
+  it("同一来源 Turn 可以连续 handoff 多个房间并立即启动不同 Agent", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    process.env.OPENAI_API_FORMAT = "chat_completions";
+    let targetRoomAId = "";
+    let targetRoomBId = "";
+    let writerAId = "";
+    let writerBId = "";
+    let markWriterAStarted!: () => void;
+    let markWriterBStarted!: () => void;
+    let markSourceFinalWaiting!: () => void;
+    let finishSourceFinal!: (response: Response) => void;
+    const writerAStarted = new Promise<void>((resolve) => { markWriterAStarted = resolve; });
+    const writerBStarted = new Promise<void>((resolve) => { markWriterBStarted = resolve; });
+    const sourceFinalWaiting = new Promise<void>((resolve) => { markSourceFinalWaiting = resolve; });
+    const sourceFinalResponse = new Promise<Response>((resolve) => { finishSourceFinal = resolve; });
+    let sourceCallCount = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { messages?: unknown[] };
+      const messages = JSON.stringify(body.messages ?? []);
+      const waitForStop = async (markStarted: () => void): Promise<Response> => {
+        markStarted();
+        return await new Promise<Response>((_, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) reject(signal.reason);
+          else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      };
+      if (messages.includes(`当前 Agent：并发写手 A（${writerAId}）`)) return await waitForStop(markWriterAStarted);
+      if (messages.includes(`当前 Agent：并发写手 B（${writerBId}）`)) return await waitForStop(markWriterBStarted);
+      if (!messages.includes("当前 Agent：领航员（navigator）")) throw new Error("无法识别即时多 handoff 测试的 Agent");
+      sourceCallCount += 1;
+      if (sourceCallCount === 1) return chatToolResponse("begin_message_to_room", { roomId: targetRoomAId, kind: "handoff" }, "multi_immediate_a");
+      if (sourceCallCount === 2) return responseEvents([
+        { choices: [{ delta: { content: "请执行并发任务 A。", tool_calls: [{ index: 0, id: "multi_immediate_b", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: targetRoomBId, kind: "handoff" }) } }] } }] },
+        "[DONE]",
+      ]);
+      if (sourceCallCount === 3) {
+        await writerAStarted;
+        return responseEvents([
+          { choices: [{ delta: { content: "请执行并发任务 B。", tool_calls: [{ index: 0, id: "multi_immediate_source", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: "room_harbor", kind: "handoff" }) } }] } }] },
+          "[DONE]",
+        ]);
+      }
+      if (sourceCallCount === 4) {
+        await writerBStarted;
+        markSourceFinalWaiting();
+        return await sourceFinalResponse;
+      }
+      throw new Error(`来源 Turn 出现非预期模型调用：${sourceCallCount}`);
+    }));
+
+    await withRepository(async (repository) => {
+      repository.executeCommand({ ...commandBase(repository), type: "create_agent", label: "并发写手 A", summary: "处理并发任务 A", instruction: "只处理明确交付的任务。" });
+      writerAId = repository.getSnapshot().agents.find((agent) => agent.label === "并发写手 A")!.id;
+      repository.executeCommand({ ...commandBase(repository), type: "create_agent", label: "并发写手 B", summary: "处理并发任务 B", instruction: "只处理明确交付的任务。" });
+      writerBId = repository.getSnapshot().agents.find((agent) => agent.label === "并发写手 B")!.id;
+      repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "即时并发目标 A", agentId: writerAId });
+      targetRoomAId = repository.getSnapshot().rooms.find((room) => room.title === "即时并发目标 A")!.id;
+      repository.executeCommand({ ...commandBase(repository), type: "add_agent", roomId: targetRoomAId, agentId: "navigator" });
+      repository.executeCommand({ ...commandBase(repository), type: "create_room", title: "即时并发目标 B", agentId: writerBId });
+      targetRoomBId = repository.getSnapshot().rooms.find((room) => room.title === "即时并发目标 B")!.id;
+      repository.executeCommand({ ...commandBase(repository), type: "add_agent", roomId: targetRoomBId, agentId: "navigator" });
+      const scheduler = new RoomScheduler(repository, new AgentExecutor());
+      sendUser(repository, "room_harbor", "在同一 Turn 中向两个房间派发任务");
+      scheduler.enqueue("room_harbor", { interruptActive: true });
+
+      await sourceFinalWaiting;
+      const source = repository.getRoom("room_harbor")!;
+      const targetA = repository.getRoom(targetRoomAId)!;
+      const targetB = repository.getRoom(targetRoomBId)!;
+      expect(source.turns.at(-1)?.status).toBe("running");
+      expect(targetA.messages.some((message) => message.content === "请执行并发任务 A。")).toBe(true);
+      expect(targetB.messages.some((message) => message.content === "请执行并发任务 B。")).toBe(true);
+      expect(targetA.turns.some((turn) => turn.agentId === writerAId && turn.status === "running")).toBe(true);
+      expect(targetB.turns.some((turn) => turn.agentId === writerBId && turn.status === "running")).toBe(true);
+
+      finishSourceFinal(chatContentResponse("两个并发任务均已派发。"));
+      await waitUntil(() => repository.getRoom("room_harbor")!.turns.at(-1)?.status === "completed");
+      await scheduler.stopRoomsAndWait(["room_harbor", targetRoomAId, targetRoomBId]);
     });
   });
 
@@ -804,6 +989,43 @@ describe("房间消息自动打断", () => {
 });
 
 describe("调度错误熔断", () => {
+  it("工具成功后的瞬时模型错误重试不会重复创建房间或公开消息", async () => {
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.OPENAI_BASE_URL = "https://example.test/v1";
+    process.env.OPENAI_API_FORMAT = "chat_completions";
+    let callCount = 0;
+    vi.stubGlobal("fetch", vi.fn(async (): Promise<Response> => {
+      callCount += 1;
+      if (callCount === 1 || callCount === 5) return chatToolResponse("begin_message_to_room", { roomId: "room_harbor", kind: "notify" }, `progress_${callCount}`);
+      if (callCount === 2 || callCount === 6) return chatContentResponse("我先创建诊断房间。");
+      if (callCount === 3 || callCount === 7) return chatToolResponse("create_room", { title: "瞬时错误诊断室", agentIds: [] }, `create_${callCount}`);
+      if (callCount === 4) return new Response("temporary unavailable", { status: 500 });
+      if (callCount === 8) return chatToolResponse("begin_message_to_room", { roomId: "room_harbor", kind: "handoff" }, "finish_retry");
+      return chatContentResponse("诊断房间已经创建完成。");
+    }));
+
+    await withRepository(async (repository) => {
+      const settings = repository.getSnapshot().settings;
+      repository.executeCommand({
+        ...commandBase(repository), type: "update_settings", model: settings.model, availableModels: settings.availableModels,
+        apiFormat: "chat_completions", thinkingMode: "disabled", reasoningEffort: settings.reasoningEffort,
+        contextTokenThreshold: settings.contextTokenThreshold, maxToolSteps: settings.maxToolSteps, maxRoomRounds: 32,
+        projectContextRoots: settings.projectContextRoots,
+      });
+      sendUser(repository, "room_harbor", "创建一个诊断房间，遇到瞬时错误后继续");
+      const scheduler = new RoomScheduler(repository, new AgentExecutor());
+      scheduler.enqueue("room_harbor");
+
+      await waitUntil(() => repository.getRoom("room_harbor")!.scheduler.status === "idle" && callCount === 9);
+
+      const snapshot = repository.getSnapshot();
+      expect(snapshot.rooms.filter((room) => room.title === "瞬时错误诊断室")).toHaveLength(1);
+      expect(repository.getRoom("room_harbor")!.messages.filter((message) => message.content === "我先创建诊断房间。")).toHaveLength(1);
+      expect(repository.getRoom("room_harbor")!.turns.map((turn) => turn.status)).toEqual(["error", "completed"]);
+      expect((repository.raw.prepare("SELECT COUNT(*) count FROM turn_effect_uses WHERE invocation_key IN (SELECT invocation_key FROM turn_effect_commits WHERE effect_type='create_room')").get() as { count: number }).count).toBe(2);
+    });
+  });
+
   it("永久性模型 400 只执行一次，并消费失败消息避免再次入队重跑", async () => {
     process.env.OPENAI_API_KEY = "test-key";
     process.env.OPENAI_BASE_URL = "https://api.deepseek.com/v1";
