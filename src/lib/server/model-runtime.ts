@@ -35,6 +35,7 @@ type RunArgs = {
   packet: SchedulerPacket;
   turnId: string;
   signal: AbortSignal;
+  onHandoffCommitted?: (roomId: string) => void;
 };
 
 export type ModelTurnResult = {
@@ -243,29 +244,13 @@ function unresolvedAwaitingTasks(args: RunArgs, effects: TurnEffect[]): Array<{ 
   }));
 }
 
-function roomHasOtherAgent(args: RunArgs, effects: TurnEffect[], roomId: string): boolean {
-  const effectiveParticipants = new Map<string, string>();
-  for (const participant of args.repository.getRoom(roomId)?.participants ?? []) {
-    if (participant.enabled && participant.agentId) effectiveParticipants.set(participant.id, participant.agentId);
-  }
-  for (const effect of effects) {
-    if (!("roomId" in effect) || effect.roomId !== roomId) continue;
-    if (effect.type === "create_room") {
-      effectiveParticipants.clear();
-      effectiveParticipants.set(`owner:${args.agent.id}`, args.agent.id);
-      for (const agentId of effect.invitedAgentIds) effectiveParticipants.set(`invite:${agentId}`, agentId);
-    } else if (effect.type === "invite_agent") {
-      if (![...effectiveParticipants.values()].includes(effect.agentId)) effectiveParticipants.set(effect.participantId, effect.agentId);
-    } else if (effect.type === "remove_participant" || effect.type === "leave_room") {
-      effectiveParticipants.delete(effect.participantId);
-    }
-  }
-  return [...effectiveParticipants.values()].some((agentId) => agentId !== args.agent.id);
+function roomHasOtherAgent(args: RunArgs, roomId: string): boolean {
+  return (args.repository.getRoom(roomId)?.participants ?? []).some((participant) => participant.enabled && participant.agentId && participant.agentId !== args.agent.id);
 }
 
 function automaticAwaitingTarget(args: RunArgs, effects: TurnEffect[], effect: Extract<TurnEffect, { type: "send_message" }>): string | null {
   if (args.packet.type === "delivery_packet" || effect.kind !== "handoff") return null;
-  if (!roomHasOtherAgent(args, effects, effect.roomId)) return null;
+  if (!roomHasOtherAgent(args, effect.roomId)) return null;
   if (effect.roomId === args.packet.room.id) {
     return unresolvedAwaitingTasks(args, effects).length > 0 ? effect.roomId : null;
   }
@@ -466,16 +451,52 @@ function publicMessageEffect(route: PublicMessageRoute, content: string): Extrac
   return { type: "send_message", roomId: validated.roomId, messageId: createId("msg"), messageKey: validated.messageKey ?? route.messageKey, content: validated.content, kind: validated.kind };
 }
 
-function commitPublicMessage(args: RunArgs, effects: TurnEffect[], route: PublicMessageRoute, content: string) {
-  const effect = publicMessageEffect(route, content);
-  effects.push(effect);
+function commitPublicMessage(args: RunArgs, effects: TurnEffect[], route: PublicMessageRoute, content: string, options: { establishAwaiting?: boolean } = {}) {
+  const candidate = publicMessageEffect(route, content);
+  const candidateAwaitingRoomId = automaticAwaitingTarget(args, [...effects, candidate], candidate);
+  const committed = args.repository.commitTurnEffect({
+    invocationKey: route.messageKey,
+    turnId: args.turnId,
+    agentId: args.agent.id,
+    participantId: args.agentParticipantId,
+    toolName: "public_message",
+    effect: candidate,
+    awaitingRoomId: options.establishAwaiting === false ? null : candidateAwaitingRoomId,
+  });
+  if (committed.effect.type !== "send_message") throw new Error("公开消息幂等记录类型不匹配");
+  const effect = committed.effect;
+  if (!effects.some((candidate) => candidate.type === "send_message" && candidate.roomId === effect.roomId && candidate.messageKey === effect.messageKey)) effects.push(effect);
+  if (!committed.replayed) {
+    publishWorkspaceEvent("workspace.changed", effect.roomId, {
+      kind: "public_message_committed",
+      turnId: args.turnId,
+      messageId: committed.emittedMessageIds[0] ?? effect.messageId,
+      messageKind: effect.kind,
+    }, args.repository.getVersion().revision);
+  }
+  if (effect.kind === "handoff") {
+    try {
+      args.onHandoffCommitted?.(effect.roomId);
+    } catch (error) {
+      publishWorkspaceEvent("turn.preview", args.turnId, {
+        kind: "handoff_dispatch_deferred",
+        roomId: effect.roomId,
+        error: error instanceof Error ? error.message : String(error),
+      }, args.repository.getVersion().revision);
+    }
+  }
   const unresolved = unresolvedDeliveryObligations(args, effects);
+  const awaitingRoomId = automaticAwaitingTarget(args, effects, effect);
   return {
     effect,
     unresolved,
     awaitingTasks: unresolvedAwaitingTasks(args, effects),
-    awaitingRoomId: automaticAwaitingTarget(args, effects, effect),
+    awaitingRoomId,
   };
+}
+
+function modelInvocationScope(args: RunArgs): string {
+  return `task:${args.agent.id}:${args.packet.room.id}:${args.packet.type}:${args.packet.targetMessageId}`;
 }
 
 function publishPublicMessageDelta(args: RunArgs, route: PublicMessageRoute, delta: string): void {
@@ -524,8 +545,8 @@ async function executeToolCalls(args: RunArgs, calls: ToolCall[], tools: ToolExe
     let outputText = ""; let structured: unknown = {}; let error: string | null = null;
     try {
       if (!definition || (definition.modelVisible === false && !options?.allowHiddenTools)) throw new Error(`未知或已停用工具：${call.name}`);
-      const context: ToolContext = { agent: args.agent, roomId: args.packet.room.id, agentParticipantId: args.agentParticipantId, packet: args.packet, repository: args.repository, signal: args.signal, turnId: args.turnId, pendingEffects: effects };
-      const invocationKey = `${args.turnId}:model:${modelStep}:tool:${callIndex}`;
+      const context: ToolContext = { agent: args.agent, roomId: args.packet.room.id, agentParticipantId: args.agentParticipantId, packet: args.packet, repository: args.repository, signal: args.signal, turnId: args.turnId };
+      const invocationKey = `${modelInvocationScope(args)}:model:${modelStep}:tool:${callIndex}`;
       const result = await definition.execute(context, parsed, call.id, invocationKey);
       outputText = result.text; structured = result.structured; effects.push(...result.effects);
     } catch (caught) {
@@ -952,7 +973,7 @@ async function runChatCompletions(args: RunArgs, modelCalls: ModelCallRecord[]):
           checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
           continue;
         }
-        const committed = commitPublicMessage(args, effects, publicRouteForStep, previousPublicContent);
+        const committed = commitPublicMessage(args, effects, publicRouteForStep, previousPublicContent, { establishAwaiting: false });
         const { effect } = committed;
         addTimeline("message_emitted", { roomId: effect.roomId, messageId: effect.messageId, messageKey: effect.messageKey, kind: effect.kind });
         activePublicRoute = null; activePublicContent = ""; activePublicTools = []; publicMessageRepairAttempts = 0;
@@ -1257,7 +1278,7 @@ async function runResponses(args: RunArgs, modelCalls: ModelCallRecord[]): Promi
           checkpointTurn(args, turnSystemPrompt, assistantContent, auditMessages, tools, timeline);
           continue;
         }
-        const committed = commitPublicMessage(args, effects, publicRouteForStep, previousPublicContent);
+        const committed = commitPublicMessage(args, effects, publicRouteForStep, previousPublicContent, { establishAwaiting: false });
         const { effect } = committed;
         addTimeline("message_emitted", { roomId: effect.roomId, messageId: effect.messageId, messageKey: effect.messageKey, kind: effect.kind });
         activePublicRoute = null; activePublicContent = ""; activePublicTools = []; publicMessageRepairAttempts = 0;

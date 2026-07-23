@@ -17,10 +17,23 @@ function nextParticipant(agents: Participant[], currentId: string): Participant 
   return agents[(index < 0 ? 0 : index + 1) % agents.length] ?? agents[0] ?? null;
 }
 
+function nextMessageResponder(room: Room, senderParticipantId: string): Participant | null {
+  const agents = enabledAgents(room);
+  if (!agents.length) return null;
+  const configuredIndex = agents.findIndex((agent) => agent.id === room.scheduler.nextAgentParticipantId);
+  const startIndex = configuredIndex < 0 ? 0 : configuredIndex;
+  for (let offset = 0; offset < agents.length; offset += 1) {
+    const candidate = agents[(startIndex + offset) % agents.length];
+    if (candidate?.id !== senderParticipantId) return candidate ?? null;
+  }
+  return null;
+}
+
 export class RoomScheduler {
   private runningRooms = new Set<string>();
   private stoppedRooms = new Set<string>();
   private pendingMessageInterrupts = new Map<string, Map<string, number>>();
+  private pendingEffectDispatches = new Map<string, ReturnType<typeof setTimeout>>();
   private repository: WorkspaceRepository;
   private executor: AgentExecutor;
 
@@ -29,20 +42,57 @@ export class RoomScheduler {
     this.executor = executor;
   }
 
+  private dispatchTurnEffects(turnId: string, sourceRoomId: string, wakeSourceRoom: boolean, onlyRoomId?: string): Set<string> {
+    const dispatch = this.repository.getTurnEffectDispatch(turnId);
+    const messageRoomIds = new Set(dispatch.messageRoomIds);
+    const dispatched = new Set<string>();
+    for (const targetRoomId of dispatch.triggerRoomIds) {
+      if (onlyRoomId && targetRoomId !== onlyRoomId) continue;
+      if (this.stoppedRooms.has(targetRoomId)) continue;
+      if (targetRoomId !== sourceRoomId || wakeSourceRoom) {
+        this.enqueue(targetRoomId, { interruptActive: messageRoomIds.has(targetRoomId) });
+      }
+      this.repository.markTurnEffectDispatchesDispatched(turnId, targetRoomId);
+      dispatched.add(targetRoomId);
+    }
+    return dispatched;
+  }
+
+  private scheduleTurnEffectDispatch(turnId: string, sourceRoomId: string, targetRoomId: string): void {
+    const key = `${turnId}\u0000${targetRoomId}`;
+    if (this.pendingEffectDispatches.has(key)) return;
+    const timer = setTimeout(() => {
+      this.pendingEffectDispatches.delete(key);
+      try {
+        this.dispatchTurnEffects(turnId, sourceRoomId, true, targetRoomId);
+      } catch {
+        // The durable outbox remains pending and Turn completion or startup recovery retries it.
+      }
+    }, 0);
+    this.pendingEffectDispatches.set(key, timer);
+  }
+
+  private cancelTurnEffectDispatches(turnId: string): void {
+    const prefix = `${turnId}\u0000`;
+    for (const [key, timer] of this.pendingEffectDispatches) {
+      if (!key.startsWith(prefix)) continue;
+      clearTimeout(timer);
+      this.pendingEffectDispatches.delete(key);
+    }
+  }
+
   enqueue(roomId: string, options: { interruptActive?: boolean } = {}): void {
     this.stoppedRooms.delete(roomId); this.executor.allowRoom(roomId);
     if (options.interruptActive) {
       const room = this.repository.getRoom(roomId);
-      const agentIds = room?.participants
-        .filter((participant) => participant.kind === "agent" && participant.enabled && participant.agentId)
-        .map((participant) => participant.agentId!) ?? [];
-      const messageSeq = room?.messages.findLast((message) => message.source === "user" || (message.source === "agent_emit" && message.kind === "handoff"))?.seq;
-      if (messageSeq !== undefined) {
+      const message = room?.messages.findLast((candidate) => candidate.source === "user" || (candidate.source === "agent_emit" && candidate.kind === "handoff"));
+      const responder = room && message ? nextMessageResponder(room, message.sender.id) : null;
+      if (message && responder?.agentId) {
         const pending = this.pendingMessageInterrupts.get(roomId) ?? new Map<string, number>();
-        for (const agentId of agentIds) pending.set(agentId, Math.max(pending.get(agentId) ?? 0, messageSeq));
+        pending.set(responder.agentId, Math.max(pending.get(responder.agentId) ?? 0, message.seq));
         this.pendingMessageInterrupts.set(roomId, pending);
+        this.executor.interruptAgentsForNewMessage(roomId, [responder.agentId]);
       }
-      this.executor.interruptAgentsForNewMessage(roomId, agentIds);
     }
     if (this.runningRooms.has(roomId)) {
       this.repository.setScheduler(roomId, { rerun: true });
@@ -165,7 +215,17 @@ export class RoomScheduler {
             agent.id,
             roomId,
             async (signal) => {
-              const result = await runAgentModel({ repository: this.repository, agent, agentParticipantId: current.id, packet, turnId, signal });
+              const result = await runAgentModel({
+                repository: this.repository,
+                agent,
+                agentParticipantId: current.id,
+                packet,
+                turnId,
+                signal,
+                onHandoffCommitted: (targetRoomId) => {
+                  this.scheduleTurnEffectDispatch(turnId, roomId, targetRoomId);
+                },
+              });
               return this.repository.finishTurn({ turnId, assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq, nextParticipantId: next?.id ?? null, awaitingRoomId: result.awaitingRoomId });
             },
             {
@@ -181,14 +241,17 @@ export class RoomScheduler {
               },
             },
           );
+          const dispatchedEffectRooms = this.dispatchTurnEffects(turnId, roomId, false);
           const messageRoomIds = new Set(applied.messageRoomIds);
-          for (const targetRoomId of new Set([...applied.triggerRoomIds, ...applied.continuationRoomIds])) {
+          for (const targetRoomId of new Set(applied.continuationRoomIds)) {
+            if (dispatchedEffectRooms.has(targetRoomId)) continue;
             if (targetRoomId !== roomId && !this.stoppedRooms.has(targetRoomId)) this.enqueue(targetRoomId, { interruptActive: messageRoomIds.has(targetRoomId) });
           }
           transientFailureRetries = 0;
           publishWorkspaceEvent("workspace.changed", turnId, { status: applied.superseded || applied.unresolvedRoomIds.length ? "continued" : "completed", emittedMessageIds: applied.emittedMessageIds, triggerRoomIds: applied.triggerRoomIds, messageRoomIds: applied.messageRoomIds, continuationRoomIds: applied.continuationRoomIds, unresolvedRoomIds: applied.unresolvedRoomIds }, this.repository.getVersion().revision);
         } catch (error) {
           if (error instanceof AgentRunSupersededError) {
+            this.dispatchTurnEffects(turnId, roomId, true);
             publishWorkspaceEvent("workspace.changed", turnId, { status: "continued", interruptedByRoomId: error.nextRoomId }, this.repository.getVersion().revision);
             break;
           }
@@ -205,6 +268,7 @@ export class RoomScheduler {
             error instanceof ModelRunError ? error.modelMeta : undefined,
             terminalFailure,
           );
+          this.dispatchTurnEffects(turnId, roomId, terminalFailure && !stopped);
           if (stopped || terminalFailure || round + 1 >= maxRounds) {
             for (const fallbackRoomId of this.repository.releaseContinuationHandoffs(turnId)) {
               if (fallbackRoomId !== roomId && !this.stoppedRooms.has(fallbackRoomId)) this.enqueue(fallbackRoomId);
@@ -213,6 +277,8 @@ export class RoomScheduler {
           publishWorkspaceEvent("workspace.changed", turnId, { status: stopped ? "stopped" : "error" }, this.repository.getVersion().revision);
           if (stopped || terminalFailure) break;
           await new Promise((resolve) => setTimeout(resolve, 100 * transientFailureRetries));
+        } finally {
+          this.cancelTurnEffectDispatches(turnId);
         }
       }
     } finally {

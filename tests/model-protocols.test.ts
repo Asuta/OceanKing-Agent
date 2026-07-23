@@ -470,7 +470,7 @@ describe("OpenAI 兼容协议", () => {
     try {
       await Promise.race([partialPreview, timeout]);
       expect(previewContents).toEqual([partialContent]);
-      expect(previewPayloads).toEqual([{ kind: "room_message_preview", roomId: "room_harbor", agentId: "navigator", messageKey: "turn_smooth_preview:model:0:tool:0", delta: partialContent, messageKind: "handoff" }]);
+      expect(previewPayloads).toEqual([{ kind: "room_message_preview", roomId: "room_harbor", agentId: "navigator", messageKey: `task:navigator:room_harbor:${packet.type}:${packet.targetMessageId}:model:0:tool:0`, delta: partialContent, messageKind: "handoff" }]);
       expect(previewPayloads[0]?.content).toBeUndefined();
     } finally {
       clearTimeout(timeoutId);
@@ -533,7 +533,7 @@ describe("OpenAI 兼容协议", () => {
     expect(publicMessages.at(-1)?.content).toContain("[系统公开输出阶段]");
     expect(result.assistantContent).toBe("");
     expect(result.tools.map((tool) => tool.name)).toEqual(["begin_message_to_room"]);
-    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", roomId: "room_harbor", messageKey: "turn_public_chat:model:0:tool:0", content: "真正流式正文", kind: "handoff" })]);
+    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", roomId: "room_harbor", messageKey: `task:navigator:room_harbor:${packet.type}:${packet.targetMessageId}:model:0:tool:0`, content: "真正流式正文", kind: "handoff" })]);
     expectProgressivePreview(previews, "真正流式正文");
   }));
 
@@ -556,7 +556,7 @@ describe("OpenAI 兼容协议", () => {
     expect(requestBodies[2]?.tool_choice).toBe("auto");
     const thirdMessages = requestBodies[2]?.messages as Array<{ role: string; content?: string }>;
     expect(thirdMessages.at(-1)?.content).toContain("公开正文为空");
-    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "重试后正式正文", messageKey: "turn_public_retry:model:0:tool:0" })]);
+    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", content: "重试后正式正文", messageKey: `task:navigator:room_harbor:${packet.type}:${packet.targetMessageId}:model:0:tool:0` })]);
   }));
 
   it("公开正文阶段保持 Auto，并执行模型返回的工具调用后继续正文", async () => withRepository(async (repository) => {
@@ -666,8 +666,8 @@ describe("OpenAI 兼容协议", () => {
     const terminalTools = bodies[2]?.tools as Array<{ function: { name: string } }>;
     expect(terminalTools.map((tool) => tool.function.name).sort()).toEqual(["begin_message_to_room", "read_no_reply"]);
     expect(result.effects).toEqual([
-      expect.objectContaining({ type: "send_message", roomId: nextRoom.id, messageKey: "turn_public_multi:model:0:tool:0", content: "新房间独立结果" }),
-      expect.objectContaining({ type: "send_message", roomId: "room_harbor", messageKey: "turn_public_multi:model:2:tool:0", content: "旧房间独立结果" }),
+      expect.objectContaining({ type: "send_message", roomId: nextRoom.id, messageKey: `task:navigator:${nextRoom.id}:${nextPacket.type}:${nextPacket.targetMessageId}:model:0:tool:0`, content: "新房间独立结果" }),
+      expect.objectContaining({ type: "send_message", roomId: "room_harbor", messageKey: `task:navigator:${nextRoom.id}:${nextPacket.type}:${nextPacket.targetMessageId}:model:2:tool:0`, content: "旧房间独立结果" }),
     ]);
   }));
 
@@ -698,6 +698,15 @@ describe("OpenAI 兼容协议", () => {
     expect(result.tools.some((tool) => tool.name === "read_room_history")).toBe(false);
     expect(result.awaitingRoomId).toBe(createdRoomId);
     expect(bodies).toHaveLength(5);
+    expect(repository.getRoom(createdRoomId)).toMatchObject({
+      title: "数数游戏室",
+      messages: [expect.objectContaining({ content: "1" })],
+    });
+    expect(repository.raw.prepare("SELECT target_room_id,awaiting_reply,awaiting_message_id FROM turn_handoffs WHERE source_turn_id='turn_create_and_send'").get()).toEqual({
+      target_room_id: createdRoomId,
+      awaiting_reply: 1,
+      awaiting_message_id: repository.getRoom(createdRoomId)?.messages[0]?.id,
+    });
 
     const applied = repository.finishTurn({ turnId: "turn_create_and_send", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, awaitingRoomId: result.awaitingRoomId, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
     const created = repository.getRoom(createdRoomId)!;
@@ -792,7 +801,20 @@ describe("OpenAI 兼容协议", () => {
     sendUser(repository, "room_harbor", "分别向六个房间发送独立任务"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
     const agent = { ...base, settings: { ...base.settings, apiFormat: "chat_completions" as const, thinkingMode: "disabled" as const, maxToolSteps: 1 } };
     repository.beginTurn({ turnId: "turn_multi_handoff", roomId: "room_harbor", agentId: agent.id, agentParticipantId: "participant_navigator_harbor", packet });
-    const result = await runAgentModel({ repository, agent, agentParticipantId: "participant_navigator_harbor", packet, turnId: "turn_multi_handoff", signal: new AbortController().signal });
+    const handoffsDispatchedWhileRunning: string[] = [];
+    const result = await runAgentModel({
+      repository,
+      agent,
+      agentParticipantId: "participant_navigator_harbor",
+      packet,
+      turnId: "turn_multi_handoff",
+      signal: new AbortController().signal,
+      onHandoffCommitted: (roomId) => {
+        expect(repository.getRoom("room_harbor")?.turns.find((turn) => turn.id === "turn_multi_handoff")?.status).toBe("running");
+        handoffsDispatchedWhileRunning.push(roomId);
+        repository.markTurnEffectDispatchesDispatched("turn_multi_handoff", roomId);
+      },
+    });
 
     expect(call).toBe(8);
     expect(result.awaitingRoomId).toBeNull();
@@ -800,6 +822,8 @@ describe("OpenAI 兼容协议", () => {
     expect(result.effects.filter((effect) => effect.type === "send_message" && targetRoomIds.includes(effect.roomId))).toEqual(
       targetRoomIds.map((roomId, index) => expect.objectContaining({ type: "send_message", roomId, kind: "handoff", content: `独立任务 ${index + 1}` })),
     );
+    expect(handoffsDispatchedWhileRunning).toEqual([...targetRoomIds, "room_harbor"]);
+    expect(repository.getTurnEffectDispatch("turn_multi_handoff").triggerRoomIds).toEqual([]);
     const applied = repository.finishTurn({ turnId: "turn_multi_handoff", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, awaitingRoomId: result.awaitingRoomId, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
     expect(applied.triggerRoomIds).toEqual(expect.arrayContaining(targetRoomIds));
     for (const [index, roomId] of targetRoomIds.entries()) expect(repository.getRoom(roomId)?.messages.at(-1)?.content).toBe(`独立任务 ${index + 1}`);
@@ -852,7 +876,7 @@ describe("OpenAI 兼容协议", () => {
     expect(repository.raw.prepare("SELECT COUNT(*) count FROM turn_handoffs WHERE source_turn_id='turn_responses_route_switch'").get()).toEqual({ count: 0 });
   }));
 
-  it("同一 Turn 向已有房间邀请 Agent 后发送 handoff 也会自动等待", async () => withRepository(async (repository) => {
+  it("同一 Turn 即时邀请 Agent 后发送 handoff 也会自动等待", async () => withRepository(async (repository) => {
     process.env.OPENAI_API_KEY = "test-key"; process.env.OPENAI_BASE_URL = "https://example.test/v1";
     const targetRoomId = "room_pending_invite_collaboration";
     sendUser(repository, "room_harbor", "预置协作房间"); const setupPacket = packetFor(repository);
@@ -872,7 +896,7 @@ describe("OpenAI 兼容协议", () => {
       if (call === 3) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_invite_builder", function: { name: "invite_agent", arguments: JSON.stringify({ roomId: targetRoomId, agentId: "builder" }) } }] } }] }, "[DONE]"]);
       if (call === 4) return sse([{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_invite_collaboration", function: { name: "begin_message_to_room", arguments: JSON.stringify({ roomId: targetRoomId, kind: "handoff" }) } }] } }] }, "[DONE]"]);
       if (call === 5) return sse([{ choices: [{ delta: { content: "请处理任务并回复结果。" } }] }, "[DONE]"]);
-      throw new Error("待提交邀请已足够触发自动等待");
+      throw new Error("即时提交的邀请已足够触发自动等待");
     }));
 
     sendUser(repository, "room_harbor", "邀请 Builder 去已有房间协作"); const packet = packetFor(repository); const base = repository.getAgent("navigator")!;
@@ -882,8 +906,8 @@ describe("OpenAI 兼容协议", () => {
 
     expect(call).toBe(5);
     expect(result.awaitingRoomId).toBe(targetRoomId);
-    const applied = repository.finishTurn({ turnId: "turn_pending_invite_collaboration", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, awaitingRoomId: result.awaitingRoomId, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
     expect(repository.getRoom(targetRoomId)?.participants.some((participant) => participant.agentId === "builder")).toBe(true);
+    const applied = repository.finishTurn({ turnId: "turn_pending_invite_collaboration", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, awaitingRoomId: result.awaitingRoomId, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
     expect(applied.continuationRoomIds).toContain(targetRoomId);
   }));
 
@@ -1459,7 +1483,7 @@ describe("OpenAI 兼容协议", () => {
     expect(bodies[1]?.previous_response_id).toBe("resp_begin_public");
     expect(JSON.stringify(bodies[1]?.input)).toContain("[系统公开输出阶段]");
     expect(result.assistantContent).toBe("");
-    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", messageKey: "turn_public_responses:model:0:tool:0", content: "Responses 公开正文" })]);
+    expect(result.effects).toEqual([expect.objectContaining({ type: "send_message", messageKey: `task:navigator:room_harbor:${packet.type}:${packet.targetMessageId}:model:0:tool:0`, content: "Responses 公开正文" })]);
     expectProgressivePreview(previews, "Responses 公开正文");
   }));
 
@@ -1514,9 +1538,9 @@ describe("OpenAI 兼容协议", () => {
     expect(result.modelMeta).toMatchObject({ toolSteps: 1 });
     expect(result.tools.map((tool) => tool.name)).toEqual(["begin_message_to_room", "read_room_history", "begin_message_to_room", "begin_message_to_room"]);
     expect(result.effects).toEqual([
-      expect.objectContaining({ type: "send_message", kind: "notify", messageKey: "turn_chat_progress:model:1:tool:0", content: "我先检查房间历史，再核对关键结果。" }),
-      expect.objectContaining({ type: "send_message", kind: "notify", messageKey: "turn_chat_progress:model:4:tool:0", content: "历史已经核对完成，正在整理最终结论。" }),
-      expect.objectContaining({ type: "send_message", kind: "handoff", messageKey: "turn_chat_progress:model:6:tool:0", content: "检查完成，最终结果已经确认。" }),
+      expect.objectContaining({ type: "send_message", kind: "notify", messageKey: `task:navigator:room_harbor:${packet.type}:${packet.targetMessageId}:model:1:tool:0`, content: "我先检查房间历史，再核对关键结果。" }),
+      expect.objectContaining({ type: "send_message", kind: "notify", messageKey: `task:navigator:room_harbor:${packet.type}:${packet.targetMessageId}:model:4:tool:0`, content: "历史已经核对完成，正在整理最终结论。" }),
+      expect.objectContaining({ type: "send_message", kind: "handoff", messageKey: `task:navigator:room_harbor:${packet.type}:${packet.targetMessageId}:model:6:tool:0`, content: "检查完成，最终结果已经确认。" }),
     ]);
     const applied = repository.finishTurn({ turnId: "turn_chat_progress", assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq: packet.cutoffSeq, nextParticipantId: null });
     expect(new Set(applied.emittedMessageIds).size).toBe(3);
@@ -1551,8 +1575,8 @@ describe("OpenAI 兼容协议", () => {
     expect(result.modelMeta).toMatchObject({ toolSteps: 1 });
     expect(result.tools.map((tool) => tool.name)).toEqual(["begin_message_to_room", "read_room_history", "begin_message_to_room"]);
     expect(result.effects).toEqual([
-      expect.objectContaining({ type: "send_message", kind: "notify", messageKey: "turn_responses_progress:model:1:tool:0", content: "我先读取历史，再给出正式结论。" }),
-      expect.objectContaining({ type: "send_message", kind: "handoff", messageKey: "turn_responses_progress:model:4:tool:0", content: "历史检查完成，这是最终结论。" }),
+      expect.objectContaining({ type: "send_message", kind: "notify", messageKey: `task:navigator:room_harbor:${packet.type}:${packet.targetMessageId}:model:1:tool:0`, content: "我先读取历史，再给出正式结论。" }),
+      expect.objectContaining({ type: "send_message", kind: "handoff", messageKey: `task:navigator:room_harbor:${packet.type}:${packet.targetMessageId}:model:4:tool:0`, content: "历史检查完成，这是最终结论。" }),
     ]);
   }));
 });
