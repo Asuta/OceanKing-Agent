@@ -263,8 +263,6 @@ export type TurnEffect =
 export type TurnEffectCommit = {
   effect: TurnEffect;
   emittedMessageIds: Id[];
-  triggerRoomIds: Id[];
-  messageRoomIds: Id[];
   replayed: boolean;
 };
 

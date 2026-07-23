@@ -33,7 +33,6 @@ export class RoomScheduler {
   private runningRooms = new Set<string>();
   private stoppedRooms = new Set<string>();
   private pendingMessageInterrupts = new Map<string, Map<string, number>>();
-  private pendingEffectDispatches = new Map<string, ReturnType<typeof setTimeout>>();
   private repository: WorkspaceRepository;
   private executor: AgentExecutor;
 
@@ -56,29 +55,6 @@ export class RoomScheduler {
       dispatched.add(targetRoomId);
     }
     return dispatched;
-  }
-
-  private scheduleTurnEffectDispatch(turnId: string, sourceRoomId: string, targetRoomId: string): void {
-    const key = `${turnId}\u0000${targetRoomId}`;
-    if (this.pendingEffectDispatches.has(key)) return;
-    const timer = setTimeout(() => {
-      this.pendingEffectDispatches.delete(key);
-      try {
-        this.dispatchTurnEffects(turnId, sourceRoomId, true, targetRoomId);
-      } catch {
-        // The durable outbox remains pending and Turn completion or startup recovery retries it.
-      }
-    }, 0);
-    this.pendingEffectDispatches.set(key, timer);
-  }
-
-  private cancelTurnEffectDispatches(turnId: string): void {
-    const prefix = `${turnId}\u0000`;
-    for (const [key, timer] of this.pendingEffectDispatches) {
-      if (!key.startsWith(prefix)) continue;
-      clearTimeout(timer);
-      this.pendingEffectDispatches.delete(key);
-    }
   }
 
   enqueue(roomId: string, options: { interruptActive?: boolean } = {}): void {
@@ -223,7 +199,7 @@ export class RoomScheduler {
                 turnId,
                 signal,
                 onHandoffCommitted: (targetRoomId) => {
-                  this.scheduleTurnEffectDispatch(turnId, roomId, targetRoomId);
+                  this.dispatchTurnEffects(turnId, roomId, true, targetRoomId);
                 },
               });
               return this.repository.finishTurn({ turnId, assistantContent: result.assistantContent, systemPrompt: result.systemPrompt, sessionMessages: result.sessionMessages, auditMessages: result.auditMessages, tools: result.tools, timeline: result.timeline, effects: result.effects, modelMeta: result.modelMeta, contextCompaction: result.contextCompaction, cutoffSeq, nextParticipantId: next?.id ?? null, awaitingRoomId: result.awaitingRoomId });
@@ -277,8 +253,6 @@ export class RoomScheduler {
           publishWorkspaceEvent("workspace.changed", turnId, { status: stopped ? "stopped" : "error" }, this.repository.getVersion().revision);
           if (stopped || terminalFailure) break;
           await new Promise((resolve) => setTimeout(resolve, 100 * transientFailureRetries));
-        } finally {
-          this.cancelTurnEffectDispatches(turnId);
         }
       }
     } finally {

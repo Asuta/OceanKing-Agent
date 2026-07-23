@@ -569,8 +569,6 @@ export class WorkspaceRepository {
         committed = {
           effect,
           emittedMessageIds: parseJson<string[]>(existing.emitted_message_ids_json, []),
-          triggerRoomIds: parseJson<string[]>(existing.trigger_room_ids_json, []),
-          messageRoomIds: parseJson<string[]>(existing.message_room_ids_json, []),
           replayed: true,
         };
         return;
@@ -594,7 +592,7 @@ export class WorkspaceRepository {
       }
       establishAwaitingHandoff(args.effect);
       this.bump();
-      committed = { effect: args.effect, emittedMessageIds, triggerRoomIds: [...triggerRoomIds], messageRoomIds: [...messageRoomIds], replayed: false };
+      committed = { effect: args.effect, emittedMessageIds, replayed: false };
     });
     tx();
     if (!committed) throw new DomainError("工具命令未能提交");
